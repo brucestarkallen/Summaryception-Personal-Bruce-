@@ -1769,13 +1769,13 @@ function escapeHtml(text) {
 }
 
 function bindUIEvents() {
-    $('#sc_enabled').on('change', function () {
+    $(document).on('change', '#sc_enabled', function () {
         getSettings().enabled = $(this).prop('checked');
         saveSettings();
         updateInjection();
     });
 
-    $('#sc_pause_summarization').on('change', function () {
+    $(document).on('change', '#sc_pause_summarization', function () {
         const s = getSettings();
         s.pauseSummarization = $(this).prop('checked');
         saveSettings();
@@ -1795,12 +1795,12 @@ function bindUIEvents() {
         }
     });
 
-    $('#sc_summarizer_response_length').on('input', function () {
+    $(document).on('input', '#sc_summarizer_response_length', function () {
         getSettings().summarizerResponseLength = parseInt($(this).val(), 10) || 0;
         saveSettings();
     });
 
-    $('#sc_strip_patterns').on('change', function () {
+    $(document).on('change', '#sc_strip_patterns', function () {
         const lines = $(this).val().split('\n').map(l => l.trim()).filter(l => l.length > 0);
         getSettings().stripPatterns = lines;
         saveSettings();
@@ -1815,7 +1815,7 @@ function bindUIEvents() {
     ];
 
     for (const sl of sliders) {
-        $(sl.id).on('input', function () {
+        $(document).on('input', sl.id, function () {
             const val = parseInt($(this).val(), 10);
             getSettings()[sl.key] = val;
             $(sl.display).text(val);
@@ -1830,23 +1830,18 @@ function bindUIEvents() {
     ];
 
     for (const ta of textareas) {
-        $(ta.id).on('change', function () {
+        $(document).on('change', ta.id, function () {
             getSettings()[ta.key] = $(this).val();
             saveSettings();
         });
     }
 
-    $('#sc_debug_mode').on('change', function () {
+    $(document).on('change', '#sc_debug_mode', function () {
         getSettings().debugMode = $(this).prop('checked');
         saveSettings();
     });
 
-    $('#sc_trace_mode').on('change', function () {
-        getSettings().traceMode = $(this).prop('checked');
-        saveSettings();
-    });
-
-    $('#sc_repair').on('click', async function () {
+    $(document).on('click', '#sc_repair', async function () {
         const { chat } = SillyTavern.getContext();
         let repaired = 0;
 
@@ -1860,10 +1855,10 @@ function bindUIEvents() {
             const m = chat[i];
 
             const isStuckHidden = (m.is_system || m.is_hidden)
-                && !m.is_user
-                && !m.extra?.sc_ghosted
-                && m.mes
-                && m.mes.trim().length > 0;
+            && !m.is_user
+            && !m.extra?.sc_ghosted
+            && m.mes
+            && m.mes.trim().length > 0;
 
             if (isStuckHidden) {
                 try {
@@ -1905,18 +1900,38 @@ function bindUIEvents() {
         }
     });
 
-    $('#sc_force_summarize').on('click', async function () {
-        trace('>>> FORCE SUMMARIZE CLICKED');
+    $(document).on('click', '#sc_clear_memory', async function () {
+        if (!confirm('Clear ALL Summaryception memory for this chat and unghost all messages?')) return;
 
-        const s = getSettings();
-        const { chat } = SillyTavern.getContext();
+        try {
+            await unghostAllMessages();
+        } catch (e) {
+            console.error(LOG_PREFIX, 'Error during unghost (continuing with clear):', e);
+            toastr.warning('Some messages could not be unghosted, but memory will still be cleared.', 'Summaryception');
+        }
+
         const store = getChatStore();
+        store.layers.length = 0;
+        store.summarizedUpTo = -1;
+        store.ghostedIndices = [];
 
-        trace('  enabled:', s.enabled);
-        trace('  isSummarizing:', isSummarizing);
+        const { chatMetadata } = SillyTavern.getContext();
+        chatMetadata[MODULE_NAME] = store;
 
-        debugVisibleTurns(chat, store);
+        await saveChatStore();
+        try {
+            const ctx = SillyTavern.getContext();
+            if (ctx.saveChat) await ctx.saveChat();
+        } catch (e) {
+            log('Could not save chat:', e);
+        }
+        updateInjection();
+        updateUI();
+        toastr.success('Memory cleared & messages unghosted', 'Summaryception');
+    });
 
+    $(document).on('click', '#sc_force_summarize', async function () {
+        const s = getSettings();
         if (!s.enabled) {
             toastr.warning('Enable Summaryception first.');
             return;
@@ -1928,65 +1943,31 @@ function bindUIEvents() {
         if (s.pauseSummarization) {
             log('Force Summarize overrides pause mode.');
         }
-
-        // ─── NEW: Repair ghosting before proceeding ───
-        if (store.summarizedUpTo >= 0) {
-            trace('  Checking ghosting integrity...');
-            const unghosteredCount = Array.from({ length: store.summarizedUpTo + 1 }).reduce((count, _, i) => {
-                const m = chat[i];
-                return (!m.is_user && !m.is_system && !m.extra?.sc_ghosted && m.mes?.trim()) ? count + 1 : count;
-            }, 0);
-
-            if (unghosteredCount > 0) {
-                trace('  Found ' + unghosteredCount + ' unghosted messages up to summarizedUpTo');
-                toastr.warning(
-                    `Found ${unghosteredCount} messages that should be hidden. Repairing ghosting...`,
-                    'Summaryception',
-                    { timeOut: 3000 }
-                );
-
-                const repaired = await repairGhostingForRange(0, store.summarizedUpTo);
-                trace('  Repaired ' + repaired + ' messages');
-                toastr.info(
-                    `Repaired ghosting for ${repaired} messages.`,
-                    'Summaryception',
-                    { timeOut: 2000 }
-                );
-            }
-        }
-
         $(this).prop('disabled', true).text(' Working…');
         try {
             catchupDismissed = false;
 
+            const { chat } = SillyTavern.getContext();
             const allAssistantTurns = getAssistantTurns(chat);
             const visibleTurns = allAssistantTurns.filter(t => !chat[t.index].extra?.sc_ghosted);
 
-            trace('  allAssistantTurns:', allAssistantTurns.length);
-            trace('  visibleTurns after repair:', visibleTurns.length);
-
             if (visibleTurns.length <= s.verbatimTurns) {
                 toastr.info('Nothing to summarize — visible turns are within the verbatim limit.', 'Summaryception');
-                trace('<<< FORCE SUMMARIZE - nothing to summarize');
                 return;
             }
 
             const overflow = visibleTurns.length - s.verbatimTurns;
-            trace('  overflow turns:', overflow);
             toastr.info(`${overflow} turns to process. Starting...`, 'Summaryception', { timeOut: 2000 });
 
-            trace('  About to call runCatchup...');
             await runCatchup(visibleTurns, overflow);
-            trace('  runCatchup returned');
             updateInjection();
         } finally {
             $(this).prop('disabled', false).html('<i class="fa-solid fa-bolt"></i> Force Summarize Now');
             updateUI();
-            trace('<<< FORCE SUMMARIZE COMPLETED');
         }
     });
 
-    $('#sc_stop_summarize').on('click', function () {
+    $(document).on('click', '#sc_stop_summarize', function () {
         if (!isSummarizing && !currentAbortController) {
             toastr.info('Nothing is running.', 'Summaryception');
             return;
@@ -1998,9 +1979,9 @@ function bindUIEvents() {
         updateUI();
     });
 
-    $('#sc_refresh_preview').on('click', () => updateUI());
+    $(document).on('click', '#sc_refresh_preview', () => updateUI());
 
-    $('#sc_export').on('click', function () {
+    $(document).on('click', '#sc_export', function () {
         const store = getChatStore();
         const blob = new Blob([JSON.stringify(store, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
@@ -2012,7 +1993,7 @@ function bindUIEvents() {
         toastr.success('Memory exported', 'Summaryception');
     });
 
-    $('#sc_import').on('click', function () {
+    $(document).on('click', '#sc_import', function () {
         const input = document.createElement('input');
         input.type = 'file';
         input.accept = '.json';
@@ -2051,8 +2032,8 @@ function bindUIEvents() {
                 updateUI();
                 toastr.success(
                     `Memory imported. ${store.layers.reduce((sum, l) => sum + (l?.length || 0), 0)} snippets loaded, messages ghosted up to index ${store.summarizedUpTo}.`,
-                    'Summaryception',
-                    { timeOut: 4000 }
+                               'Summaryception',
+                               { timeOut: 4000 }
                 );
             } catch (err) {
                 console.error(LOG_PREFIX, err);
@@ -2063,28 +2044,25 @@ function bindUIEvents() {
     });
 
     // ── Prompt Preset dropdown ──
-    $('#sc_prompt_preset').on('change', function () {
+    $(document).on('change', '#sc_prompt_preset', function () {
         const selected = $(this).val();
         const s = getSettings();
         s.promptPreset = selected;
 
         if (selected !== 'custom') {
-            // Overwrite textarea with the selected preset
             const presetText = PROMPT_PRESETS[selected];
             $('#sc_summarizer_user_prompt').val(presetText);
             s.summarizerUserPrompt = presetText;
         }
-        // 'custom' leaves the textarea untouched for user editing
 
         saveSettings();
     });
 
     // Auto-switch to 'custom' when user manually edits the prompt textarea
-    $('#sc_summarizer_user_prompt').on('input', function () {
+    $(document).on('input', '#sc_summarizer_user_prompt', function () {
         const currentText = $(this).val();
         const s = getSettings();
 
-        // Always sync the prompt text
         s.summarizerUserPrompt = currentText;
 
         if (s.promptPreset !== 'custom') {
