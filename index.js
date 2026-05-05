@@ -1,5 +1,5 @@
 /**
- * Summaryception v5.5.1 — Layered Recursive Summarization for SillyTavern
+ * Summaryception v5.5.2 — Layered Recursive Summarization for SillyTavern
  *
  * NON-DESTRUCTIVE: Uses SillyTavern's native /hide and /unhide commands
  * to exclude summarized messages from LLM context while keeping them
@@ -491,6 +491,74 @@ async function ghostMessagesUpTo(endIndex) {
 
     if (progressToast) toastr.clear(progressToast);
     log(`Ghosted messages from index 0 to ${endIndex}${s.disableGhosting ? ' (hiding disabled — metadata only)' : ''}`);
+}
+
+// ─── Branch Detection & Repair ───────────────────────────────────────
+
+/**
+ * Detect if the current chat was branched before the summarized point.
+ * When ST creates a branch at message N, it copies messages 0..N into a new chat file.
+ * But chatMetadata (including our store) is copied as-is, so summarizedUpTo might
+ * point beyond the end of the new chat, and snippets may reference turns that
+ * no longer exist in this branch.
+ *
+ * This function detects that condition and trims our store to match reality.
+ */
+async function repairIfBranched() {
+    const { chat } = SillyTavern.getContext();
+    const store = getChatStore();
+
+    if (!chat || chat.length === 0) return;
+    if (store.summarizedUpTo < 0) return;
+
+    const chatLength = chat.length;
+
+    // If summarizedUpTo is beyond (or at) the end of the chat, we branched
+    if (store.summarizedUpTo >= chatLength) {
+        const oldSummarizedUpTo = store.summarizedUpTo;
+        log(`Branch detected! summarizedUpTo (${oldSummarizedUpTo}) >= chat length (${chatLength}). Repairing...`);
+
+        // Find the safe cutoff — the last message index that actually exists
+        const safeCutoff = chatLength - 1;
+
+        // Remove Layer 0 snippets whose turnRange extends beyond the branch point
+        if (store.layers[0]) {
+            const before = store.layers[0].length;
+            store.layers[0] = store.layers[0].filter(sn => {
+                if (!sn.turnRange) return true; // promoted snippets without turnRange are kept
+                return sn.turnRange[1] < chatLength;
+            });
+            const removed = before - store.layers[0].length;
+            if (removed > 0) {
+                log(`Removed ${removed} Layer 0 snippets that referenced turns beyond branch point`);
+            }
+        }
+
+        // Recalculate summarizedUpTo based on remaining snippets
+        if (store.layers[0] && store.layers[0].length > 0) {
+            const maxEnd = Math.max(...store.layers[0]
+            .filter(sn => sn.turnRange)
+            .map(sn => sn.turnRange[1]));
+            store.summarizedUpTo = maxEnd;
+        } else {
+            store.summarizedUpTo = -1;
+        }
+
+        // Trim ghostedIndices to only include valid indices
+        if (store.ghostedIndices) {
+            store.ghostedIndices = store.ghostedIndices.filter(idx => idx < chatLength);
+        }
+
+        await saveChatStore();
+
+        log(`Branch repair complete. summarizedUpTo: ${oldSummarizedUpTo} → ${store.summarizedUpTo}`);
+
+        toastr.info(
+            `Branch detected — trimmed ${oldSummarizedUpTo - store.summarizedUpTo} turns of stale summary data that referenced messages beyond the branch point.`,
+            'Summaryception — Branch Repair',
+            { timeOut: 6000 }
+        );
+    }
 }
 
 // ─── Assistant Turn Utilities ────────────────────────────────────────
@@ -1444,7 +1512,8 @@ function onMessageReceived(messageIndex) {
 function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
-    setTimeout(() => {
+    setTimeout(async () => {
+        await repairIfBranched();
         updateInjection();
         updateUI();
     }, 100);
@@ -2650,6 +2719,6 @@ async function fetchProfilesFallback(selectElement, currentValue) {
     eventSource.on(event_types.APP_READY, () => {
         updateInjection();
         updateUI();
-        console.log(LOG_PREFIX, 'v5.5.1 loaded. Connection Settings available');
+        console.log(LOG_PREFIX, 'v5.5.2 loaded. Connection Settings available');
     });
 })();
