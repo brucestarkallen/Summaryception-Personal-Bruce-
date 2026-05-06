@@ -278,6 +278,20 @@ Restart SillyTavern and enable the extension.
 
 ---
 
+## Community Forks
+
+These forks extend Summaryception with specialized features. They use the same internal module name, so **install only one at a time** — your existing settings and per-chat memory will carry over.
+
+### [Per-Character Memory Banks](https://github.com/dogoo9/Extension-Summaryception) by dogoo9
+
+Keeps separate summary memory for each character card in the same chat. Useful for group chats or stories where you switch between characters and don't want their memories bleeding together.
+
+### [Lorebook Ingestion](https://github.com/jeromehbonaparte-star/Extension-Summaryception-Lorebook) by Romuromylus
+
+Automatically extracts stable facts (character traits, locations, items) from summaries and proposes them as World Info entries. Summaries handle events and state changes; lorebook entries handle things that should never be forgotten across layers. Includes a review queue so nothing gets written without your approval.
+
+---
+
 ## 🤝 Credits
 
 Built with frustration at context limits and love for long-form roleplay.
