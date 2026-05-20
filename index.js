@@ -989,8 +989,23 @@ async function summarizeOneBatch(visibleTurns) {
     const { chat } = SillyTavern.getContext();
     const store = getChatStore();
 
-    const batchSize = Math.min(s.turnsPerSummary, visibleTurns.length);
-    const batch = visibleTurns.slice(0, batchSize);
+    // ─── FIX: Filter out turns that are at or before summarizedUpTo ───
+    const eligibleTurns = visibleTurns.filter(t => t.index > store.summarizedUpTo);
+    trace('  eligibleTurns after filtering:', eligibleTurns.length);
+
+    if (eligibleTurns.length === 0) {
+        log('All visible turns are already summarized — repairing ghosting...');
+        const turnsToGhost = visibleTurns.filter(t => t.index <= store.summarizedUpTo);
+        for (const t of turnsToGhost) {
+            await ghostMessage(t.index);
+        }
+        await saveChatStore();
+        trace('<<< EXITING summarizeOneBatch - REPAIRED GHOSTING');
+        return false;
+    }
+
+    const batchSize = Math.min(s.turnsPerSummary, eligibleTurns.length);
+    const batch = eligibleTurns.slice(0, batchSize);
 
     if (batch.length === 0) {
         trace('<<< EXITING summarizeOneBatch - EMPTY BATCH');
@@ -1006,13 +1021,6 @@ async function summarizeOneBatch(visibleTurns) {
         trace('  store.summarizedUpTo:', store.summarizedUpTo);
 
         log(`Summarizing ${batch.length} assistant turns (indices ${startIdx}–${endIdx})`);
-
-        // ─── FIX: Ensure batch is actually after the summarized point ───
-        if (startIdx <= store.summarizedUpTo) {
-            log(`Skipping batch: startIdx (${startIdx}) is <= summarizedUpTo (${store.summarizedUpTo})`);
-            trace('<<< EXITING summarizeOneBatch - BATCH ALREADY SUMMARIZED');
-            return false;
-        }
 
         if (!store.layers[0]) store.layers[0] = [];
         const passageStart = store.summarizedUpTo < 0 ? 0 : store.summarizedUpTo + 1;
@@ -1087,8 +1095,29 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
     const { chat } = SillyTavern.getContext();
     const store = getChatStore();
 
-    const batchSize = Math.min(s.turnsPerSummary, visibleTurns.length);
-    const batch = visibleTurns.slice(0, batchSize);
+    // ─── FIX: Filter out turns that are at or before summarizedUpTo ───
+    // This handles desync where summarizedUpTo advanced but ghosting failed
+    // (e.g., connection drop mid-summarization). Without this filter, the batch
+    // always starts at the first un-ghosted turn, gets rejected by the
+    // startIdx <= summarizedUpTo guard, and loops forever.
+    const eligibleTurns = visibleTurns.filter(t => t.index > store.summarizedUpTo);
+    trace('  eligibleTurns after filtering:', eligibleTurns.length);
+
+    if (eligibleTurns.length === 0) {
+        // All "visible" turns are actually already summarized but not ghosted.
+        // Ghost them now to fix the desync.
+        log('All visible turns are already summarized — repairing ghosting...');
+        const turnsToGhost = visibleTurns.filter(t => t.index <= store.summarizedUpTo);
+        for (const t of turnsToGhost) {
+            await ghostMessage(t.index);
+        }
+        await saveChatStore();
+        trace('<<< EXITING summarizeOneBatchFromTurns - REPAIRED GHOSTING');
+        return false;
+    }
+
+    const batchSize = Math.min(s.turnsPerSummary, eligibleTurns.length);
+    const batch = eligibleTurns.slice(0, batchSize);
 
     trace('  batchSize:', batchSize);
     trace('  batch prepared:', batch.length);
@@ -1104,17 +1133,9 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
     trace('  startIdx:', startIdx, 'endIdx:', endIdx);
     trace('  store.summarizedUpTo:', store.summarizedUpTo);
 
-    // ─── FIX: Ensure batch is actually after the summarized point ───
-    // If this batch starts BEFORE summarizedUpTo, skip it entirely
-    if (startIdx <= store.summarizedUpTo) {
-        trace('  SKIP: batch startIdx (' + startIdx + ') is <= summarizedUpTo (' + store.summarizedUpTo + ')');
-        trace('<<< EXITING - batch is before summarized point');
-        return false;
-    }
-
     if (!store.layers[0]) store.layers[0] = [];
 
-    // ─── FIX: Start from the message AFTER the last summarized one ───
+    // ─── Start from the message AFTER the last summarized one ───
     const passageStart = store.summarizedUpTo < 0 ? 0 : store.summarizedUpTo + 1;
 
     trace('  passageStart:', passageStart, 'endIdx:', endIdx);
