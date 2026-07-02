@@ -2207,6 +2207,7 @@ function escapeHtml(text) {
 
 let _editorPending = [];
 let _editorUndoSnapshot = null;
+let _editorCancelled = false;
 
 function buildMemoryDump() {
     const store = getChatStore();
@@ -2287,6 +2288,8 @@ async function runContinuityEditorReview() {
     }
     const btn = $('#sc_editor_review');
     btn.prop('disabled', true).text('Thinking…');
+    _editorCancelled = false;
+    $('#sc_editor_cancel').show();
     try {
         const memStr = JSON.stringify(dump, null, 1);
         const userTpl = (s.editorUserPrompt || '')
@@ -2298,6 +2301,10 @@ async function runContinuityEditorReview() {
             systemPrompt: s.editorSystemPrompt,
             userPrompt: userTpl,
         });
+        if (_editorCancelled) {
+            toastr.info('Review cancelled — nothing was changed.', 'Summaryception', { timeOut: 2500 });
+            return;
+        }
         const edits = extractJsonArray(raw);
         if (!edits) {
             toastr.error('Co-Writer did not return valid edits. Try rephrasing, or point the connection at a stronger model.', 'Summaryception', { timeOut: 7000 });
@@ -2314,6 +2321,8 @@ async function runContinuityEditorReview() {
         log('Continuity editor error:', e);
         toastr.error('Co-Writer failed — nothing was changed.', 'Summaryception', { timeOut: 5000 });
     } finally {
+        $('#sc_editor_cancel').hide();
+        _editorCancelled = false;
         btn.prop('disabled', false).text('🔍 Review Proposed Edits');
     }
 }
@@ -2505,6 +2514,11 @@ function bindUIEvents() {
     // ── Continuity Editor (Co-Writer / Master Novelist) ──
     $(document).on('click', '#sc_editor_review', runContinuityEditorReview);
     $(document).on('click', '#sc_editor_undo', restoreMemorySnapshot);
+    $(document).on('click', '#sc_editor_cancel', function () {
+        _editorCancelled = true;
+        abortSummarization();
+        toastr.info('Cancelling the co-writer…', 'Summaryception', { timeOut: 1500 });
+    });
     $(document).on('input', '#sc_editor_system_prompt', function () {
         getSettings().editorSystemPrompt = $(this).val();
         saveSettings();
@@ -3273,7 +3287,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.7.0 (LO) loaded — Detail Auditor + Continuity Editor.');
+            console.log(LOG_PREFIX, 'v5.7.1 (LO) loaded — Detail Auditor + Continuity Editor + Cancel.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
