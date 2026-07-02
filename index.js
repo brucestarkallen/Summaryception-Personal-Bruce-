@@ -51,6 +51,12 @@ const defaultSettings = Object.freeze({
     sisterUserPrompt:
         `<player_name>{{player_name}}</player_name>\n<prior_context>{{context_str}}</prior_context>\n<passage>{{story_txt}}</passage>\n<snippet>{{snippet}}</snippet>\n\n<snippet> is the compact memory line already recorded for <passage>.\n\nDecide: does <snippet> omit any important specifics from <passage> that a storyteller would need and could NOT reconstruct from the gist alone? Consider: exact quantities/counts, named tactics or plans, specific conditional promises ("if X then Y"), precise capabilities or limits, and identity/title details.\n\nRecord ONLY omissions that are ALL of: (a) present in <passage>, (b) NOT already in <snippet>, (c) NOT already in <prior_context>.\n\nIf <snippet> already captures everything important, output exactly:\nNONE\n\nOtherwise output ONE line:\nDETAIL: <only the missing specifics, short phrases separated by semicolons>`,
 
+    // ── Continuity Editor ("Co-Writer / Master Novelist") prompts ──
+    editorSystemPrompt:
+        'Role: master continuity editor and co-writer for an ongoing roleplay. You receive the story\'s full memory — a notepad of established canon (plot-essential lore), an ordered list of summary snippets, and their detail notes — plus an instruction describing a problem or retcon. Determine the MINIMAL set of edits that resolves the problem and keeps everything internally consistent. Change only what must change; preserve each entry\'s terse style. Output STRICT JSON ONLY: a single array of edit operations — no prose, no markdown, no commentary. If nothing needs changing, output [].',
+    editorUserPrompt:
+        `<player_name>{{player_name}}</player_name>\n\n<instruction>\n{{command}}\n</instruction>\n\n<memory>\n{{memory}}\n</memory>\n\n<memory> has "notepad" (established canon) and "snippets" (each with an "id" like "L0#3", its "text", and optional "detail"). Apply <instruction> by editing memory so the whole story stays logical and consistent.\n\nReturn a JSON array of edit operations. Allowed ops:\n{"op":"edit_notepad","text":"<full new notepad>","reason":"<short why>"}\n{"op":"edit_snippet","id":"L0#3","text":"<new snippet text>","reason":"<short why>"}\n{"op":"delete_snippet","id":"L0#3","reason":"<short why>"}\n{"op":"edit_detail","id":"L0#3","text":"<new detail text>","reason":"<short why>"}\n{"op":"delete_detail","id":"L0#3","reason":"<short why>"}\n\nRules: reference snippets ONLY by their exact "id" from <memory>. Keep edits minimal — do not rewrite unaffected entries. Output ONLY the JSON array (or [] if nothing needs changing).`,
+
     summarizerSystemPrompt:
         'Role: precise narrative-state tracker. Output only the summary line — no preamble, no commentary, no markdown.',
 
@@ -1793,6 +1799,8 @@ function updateUI() {
         $('#sc_sister_enabled').prop('checked', s.sisterEnabled !== false);
         $('#sc_sister_system_prompt').val(s.sisterSystemPrompt);
         $('#sc_sister_user_prompt').val(s.sisterUserPrompt);
+        $('#sc_editor_system_prompt').val(s.editorSystemPrompt);
+        $('#sc_editor_user_prompt').val(s.editorUserPrompt);
         // ── Prompt preset migration & sync ──
         // Migration: existing users with the old game-state default get upgraded to narrative.
         // Users who customized their prompt get marked as 'custom'.
@@ -2191,6 +2199,192 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// ─── Continuity Editor ("Co-Writer / Master Novelist") ───────────────
+// Reads the ENTIRE memory (notepad + all snippets + detail notes), asks a
+// smart editor model for a MINIMAL set of edits to resolve a problem/retcon,
+// then applies them under per-item review with a one-tap undo. Reuses the
+// summarizer connection + machinery.
+
+let _editorPending = [];
+let _editorUndoSnapshot = null;
+
+function buildMemoryDump() {
+    const store = getChatStore();
+    const snippets = [];
+    if (store.layers) {
+        for (let L = 0; L < store.layers.length; L++) {
+            const layer = store.layers[L];
+            if (!layer) continue;
+            for (let i = 0; i < layer.length; i++) {
+                const sn = layer[i];
+                const entry = { id: `L${L}#${i}`, layer: L, text: sn.text };
+                if (sn.turnRange) entry.turns = `${sn.turnRange[0]}-${sn.turnRange[1]}`;
+                if (sn.detail) entry.detail = sn.detail;
+                snippets.push(entry);
+            }
+        }
+    }
+    return { notepad: store.notepad || '', snippets };
+}
+
+function resolveSnippetId(id) {
+    const m = /^L(\d+)#(\d+)$/.exec(String(id || '').trim());
+    if (!m) return null;
+    const layer = parseInt(m[1], 10), idx = parseInt(m[2], 10);
+    const store = getChatStore();
+    const arr = store.layers && store.layers[layer];
+    if (!arr || !arr[idx]) return null;
+    return { layer, idx, arr, obj: arr[idx] };
+}
+
+function extractJsonArray(raw) {
+    if (!raw) return null;
+    let t = String(raw).trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const start = t.indexOf('['), end = t.lastIndexOf(']');
+    if (start === -1 || end === -1 || end < start) return null;
+    try { const p = JSON.parse(t.slice(start, end + 1)); return Array.isArray(p) ? p : null; }
+    catch { return null; }
+}
+
+function recomputeSummarizedUpTo() {
+    const store = getChatStore();
+    const l0 = (store.layers && store.layers[0]) ? store.layers[0].filter(sn => sn.turnRange) : [];
+    store.summarizedUpTo = l0.length > 0 ? Math.max(...l0.map(sn => sn.turnRange[1])) : -1;
+}
+
+function snapshotMemory() {
+    const store = getChatStore();
+    _editorUndoSnapshot = {
+        notepad: store.notepad || '',
+        layers: JSON.parse(JSON.stringify(store.layers || [])),
+    };
+}
+
+async function restoreMemorySnapshot() {
+    if (!_editorUndoSnapshot) return;
+    const store = getChatStore();
+    store.notepad = _editorUndoSnapshot.notepad;
+    store.layers = JSON.parse(JSON.stringify(_editorUndoSnapshot.layers));
+    recomputeSummarizedUpTo();
+    await saveChatStore();
+    updateInjection(true);
+    updateUI();
+    $('#sc_notepad').val(store.notepad || '');
+    $('#sc_editor_undo').hide();
+    $('#sc_editor_review_list').empty();
+    _editorUndoSnapshot = null;
+    _editorPending = [];
+    toastr.success('Reverted — memory restored to before the edits.', 'Summaryception', { timeOut: 3000 });
+}
+
+async function runContinuityEditorReview() {
+    const s = getSettings();
+    const command = ($('#sc_editor_command').val() || '').trim();
+    if (!command) { toastr.warning('Describe what to fix first.', 'Summaryception'); return; }
+    const dump = buildMemoryDump();
+    if (dump.snippets.length === 0 && !dump.notepad.trim()) {
+        toastr.info('No memory yet to edit in this chat.', 'Summaryception'); return;
+    }
+    const btn = $('#sc_editor_review');
+    btn.prop('disabled', true).text('Thinking…');
+    try {
+        const memStr = JSON.stringify(dump, null, 1);
+        const userTpl = (s.editorUserPrompt || '')
+            .replace('{{command}}', command)
+            .replace('{{memory}}', memStr)
+            .replace('{{player_name}}', getPlayerName());
+        toastr.info('Co-Writer is reviewing your full memory…', 'Summaryception', { timeOut: 4000, progressBar: true });
+        const raw = await callSummarizer('(continuity edit)', '', {
+            systemPrompt: s.editorSystemPrompt,
+            userPrompt: userTpl,
+        });
+        const edits = extractJsonArray(raw);
+        if (!edits) {
+            toastr.error('Co-Writer did not return valid edits. Try rephrasing, or point the connection at a stronger model.', 'Summaryception', { timeOut: 7000 });
+            return;
+        }
+        if (edits.length === 0) {
+            $('#sc_editor_review_list').empty();
+            toastr.info('Co-Writer found nothing that needs changing.', 'Summaryception', { timeOut: 5000 });
+            return;
+        }
+        snapshotMemory();   // capture pre-edit state so every Apply can be undone
+        renderEditorReview(edits);
+    } catch (e) {
+        log('Continuity editor error:', e);
+        toastr.error('Co-Writer failed — nothing was changed.', 'Summaryception', { timeOut: 5000 });
+    } finally {
+        btn.prop('disabled', false).text('🔍 Review Proposed Edits');
+    }
+}
+
+function renderEditorReview(edits) {
+    _editorPending = [];
+    let cards = '';
+    let shown = 0;
+    edits.forEach((e, i) => {
+        const op = String(e.op || '');
+        let head, kind, oldText;
+        if (op === 'edit_notepad') {
+            _editorPending[i] = { op };
+            head = '✏️ Notepad (canon)'; kind = 'edit'; oldText = getChatStore().notepad || '';
+        } else if (['edit_snippet', 'delete_snippet', 'edit_detail', 'delete_detail'].includes(op)) {
+            const r = resolveSnippetId(e.id);
+            if (!r) return;   // id doesn't exist — skip this edit
+            _editorPending[i] = { op, ref: r };
+            if (op === 'edit_snippet')       { head = `✏️ Snippet ${e.id}`;   kind = 'edit';   oldText = r.obj.text || ''; }
+            else if (op === 'delete_snippet'){ head = `🗑️ Snippet ${e.id}`;   kind = 'delete'; oldText = r.obj.text || ''; }
+            else if (op === 'edit_detail')   { head = `✏️ Detail on ${e.id}`; kind = 'edit';   oldText = r.obj.detail || ''; }
+            else                             { head = `🗑️ Detail on ${e.id}`; kind = 'delete'; oldText = r.obj.detail || ''; }
+        } else { return; }   // unknown op — skip
+        shown++;
+        const reason = e.reason ? `<div class="sc-editor-reason">${escapeHtml(String(e.reason))}</div>` : '';
+        const oldBlock = `<div class="sc-editor-old">was: ${escapeHtml(oldText.slice(0, 240))}${oldText.length > 240 ? '…' : ''}</div>`;
+        const body = kind === 'edit'
+            ? oldBlock + `<textarea class="sc-editor-new text_pole" data-idx="${i}" rows="3">${escapeHtml(String(e.text || ''))}</textarea>`
+            : oldBlock;
+        cards += `<div class="sc-editor-card ${kind === 'delete' ? 'sc-editor-card-del' : ''}" data-idx="${i}">
+            <div class="sc-editor-head">${head}</div>
+            ${reason}
+            ${body}
+            <div class="sc-editor-btns">
+                <button class="sc-editor-apply menu_button" data-idx="${i}">${kind === 'delete' ? 'Apply (delete)' : 'Apply'}</button>
+                <button class="sc-editor-reject menu_button" data-idx="${i}">Reject</button>
+            </div>
+        </div>`;
+    });
+    const header = `<div class="sc-editor-actions"><button id="sc_editor_applyall" class="menu_button">✅ Apply All (${shown})</button></div>`;
+    $('#sc_editor_review_list').html(shown ? header + cards : '<div class="sc-hint">No applicable edits — the proposed ids weren\'t found in memory.</div>');
+}
+
+async function applyEditorOp(i) {
+    const pend = _editorPending[i];
+    if (!pend) return false;
+    const store = getChatStore();
+    const card = $(`.sc-editor-card[data-idx="${i}"]`);
+    const newVal = String(card.find('.sc-editor-new').val() ?? '').trim();
+    if (pend.op === 'edit_notepad') {
+        store.notepad = newVal;
+        $('#sc_notepad').val(newVal);
+    } else if (pend.ref) {
+        const { obj, arr } = pend.ref;   // object reference — stable across splices
+        if (pend.op === 'edit_snippet') { if (newVal) obj.text = newVal; }
+        else if (pend.op === 'edit_detail') { if (newVal) obj.detail = newVal; else delete obj.detail; }
+        else if (pend.op === 'delete_detail') { delete obj.detail; }
+        else if (pend.op === 'delete_snippet') { const k = arr.indexOf(obj); if (k >= 0) arr.splice(k, 1); }
+    }
+    recomputeSummarizedUpTo();
+    await saveChatStore();
+    updateInjection(true);
+    return true;
+}
+
+async function finalizeAfterApply() {
+    updateUI();
+    if (typeof updateSnippetBrowser === 'function') updateSnippetBrowser();
+    $('#sc_editor_undo').show();
+}
+
 function bindUIEvents() {
     $(document).on('change', '#sc_enabled', function () {
         getSettings().enabled = $(this).prop('checked');
@@ -2306,6 +2500,49 @@ function bindUIEvents() {
     $(document).on('input', '#sc_sister_user_prompt', function () {
         getSettings().sisterUserPrompt = $(this).val();
         saveSettings();
+    });
+
+    // ── Continuity Editor (Co-Writer / Master Novelist) ──
+    $(document).on('click', '#sc_editor_review', runContinuityEditorReview);
+    $(document).on('click', '#sc_editor_undo', restoreMemorySnapshot);
+    $(document).on('input', '#sc_editor_system_prompt', function () {
+        getSettings().editorSystemPrompt = $(this).val();
+        saveSettings();
+    });
+    $(document).on('input', '#sc_editor_user_prompt', function () {
+        getSettings().editorUserPrompt = $(this).val();
+        saveSettings();
+    });
+    $(document).on('click', '.sc-editor-apply', async function () {
+        const i = parseInt($(this).data('idx'), 10);
+        const ok = await applyEditorOp(i);
+        if (ok) {
+            $(`.sc-editor-card[data-idx="${i}"]`).slideUp(120, function () { $(this).remove(); });
+            await finalizeAfterApply();
+            toastr.success('Applied', 'Summaryception', { timeOut: 1200 });
+        }
+    });
+    $(document).on('click', '.sc-editor-reject', function () {
+        const i = parseInt($(this).data('idx'), 10);
+        $(`.sc-editor-card[data-idx="${i}"]`).slideUp(120, function () { $(this).remove(); });
+    });
+    $(document).on('click', '#sc_editor_applyall', async function () {
+        const btn = $(this);
+        btn.prop('disabled', true).text('Applying…');
+        const order = [];
+        _editorPending.forEach((p, i) => { if (p) order.push(i); });
+        // apply deletes last (object refs keep this safe; this is just tidy ordering)
+        order.sort((a, b) => (/^delete_/.test((_editorPending[a] || {}).op) ? 1 : 0) - (/^delete_/.test((_editorPending[b] || {}).op) ? 1 : 0));
+        let n = 0;
+        for (const i of order) {
+            if ($(`.sc-editor-card[data-idx="${i}"]`).length === 0) continue;   // skip rejected
+            const ok = await applyEditorOp(i);
+            if (ok) n++;
+        }
+        await finalizeAfterApply();
+        $('#sc_editor_review_list').empty();
+        toastr.success(`Applied ${n} edit(s)`, 'Summaryception', { timeOut: 2500 });
+        btn.prop('disabled', false).text('✅ Apply All');
     });
 
     $(document).on('change', '#sc_debug_mode', function () {
@@ -3036,7 +3273,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.6.0 (LO) loaded — with Detail Auditor.');
+            console.log(LOG_PREFIX, 'v5.7.0 (LO) loaded — Detail Auditor + Continuity Editor.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

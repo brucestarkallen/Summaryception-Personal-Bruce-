@@ -447,6 +447,43 @@
 
                     <hr class="sc-divider" />
 
+                    <h4 class="sc-section-title">🩺 Continuity Editor (Co-Writer)</h4>
+
+                    <div class="sc-row">
+                        <label for="sc_editor_command">
+                            <span>Describe what's wrong / what to fix</span>
+                            <small class="sc-hint">A senior co-writer AI reads your ENTIRE memory — the notepad (plot essential), every snippet, and every detail note — then proposes exact edits so the whole story stays logical. Ideal for retcons, or when an upstream AI got a fact wrong 50 turns ago. Nothing changes until you approve each edit, and there's a one-tap Undo. Uses the summarizer connection — point it at your smartest model when you run it.</small>
+                        </label>
+                        <textarea id="sc_editor_command" class="text_pole sc-textarea" rows="4" placeholder="e.g. Jovan never betrayed Stella — retcon it and fix every entry that assumes he did. Or: the capital is Vhalen, not Kaer — correct it everywhere."></textarea>
+                    </div>
+
+                    <div class="sc-row sc-editor-actions">
+                        <button id="sc_editor_review" class="menu_button">🔍 Review Proposed Edits</button>
+                        <button id="sc_editor_undo" class="menu_button" style="display:none;">↩️ Undo Last Apply</button>
+                    </div>
+
+                    <div id="sc_editor_review_list" class="sc-editor-review"></div>
+
+                    <div class="sc-row">
+                        <label for="sc_editor_system_prompt">
+                            <span>Co-Writer System Prompt</span>
+                            <small class="sc-hint">The editor's role. Should instruct it to return STRICT JSON edits only (op schema is in the User Prompt below).</small>
+                        </label>
+                        <textarea id="sc_editor_system_prompt" class="text_pole sc-textarea" rows="4"></textarea>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_editor_user_prompt">
+                            <span>Co-Writer User Prompt</span>
+                            <small class="sc-hint">
+                                Variables: <code>{{command}}</code> (your instruction) <code>{{memory}}</code> (the full addressed memory dump) <code>{{player_name}}</code>. Must return a JSON array of edit ops (edit/delete for notepad, snippets, and details).
+                            </small>
+                        </label>
+                        <textarea id="sc_editor_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
+                    </div>
+
+                    <hr class="sc-divider" />
+
                     <!-- Strip Patterns -->
                     <div class="sc-row">
                         <label for="sc_strip_patterns">

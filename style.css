@@ -513,3 +513,52 @@
 .sc-detail-delete { color: #ff6b6b; }
 .sc-detail-redo:hover,
 .sc-detail-delete:hover { opacity: 1; }
+
+/* ─── Continuity Editor (Co-Writer) ───────────────────────────── */
+.sc-editor-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin: 6px 0;
+}
+
+.sc-editor-review { margin-top: 6px; }
+
+.sc-editor-card {
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-left: 3px solid #7bd88f;
+    border-radius: 5px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    font-size: 0.85em;
+}
+.sc-editor-card-del { border-left-color: #ff6b6b; }
+
+.sc-editor-head { font-weight: 600; margin-bottom: 4px; }
+
+.sc-editor-reason {
+    opacity: 0.7;
+    font-style: italic;
+    margin-bottom: 5px;
+}
+
+.sc-editor-old {
+    opacity: 0.5;
+    font-size: 0.92em;
+    margin-bottom: 5px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.sc-editor-new {
+    width: 100%;
+    margin-bottom: 6px;
+    font-family: inherit;
+}
+
+.sc-editor-btns { display: flex; gap: 6px; }
+.sc-editor-btns .menu_button { padding: 2px 10px; font-size: 0.9em; }
+
+.sc-editor-count { opacity: 0.6; font-size: 0.85em; }
