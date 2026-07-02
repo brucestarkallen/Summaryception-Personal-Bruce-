@@ -40,6 +40,17 @@ const defaultSettings = Object.freeze({
     // ── Manual notepad wrapper (the note text itself is stored per-chat, in chat metadata) ──
     notepadTemplate: '\n\n<notes>\n{{notes}}\n</notes>\n',
 
+    // ── Detail Auditor ("sister"): a SECOND pass, per batch, that checks whether the
+    //    compact snippet dropped important specifics the storyteller would need, and if
+    //    so records ONLY the omissions as a short director's-note attached to that
+    //    snippet. Empty (NONE) for routine batches. Never touches the snippet itself. ──
+    sisterEnabled: true,
+    sisterInjectTemplate: '\n\n<details>\nSpecifics behind recent events (canon — do not contradict):\n{{details}}\n</details>\n',
+    sisterSystemPrompt:
+        'Role: continuity auditor for an ongoing fiction. You receive a compact summary snippet and the exact passage it was made from. Your ONLY job: decide whether the snippet dropped important, hard-to-reconstruct specifics a future storyteller would need — exact numbers, named plans or tactics, specific commitments or conditions, precise capabilities, or identity details. If the snippet already captures everything important, output exactly: NONE. Otherwise output a single "DETAIL:" line containing ONLY the missing specifics, as terse director\'s notes (breaking the fourth wall is fine). Never repeat anything the snippet or prior context already contains. No preamble, no markdown, no commentary.',
+    sisterUserPrompt:
+        `<player_name>{{player_name}}</player_name>\n<prior_context>{{context_str}}</prior_context>\n<passage>{{story_txt}}</passage>\n<snippet>{{snippet}}</snippet>\n\n<snippet> is the compact memory line already recorded for <passage>.\n\nDecide: does <snippet> omit any important specifics from <passage> that a storyteller would need and could NOT reconstruct from the gist alone? Consider: exact quantities/counts, named tactics or plans, specific conditional promises ("if X then Y"), precise capabilities or limits, and identity/title details.\n\nRecord ONLY omissions that are ALL of: (a) present in <passage>, (b) NOT already in <snippet>, (c) NOT already in <prior_context>.\n\nIf <snippet> already captures everything important, output exactly:\nNONE\n\nOtherwise output ONE line:\nDETAIL: <only the missing specifics, short phrases separated by semicolons>`,
+
     summarizerSystemPrompt:
         'Role: precise narrative-state tracker. Output only the summary line — no preamble, no commentary, no markdown.',
 
@@ -526,19 +537,10 @@ async function repairIfBranched() {
     const s = getSettings();
     const layer0 = store.layers && store.layers[0] ? store.layers[0] : null;
 
-    // A branch is detected when the summary state references turns at or beyond
-    // the (new, shorter) end of the chat.
-    const summaryOverruns = store.summarizedUpTo >= chatLength;
-    const snippetOverruns = !!layer0 && layer0.some(sn => sn.turnRange && sn.turnRange[1] >= chatLength);
-    if (!summaryOverruns && !snippetOverruns) return;   // normal load — leave it alone
-
-    const oldSummarizedUpTo = store.summarizedUpTo;
-    log(`Branch detected! summarizedUpTo=${oldSummarizedUpTo}, chatLength=${chatLength}. Repairing...`);
-
-    // ── 1. Work out the verbatim window: the most recent `verbatimTurns`
-    //       assistant turns that still exist in this branch should go back to
-    //       being verbatim (visible, word-for-word). Ghosted assistant turns are
-    //       is_system=true, so include those in the count. ──
+    // ── Work out the verbatim window FIRST (the trigger below depends on it):
+    //    the most recent `verbatimTurns` assistant turns that still exist in this
+    //    branch should be verbatim (visible, word-for-word). Ghosted assistant
+    //    turns are is_system=true, so include those in the count. ──
     const asstTurns = [];
     for (let i = 0; i < chatLength; i++) {
         const m = chat[i];
@@ -550,6 +552,23 @@ async function repairIfBranched() {
     const verbatimStartIdx = asstTurns.length > 0
         ? (keep < asstTurns.length ? asstTurns[keep] : chatLength)
         : chatLength;
+
+    // Repair is needed when ANY of these hold:
+    //   • summaryOverruns — the summary pointer sits at/past the (new, shorter) chat end.
+    //   • snippetOverruns — a snippet references turns beyond the chat end.
+    //   • verbatimGhosted — the summary has eaten INTO the verbatim window, i.e. the
+    //       branch left FEWER than `verbatimTurns` turns actually visible. This is the
+    //       branch-at-N case: e.g. turns 55-60 are summarized, you branch at 61, and
+    //       those recent turns stay ghosted with only the summary as anchor. Without
+    //       this check they never return to verbatim and continuity breaks (the MC's
+    //       recent actions exist only as summary, not as on-screen prose).
+    const summaryOverruns = store.summarizedUpTo >= chatLength;
+    const snippetOverruns = !!layer0 && layer0.some(sn => sn.turnRange && sn.turnRange[1] >= chatLength);
+    const verbatimGhosted = store.summarizedUpTo >= verbatimStartIdx;
+    if (!summaryOverruns && !snippetOverruns && !verbatimGhosted) return;   // healthy — leave it alone
+
+    const oldSummarizedUpTo = store.summarizedUpTo;
+    log(`Repair triggered (overrun=${summaryOverruns || snippetOverruns}, verbatimGhosted=${verbatimGhosted}). summarizedUpTo=${oldSummarizedUpTo}, chatLength=${chatLength}, verbatimStartIdx=${verbatimStartIdx}. Repairing...`);
 
     // ── 2. Drop Layer 0 snippets that cover turns in the verbatim window or
     //       beyond the branch point. (verbatimStartIdx <= chatLength, so this
@@ -805,7 +824,7 @@ function abortSummarization() {
 
 // ─── Core: LLM Summarization with Retry ──────────────────────────────
 
-async function callSummarizer(storyTxt, contextStr) {
+async function callSummarizer(storyTxt, contextStr, opts = {}) {
     trace('>>> ENTERING callSummarizer');
     trace('  storyTxt length:', storyTxt?.length ?? 'UNDEFINED');
     trace('  contextStr length:', contextStr?.length ?? 'UNDEFINED');
@@ -816,10 +835,13 @@ async function callSummarizer(storyTxt, contextStr) {
         enabled: s.enabled,
     });
 
-    const prompt = s.summarizerUserPrompt
+    const sysPrompt = opts.systemPrompt || s.summarizerSystemPrompt;
+    const userTpl = opts.userPrompt || s.summarizerUserPrompt;
+    let prompt = userTpl
         .replace('{{player_name}}', getPlayerName())
         .replace('{{context_str}}', contextStr || '(none yet)')
         .replace('{{story_txt}}', storyTxt);
+    if (userTpl.includes('{{snippet}}')) prompt = prompt.replace('{{snippet}}', opts.snippet || '(none)');
 
     log('── Summarizer Call ──');
     log('Context str length:', contextStr.length, 'chars');
@@ -857,7 +879,7 @@ async function callSummarizer(storyTxt, contextStr) {
 
                 const timeoutMs = 120000;
                 const result = await Promise.race([
-                    sendSummarizerRequest(s, s.summarizerSystemPrompt, prompt),
+                    sendSummarizerRequest(s, sysPrompt, prompt),
                     new Promise((_, reject) => {
                         const timer = setTimeout(() => reject(new Error('Request timed out after 120s')), timeoutMs);
                         signal.addEventListener('abort', () => {
@@ -954,6 +976,55 @@ async function callSummarizer(storyTxt, contextStr) {
         if (isDefaultMode && snapshot) {
             restorePromptToggles(snapshot);
         }
+    }
+}
+
+// ─── Detail Auditor ("sister") ───────────────────────────────────────
+// A second, per-batch pass that checks whether the compact snippet dropped
+// important specifics from the same passage. Reuses callSummarizer's machinery
+// via prompt overrides. Returns '' (no detail) or a short note. Non-fatal.
+
+function normalizeAuditorOutput(raw) {
+    let t = (raw || '').trim();
+    if (!t) return '';
+    // Strip an optional leading "DETAIL:" label the model may include.
+    t = t.replace(/^\s*DETAIL\s*[:\-–]?\s*/i, '').trim();
+    // Treat an explicit "nothing to add" as empty.
+    if (/^\(?\s*(none|n\/?a|nothing|no( new)? detail[s]?( needed)?)\s*\)?[.!]?$/i.test(t)) return '';
+    return t;
+}
+
+async function callAuditor(storyTxt, snippetText, contextStr) {
+    const s = getSettings();
+    const raw = await callSummarizer(storyTxt, contextStr, {
+        systemPrompt: s.sisterSystemPrompt,
+        userPrompt: s.sisterUserPrompt,
+        snippet: snippetText,
+    });
+    return normalizeAuditorOutput(raw);
+}
+
+// Run the auditor for the snippet just pushed to Layer 0 and attach its detail
+// note (if any). Called right after each snippet push. Never throws upward.
+async function maybeAuditDetail(storyTxt, snippetText, contextStr) {
+    const s = getSettings();
+    if (!s.sisterEnabled) return;
+    const store = getChatStore();
+    const layer0 = store.layers && store.layers[0];
+    if (!layer0 || layer0.length === 0) return;
+    const snip = layer0[layer0.length - 1];   // the snippet we just pushed
+    try {
+        const detail = await callAuditor(storyTxt, snippetText, contextStr);
+        if (detail) {
+            snip.detail = detail;
+            await saveChatStore();
+            updateInjection();
+            log(`Detail auditor: attached ${detail.length} chars to snippet.`);
+        } else {
+            log('Detail auditor: snippet already complete — no detail added.');
+        }
+    } catch (e) {
+        log('Detail auditor error — detail skipped, snippet kept:', e);
     }
 }
 
@@ -1104,6 +1175,9 @@ async function summarizeOneBatch(visibleTurns) {
         store.summarizedUpTo = Math.max(store.summarizedUpTo, endIdx);
         await ghostMessagesUpTo(endIdx);
 
+        // Sister pass: check the snippet for dropped specifics; attach a detail note if any.
+        await maybeAuditDetail(storyTxt, summary, contextStr);
+
         log(`Layer 0 now has ${store.layers[0].length} snippets`);
 
         await maybePromoteLayer(0);
@@ -1225,6 +1299,10 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
 
         await saveChatStore();
         await ghostMessagesUpTo(endIdx);
+
+        // Sister pass: check the snippet for dropped specifics; attach a detail note if any.
+        await maybeAuditDetail(storyTxt, summary, contextStr);
+
         await maybePromoteLayer(0);
         await saveChatStore();
 
@@ -1525,8 +1603,21 @@ function assembleSummaryBlock() {
         }
     }
 
-    // Notepad first (stable facts), then the evolving summary. Empty when both are.
-    return notesPart + summaryPart;
+    // ── Sister detail notes — the specifics the compact snippets dropped, for
+    //    recent (Layer 0) events. Rides along with the summary, clearly marked. ──
+    let detailPart = '';
+    if (s.sisterEnabled && store.layers && store.layers[0]) {
+        const notes = store.layers[0]
+            .filter(sn => sn.detail && sn.detail.trim())
+            .map(sn => '- ' + sn.detail.trim());
+        if (notes.length > 0) {
+            const tpl = s.sisterInjectTemplate || '\n\n<details>\n{{details}}\n</details>\n';
+            detailPart = tpl.replace('{{details}}', notes.join('\n'));
+        }
+    }
+
+    // Notepad first (stable canon), then the summary (gist), then details (specifics).
+    return notesPart + summaryPart + detailPart;
 }
 
 // ─── Injection via setExtensionPrompt ────────────────────────────────
@@ -1699,6 +1790,9 @@ function updateUI() {
         $('#sc_notepad').val(store.notepad || '');
         $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
+        $('#sc_sister_enabled').prop('checked', s.sisterEnabled !== false);
+        $('#sc_sister_system_prompt').val(s.sisterSystemPrompt);
+        $('#sc_sister_user_prompt').val(s.sisterUserPrompt);
         // ── Prompt preset migration & sync ──
         // Migration: existing users with the old game-state default get upgraded to narrative.
         // Users who customized their prompt get marked as 'custom'.
@@ -1816,11 +1910,26 @@ function updateSnippetBrowser() {
                     ? `<button class="sc-snippet-redo menu_button fa-solid fa-rotate-right" title="Regenerate this snippet"></button>`
                     : '';
 
+                // Sister detail row (Layer 0 turn-summaries only)
+                let detailRow = '';
+                if (i === 0 && sn.turnRange) {
+                    const hasDetail = sn.detail && String(sn.detail).trim();
+                    const detailText = hasDetail
+                        ? `<span class="sc-detail-text" data-layer="${i}" data-idx="${j}" title="Click to edit detail">📝 ${escapeHtml(String(sn.detail).trim())}</span>`
+                        : `<span class="sc-detail-empty">no detail</span>`;
+                    const detailRedo = `<button class="sc-detail-redo menu_button fa-solid fa-wand-magic-sparkles" title="${hasDetail ? 'Regenerate' : 'Generate'} detail (re-run the sister on these turns)"></button>`;
+                    const detailDel = hasDetail
+                        ? `<button class="sc-detail-delete menu_button fa-solid fa-eraser" title="Delete this detail"></button>`
+                        : '';
+                    detailRow = `<div class="sc-detail-row" data-layer="${i}" data-idx="${j}">${detailText}${detailRedo}${detailDel}</div>`;
+                }
+
                 html += `<div class="sc-snippet" data-layer="${i}" data-idx="${j}">
                 <span class="sc-snippet-text" data-layer="${i}" data-idx="${j}" title="Click to edit">${escapeHtml(sn.text)}</span>
                 <span class="sc-snippet-meta">${rangeStr}${seedStr}</span>
                 ${redoBtn}
                 <button class="sc-snippet-delete menu_button fa-solid fa-xmark" title="Delete this snippet"></button>
+                ${detailRow}
                 </div>`;
             }
             html += '</div>';
@@ -1979,6 +2088,101 @@ function updateSnippetBrowser() {
             toastr.info(`Snippet removed from Layer ${layerIdx}`, 'Summaryception');
         }
     });
+
+    // Edit detail on click
+    $('.sc-detail-text').off('click').on('click', function () {
+        const layerIdx = parseInt($(this).data('layer'));
+        const snippetIdx = parseInt($(this).data('idx'));
+        const layer = store.layers[layerIdx];
+        if (!layer || !layer[snippetIdx]) return;
+        const sn = layer[snippetIdx];
+        const commit = async (val) => {
+            const v = (val || '').trim();
+            if (v !== (sn.detail || '')) {
+                if (v) sn.detail = v; else delete sn.detail;
+                await saveChatStore();
+                updateInjection();
+                toastr.success('Detail updated', 'Summaryception', { timeOut: 1500 });
+            }
+        };
+        const textarea = $('<textarea class="sc-snippet-edit"></textarea>')
+            .val(sn.detail || '')
+            .on('keydown', async function (e) {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    await commit($(this).val());
+                    updateSnippetBrowser();
+                } else if (e.key === 'Escape') {
+                    updateSnippetBrowser();
+                }
+            })
+            .on('blur', async function () {
+                await commit($(this).val());
+                updateSnippetBrowser();
+            });
+        $(this).replaceWith(textarea);
+        textarea[0].style.height = 'auto';
+        textarea[0].style.height = textarea[0].scrollHeight + 'px';
+        textarea.focus().select();
+    });
+
+    // Regenerate / generate detail (re-run the sister on the snippet's source turns)
+    $('.sc-detail-redo').off('click').on('click', async function () {
+        const layerIdx = parseInt($(this).closest('.sc-detail-row').data('layer'));
+        const snippetIdx = parseInt($(this).closest('.sc-detail-row').data('idx'));
+        const layer = store.layers[layerIdx];
+        if (!layer || !layer[snippetIdx] || !layer[snippetIdx].turnRange) return;
+        if (isSummarizing) { toastr.warning('Busy summarizing — try again in a moment.', 'Summaryception'); return; }
+        const sn = layer[snippetIdx];
+        const [rangeStart, rangeEnd] = sn.turnRange;
+        const { chat } = SillyTavern.getContext();
+        isSummarizing = true;
+        const btn = $(this);
+        btn.prop('disabled', true).removeClass('fa-wand-magic-sparkles').addClass('fa-spinner fa-spin');
+        try {
+            const storyTxt = buildPassageFromRange(chat, rangeStart, rangeEnd);
+            if (!storyTxt.trim()) { toastr.error('Source turns are empty — cannot audit.', 'Summaryception'); return; }
+            const contextParts = [];
+            for (let i = store.layers.length - 1; i >= 0; i--) {
+                const l = store.layers[i];
+                if (!l) continue;
+                for (let k = 0; k < l.length; k++) {
+                    if (i === layerIdx && k === snippetIdx) continue;
+                    contextParts.push(l[k].text);
+                }
+            }
+            const contextStr = contextParts.length > 0 ? contextParts.join(' ') : '(none yet)';
+            toastr.info(`Auditing turns ${rangeStart}–${rangeEnd} for detail…`, 'Summaryception', { timeOut: 3000, progressBar: true });
+            const detail = await callAuditor(storyTxt, sn.text, contextStr);
+            if (detail) {
+                sn.detail = detail;
+                toastr.success('Detail generated', 'Summaryception', { timeOut: 2500 });
+            } else {
+                delete sn.detail;
+                toastr.info('Auditor found nothing to add — the snippet already covers it.', 'Summaryception', { timeOut: 3000 });
+            }
+            await saveChatStore();
+            updateInjection();
+        } finally {
+            isSummarizing = false;
+            btn.prop('disabled', false).removeClass('fa-spinner fa-spin').addClass('fa-wand-magic-sparkles');
+            updateSnippetBrowser();
+        }
+    });
+
+    // Delete detail
+    $('.sc-detail-delete').off('click').on('click', async function () {
+        const layerIdx = parseInt($(this).closest('.sc-detail-row').data('layer'));
+        const snippetIdx = parseInt($(this).closest('.sc-detail-row').data('idx'));
+        const layer = store.layers[layerIdx];
+        if (layer && layer[snippetIdx]) {
+            delete layer[snippetIdx].detail;
+            await saveChatStore();
+            updateInjection();
+            updateSnippetBrowser();
+            toastr.info('Detail removed', 'Summaryception', { timeOut: 1500 });
+        }
+    });
 }
 
 function escapeHtml(text) {
@@ -2087,6 +2291,21 @@ function bindUIEvents() {
         getChatStore().notepad = $(this).val();
         saveChatStore();
         updateInjection(true);
+    });
+
+    // ── Detail Auditor (sister) ──
+    $(document).on('change', '#sc_sister_enabled', function () {
+        getSettings().sisterEnabled = $(this).prop('checked');
+        saveSettings();
+        updateInjection(true);
+    });
+    $(document).on('input', '#sc_sister_system_prompt', function () {
+        getSettings().sisterSystemPrompt = $(this).val();
+        saveSettings();
+    });
+    $(document).on('input', '#sc_sister_user_prompt', function () {
+        getSettings().sisterUserPrompt = $(this).val();
+        saveSettings();
     });
 
     $(document).on('change', '#sc_debug_mode', function () {
@@ -2817,7 +3036,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.5.3 (LO) loaded.');
+            console.log(LOG_PREFIX, 'v5.6.0 (LO) loaded — with Detail Auditor.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

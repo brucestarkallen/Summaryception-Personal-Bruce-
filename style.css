@@ -470,3 +470,46 @@
     flex-direction: column;
     gap: 6px;
 }
+/* ─── Sister Detail Notes ─────────────────────────────────────── */
+.sc-snippet { flex-wrap: wrap; }               /* let the detail row drop to its own line */
+
+.sc-detail-row {
+    flex-basis: 100%;
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    margin-top: 4px;
+    padding-left: 8px;
+    border-left: 2px solid rgba(255, 255, 255, 0.14);
+    font-size: 0.95em;
+}
+
+.sc-detail-text {
+    flex: 1;
+    opacity: 0.85;
+    word-break: break-word;
+    cursor: pointer;
+}
+.sc-detail-text:hover { opacity: 1; }
+
+.sc-detail-empty {
+    flex: 1;
+    opacity: 0.3;
+    font-style: italic;
+}
+
+.sc-detail-redo,
+.sc-detail-delete {
+    flex-shrink: 0;
+    opacity: 0.35;
+    cursor: pointer;
+    font-size: 0.8em;
+    padding: 2px 4px;
+    border: none;
+    background: none;
+    transition: opacity 0.15s;
+}
+.sc-detail-redo { color: #7bd88f; }
+.sc-detail-delete { color: #ff6b6b; }
+.sc-detail-redo:hover,
+.sc-detail-delete:hover { opacity: 1; }

@@ -370,6 +370,36 @@
                         <textarea id="sc_summarizer_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
                     </div>
 
+                    <hr class="sc-divider" />
+
+                    <h4 class="sc-section-title">🔍 Detail Auditor (sister)</h4>
+
+                    <div class="sc-row">
+                        <label class="checkbox_label" for="sc_sister_enabled">
+                            <input type="checkbox" id="sc_sister_enabled" />
+                            <span>Enable detail auditor</span>
+                        </label>
+                        <small class="sc-hint">A second pass, once per batch: it checks whether the compact snippet dropped important specifics (exact numbers, named plans/tactics, promises, capabilities, identities) and, if so, attaches a short <em>detail note</em> to that snippet — injected alongside the summary and never auto-edited. Empty for routine batches. Uses the same connection as the summarizer. View / edit / regenerate / delete each note in the Snippet Browser.</small>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_sister_system_prompt">
+                            <span>Auditor System Prompt</span>
+                            <small class="sc-hint">The auditor's role. Should instruct it to output <code>NONE</code> when the snippet already captures everything, or a <code>DETAIL:</code> line of only the missing specifics.</small>
+                        </label>
+                        <textarea id="sc_sister_system_prompt" class="text_pole sc-textarea" rows="4"></textarea>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_sister_user_prompt">
+                            <span>Auditor User Prompt</span>
+                            <small class="sc-hint">
+                                Variables: <code>{{player_name}}</code> <code>{{context_str}}</code> (established memory) <code>{{snippet}}</code> (the short line just written) <code>{{story_txt}}</code> (the same batch passage). Output <code>NONE</code> or <code>DETAIL: …</code>.
+                            </small>
+                        </label>
+                        <textarea id="sc_sister_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
+                    </div>
+
                     <div class="sc-row">
                         <label for="sc_injection_template">
                             <span>Injection Wrapper Template</span>
