@@ -378,6 +378,43 @@
                         <textarea id="sc_injection_template" class="text_pole sc-textarea" rows="3"></textarea>
                     </div>
 
+                    <h4 class="sc-section-title">📍 Injection Placement</h4>
+
+                    <div class="sc-row">
+                        <label for="sc_injection_position">
+                            <span>Where to inject the block</span>
+                            <small class="sc-hint">In-chat @ depth keeps it out of your system prompt. In-prompt merges it with system instructions (old behavior — can cause the bleed you saw).</small>
+                        </label>
+                        <select id="sc_injection_position" class="text_pole">
+                            <option value="1">In-chat @ depth (recommended)</option>
+                            <option value="0">In-prompt (with system)</option>
+                            <option value="2">Before prompt</option>
+                        </select>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_injection_depth">
+                            <span>Injection Depth</span>
+                            <small class="sc-hint">How many messages up from the newest the block sits. Only used for in-chat.</small>
+                        </label>
+                        <div class="sc-slider-row">
+                            <input type="range" id="sc_injection_depth" min="0" max="20" step="1" />
+                            <span id="sc_injection_depth_val" class="sc-val">4</span>
+                        </div>
+                    </div>
+
+                    <hr class="sc-divider" />
+
+                    <h4 class="sc-section-title">📝 Manual Notepad (this chat)</h4>
+
+                    <div class="sc-row">
+                        <label for="sc_notepad">
+                            <span>Story / lore notes</span>
+                            <small class="sc-hint">Facts you write yourself about <em>this</em> story — injected with the summary and never auto-edited or summarized away. Saved per-chat and carried into branches. Good for lore, character canon, world rules, names.</small>
+                        </label>
+                        <textarea id="sc_notepad" class="text_pole sc-textarea sc-textarea-tall" rows="6" placeholder="Lore this story must never forget — e.g. character names & canon, world rules, locations, ongoing plot facts."></textarea>
+                    </div>
+
                     <hr class="sc-divider" />
 
                     <!-- Strip Patterns -->

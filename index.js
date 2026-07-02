@@ -32,6 +32,14 @@ const defaultSettings = Object.freeze({
     maxLayers: 5,
     injectionTemplate: '\n\n<summary>\n{{summary}}\n</summary>\n\n',
 
+    // ── Injection placement (previously hardcoded to IN_PROMPT / system) ──
+    injectionPosition: 1,   // 0 = in-prompt (merged w/ system) · 1 = in-chat @ depth · 2 = before-prompt
+    injectionDepth: 4,      // messages up from newest; only used when position = 1
+    injectionRole: 0,       // 0 = system · 1 = user · 2 = assistant
+
+    // ── Manual notepad wrapper (the note text itself is stored per-chat, in chat metadata) ──
+    notepadTemplate: '\n\n<notes>\n{{notes}}\n</notes>\n',
+
     summarizerSystemPrompt:
         'Role: precise narrative-state tracker. Output only the summary line — no preamble, no commentary, no markdown.',
 
@@ -269,6 +277,10 @@ function getChatStore() {
     // Migration: add ghostedIndices if missing from older saves
     if (!chatMetadata[MODULE_NAME].ghostedIndices) {
         chatMetadata[MODULE_NAME].ghostedIndices = [];
+    }
+    // Manual notepad — per-chat story/lore memory you write yourself
+    if (chatMetadata[MODULE_NAME].notepad === undefined) {
+        chatMetadata[MODULE_NAME].notepad = '';
     }
     return chatMetadata[MODULE_NAME];
 }
@@ -509,56 +521,84 @@ async function repairIfBranched() {
     const store = getChatStore();
 
     if (!chat || chat.length === 0) return;
-    if (store.summarizedUpTo < 0) return;
 
     const chatLength = chat.length;
+    const s = getSettings();
+    const layer0 = store.layers && store.layers[0] ? store.layers[0] : null;
 
-    // If summarizedUpTo is beyond (or at) the end of the chat, we branched
-    if (store.summarizedUpTo >= chatLength) {
-        const oldSummarizedUpTo = store.summarizedUpTo;
-        log(`Branch detected! summarizedUpTo (${oldSummarizedUpTo}) >= chat length (${chatLength}). Repairing...`);
+    // A branch is detected when the summary state references turns at or beyond
+    // the (new, shorter) end of the chat.
+    const summaryOverruns = store.summarizedUpTo >= chatLength;
+    const snippetOverruns = !!layer0 && layer0.some(sn => sn.turnRange && sn.turnRange[1] >= chatLength);
+    if (!summaryOverruns && !snippetOverruns) return;   // normal load — leave it alone
 
-        // Find the safe cutoff — the last message index that actually exists
-        const safeCutoff = chatLength - 1;
+    const oldSummarizedUpTo = store.summarizedUpTo;
+    log(`Branch detected! summarizedUpTo=${oldSummarizedUpTo}, chatLength=${chatLength}. Repairing...`);
 
-        // Remove Layer 0 snippets whose turnRange extends beyond the branch point
-        if (store.layers[0]) {
-            const before = store.layers[0].length;
-            store.layers[0] = store.layers[0].filter(sn => {
-                if (!sn.turnRange) return true; // promoted snippets without turnRange are kept
-                return sn.turnRange[1] < chatLength;
-            });
-            const removed = before - store.layers[0].length;
-            if (removed > 0) {
-                log(`Removed ${removed} Layer 0 snippets that referenced turns beyond branch point`);
-            }
-        }
-
-        // Recalculate summarizedUpTo based on remaining snippets
-        if (store.layers[0] && store.layers[0].length > 0) {
-            const maxEnd = Math.max(...store.layers[0]
-            .filter(sn => sn.turnRange)
-            .map(sn => sn.turnRange[1]));
-            store.summarizedUpTo = maxEnd;
-        } else {
-            store.summarizedUpTo = -1;
-        }
-
-        // Trim ghostedIndices to only include valid indices
-        if (store.ghostedIndices) {
-            store.ghostedIndices = store.ghostedIndices.filter(idx => idx < chatLength);
-        }
-
-        await saveChatStore();
-
-        log(`Branch repair complete. summarizedUpTo: ${oldSummarizedUpTo} → ${store.summarizedUpTo}`);
-
-        toastr.info(
-            `Branch detected — trimmed ${oldSummarizedUpTo - store.summarizedUpTo} turns of stale summary data that referenced messages beyond the branch point.`,
-            'Summaryception — Branch Repair',
-            { timeOut: 6000 }
-        );
+    // ── 1. Work out the verbatim window: the most recent `verbatimTurns`
+    //       assistant turns that still exist in this branch should go back to
+    //       being verbatim (visible, word-for-word). Ghosted assistant turns are
+    //       is_system=true, so include those in the count. ──
+    const asstTurns = [];
+    for (let i = 0; i < chatLength; i++) {
+        const m = chat[i];
+        if (!m || !m.mes || !m.mes.trim()) continue;
+        const isOurGhost = m.extra?.sc_ghosted === true;
+        if (!m.is_user && (!m.is_system || isOurGhost)) asstTurns.push(i);
     }
+    const keep = Math.max(0, asstTurns.length - (s.verbatimTurns ?? 10));
+    const verbatimStartIdx = asstTurns.length > 0
+        ? (keep < asstTurns.length ? asstTurns[keep] : chatLength)
+        : chatLength;
+
+    // ── 2. Drop Layer 0 snippets that cover turns in the verbatim window or
+    //       beyond the branch point. (verbatimStartIdx <= chatLength, so this
+    //       also removes any snippet that runs past the end of the branch.) ──
+    if (layer0) {
+        const before = layer0.length;
+        store.layers[0] = layer0.filter(sn => {
+            if (!sn.turnRange) return true;                 // promoted seeds w/o range: keep
+            return sn.turnRange[1] < verbatimStartIdx;
+        });
+        const removed = before - store.layers[0].length;
+        if (removed > 0) log(`Removed ${removed} Layer 0 snippet(s) covering the verbatim window / beyond the branch.`);
+    }
+
+    // ── 3. Recompute summarizedUpTo from the snippets that survived. ──
+    const survivors = (store.layers[0] || []).filter(sn => sn.turnRange);
+    store.summarizedUpTo = survivors.length > 0
+        ? Math.max(...survivors.map(sn => sn.turnRange[1]))
+        : -1;
+
+    // ── 4. Un-ghost everything past the (new) summarized boundary, so no turn is
+    //       ever both hidden AND unsummarized. This restores the verbatim window
+    //       and rescues any turns orphaned by a straddling snippet. ──
+    let unghosted = 0;
+    for (let i = store.summarizedUpTo + 1; i < chatLength; i++) {
+        const m = chat[i];
+        if (m?.extra?.sc_ghosted) {
+            delete m.extra.sc_ghosted;
+            try {
+                await SillyTavern.getContext().executeSlashCommandsWithOptions(`/unhide ${i}`, { showOutput: false });
+            } catch (e) {
+                log(`Failed to unhide message ${i}:`, e);
+            }
+            unghosted++;
+        }
+    }
+
+    // ── 5. Trim the ghost tracking to only valid, still-summarized indices. ──
+    store.ghostedIndices = (store.ghostedIndices || [])
+        .filter(idx => idx < chatLength && idx <= store.summarizedUpTo);
+
+    await saveChatStore();
+
+    log(`Branch repair complete. summarizedUpTo: ${oldSummarizedUpTo} → ${store.summarizedUpTo}, un-ghosted ${unghosted} turn(s).`);
+    toastr.info(
+        `Branch repaired — rewound the summary to turn ${store.summarizedUpTo} and restored ${unghosted} recent turn(s) to verbatim. They'll be re-summarized as this branch grows.`,
+        'Summaryception — Branch Repair',
+        { timeOut: 6000 }
+    );
 }
 
 // ─── Assistant Turn Utilities ────────────────────────────────────────
@@ -1461,53 +1501,65 @@ function assembleSummaryBlock() {
     const s = getSettings();
     const store = getChatStore();
 
-    if (!store.layers || store.layers.every(l => !l || l.length === 0)) return '';
+    // ── Manual notepad — per-chat story/lore memory (survives branches) ──
+    let notesPart = '';
+    if (store.notepad && store.notepad.trim().length > 0) {
+        const tpl = s.notepadTemplate || '\n\n<notes>\n{{notes}}\n</notes>\n';
+        notesPart = tpl.replace('{{notes}}', store.notepad.trim());
+    }
 
-    const snippets = [];
-
-    for (let i = store.layers.length - 1; i >= 1; i--) {
-        const layer = store.layers[i];
-        if (!layer || layer.length === 0) continue;
-        for (const sn of layer) {
-            snippets.push(sn.text);
+    // ── Auto-generated layered summary ──
+    let summaryPart = '';
+    if (store.layers && !store.layers.every(l => !l || l.length === 0)) {
+        const snippets = [];
+        for (let i = store.layers.length - 1; i >= 1; i--) {
+            const layer = store.layers[i];
+            if (!layer || layer.length === 0) continue;
+            for (const sn of layer) snippets.push(sn.text);
+        }
+        if (store.layers[0] && store.layers[0].length > 0) {
+            for (const sn of store.layers[0]) snippets.push(sn.text);
+        }
+        if (snippets.length > 0) {
+            summaryPart = s.injectionTemplate.replace('{{summary}}', snippets.join(' '));
         }
     }
 
-    if (store.layers[0] && store.layers[0].length > 0) {
-        for (const sn of store.layers[0]) {
-            snippets.push(sn.text);
-        }
-    }
-
-    if (snippets.length === 0) return '';
-
-    return s.injectionTemplate.replace('{{summary}}', snippets.join(' '));
+    // Notepad first (stable facts), then the evolving summary. Empty when both are.
+    return notesPart + summaryPart;
 }
 
 // ─── Injection via setExtensionPrompt ────────────────────────────────
 
 let _lastInjected = '';
 
-function updateInjection() {
+function updateInjection(force = false) {
     try {
         const { setExtensionPrompt } = SillyTavern.getContext();
         const s = getSettings();
 
+        const pos  = (s.injectionPosition ?? 1);
+        const dep  = (s.injectionDepth ?? 4);
+        const role = (s.injectionRole ?? 0);
+
         if (!s.enabled) {
-            if (_lastInjected !== '') {
-                setExtensionPrompt(MODULE_NAME, '', 0, 0, false, 0);
+            if (_lastInjected !== '' || force) {
+                setExtensionPrompt(MODULE_NAME, '', pos, dep, false, role);
                 _lastInjected = '';
             }
             return;
         }
 
         const summaryBlock = assembleSummaryBlock();
-        if (summaryBlock === _lastInjected) return;
+        // `force` bypasses the cache — required on chat/branch switch, because a
+        // branch inherits the parent's metadata so the block is byte-identical to
+        // what was last injected, and the plain equality check would skip re-injection.
+        if (!force && summaryBlock === _lastInjected) return;
 
-        setExtensionPrompt(MODULE_NAME, summaryBlock || '', 0, 0, false, 0);
+        setExtensionPrompt(MODULE_NAME, summaryBlock || '', pos, dep, false, role);
         _lastInjected = summaryBlock || '';
 
-        log(`Injection updated: ${(summaryBlock || '').length} chars`);
+        log(`Injection updated: ${(summaryBlock || '').length} chars @ pos ${pos} depth ${dep}`);
     } catch (e) {
         log('updateInjection error:', e);
     }
@@ -1537,13 +1589,16 @@ function onChatChanged() {
     catchupDismissed = false;
     setTimeout(async () => {
         await repairIfBranched();
-        updateInjection();
+        updateInjection(true);   // force — new branch/chat needs re-injection past the cache
         updateUI();
-    }, 100);
+    }, 200);
 }
 
 function onGenerationStarted() {
-    updateInjection();
+    // Force so the injection is guaranteed present at prompt-build time, even if
+    // a branch/chat switch left it stale or cleared. This removes the need to
+    // toggle enabled/pause or refresh the page after branching.
+    updateInjection(true);
 }
 
 // ─── Slash Commands ──────────────────────────────────────────────────
@@ -1638,6 +1693,10 @@ function updateUI() {
         $('#sc_max_layers').val(s.maxLayers);
         $('#sc_max_layers_val').text(s.maxLayers);
         $('#sc_injection_template').val(s.injectionTemplate);
+        $('#sc_injection_position').val(String(s.injectionPosition ?? 1));
+        $('#sc_injection_depth').val(s.injectionDepth ?? 4);
+        $('#sc_injection_depth_val').text(s.injectionDepth ?? 4);
+        $('#sc_notepad').val(store.notepad || '');
         $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
         // ── Prompt preset migration & sync ──
@@ -2008,6 +2067,27 @@ function bindUIEvents() {
             saveSettings();
         });
     }
+
+    // ── Injection placement controls ──
+    $(document).on('change', '#sc_injection_position', function () {
+        getSettings().injectionPosition = parseInt($(this).val(), 10);
+        saveSettings();
+        updateInjection(true);
+    });
+    $(document).on('input', '#sc_injection_depth', function () {
+        const val = parseInt($(this).val(), 10);
+        getSettings().injectionDepth = val;
+        $('#sc_injection_depth_val').text(val);
+        saveSettings();
+        updateInjection(true);
+    });
+
+    // ── Manual notepad (per-chat, live) ──
+    $(document).on('input', '#sc_notepad', function () {
+        getChatStore().notepad = $(this).val();
+        saveChatStore();
+        updateInjection(true);
+    });
 
     $(document).on('change', '#sc_debug_mode', function () {
         getSettings().debugMode = $(this).prop('checked');
@@ -2715,33 +2795,58 @@ async function fetchProfilesFallback(selectElement, currentValue) {
 // ─── Initialization ──────────────────────────────────────────────────
 
 (async function init() {
-    const {
-        eventSource,
-        event_types,
-        renderExtensionTemplateAsync,
-    } = SillyTavern.getContext();
+    try {
+        const {
+            eventSource,
+            event_types,
+            renderExtensionTemplateAsync,
+        } = SillyTavern.getContext();
 
-    getSettings();
+        getSettings();
 
-    const html = await renderExtensionTemplateAsync(
-        'third-party/Extension-Summaryception',
-        'settings',
-        {}
-    );
-    $('#extensions_settings2').append(html);
+        // Register core hooks + slash commands FIRST. These are what actually run
+        // your memory: injection, summarization, and branch repair. They don't
+        // depend on the settings panel, so registering them up front means a panel
+        // failure below can never stop them — and there's no window at startup
+        // where an early chat event is missed.
+        eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
+        eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
+        eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
+        registerSlashCommands();
 
-    bindUIEvents();
-    initConnectionUI();
+        eventSource.on(event_types.APP_READY, () => {
+            updateInjection();
+            updateUI();
+            console.log(LOG_PREFIX, 'v5.5.3 (LO) loaded.');
+        });
 
-    eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-    eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
-    eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
+        // Settings panel — isolated. renderExtensionTemplateAsync() fetches
+        // settings.html by a FIXED path, so if this extension's folder is named
+        // anything other than "Extension-Summaryception" the fetch 404s. Keeping
+        // it in its own try means that failure only hides the settings panel;
+        // the memory engine above keeps working.
+        try {
+            // Work out our OWN folder name from this module's URL, so the settings
+            // panel loads no matter what you named the repo/folder. This removes the
+            // fixed-name requirement entirely. If URL detection ever fails, fall back
+            // to the current known folder name.
+            let extPath = 'third-party/Summaryception-Personal-Bruce-';
+            try {
+                const m = import.meta.url.match(/extensions\/(third-party\/[^/]+)\//);
+                if (m && m[1]) extPath = decodeURIComponent(m[1]);
+            } catch (_) { /* keep fallback */ }
 
-    registerSlashCommands();
-
-    eventSource.on(event_types.APP_READY, () => {
-        updateInjection();
-        updateUI();
-        console.log(LOG_PREFIX, 'v5.5.3 loaded. Connection Settings available');
-    });
+            const html = await renderExtensionTemplateAsync(extPath, 'settings', {});
+            $('#extensions_settings2').append(html);
+            bindUIEvents();
+            initConnectionUI();
+        } catch (e) {
+            console.error(
+                `${LOG_PREFIX} Settings panel failed to load (the core memory features still work). It tried to load settings from the extension's own folder, detected via import.meta.url.`,
+                e
+            );
+        }
+    } catch (e) {
+        console.error(`${LOG_PREFIX} Initialization failed:`, e);
+    }
 })();
