@@ -2394,6 +2394,80 @@ async function finalizeAfterApply() {
     $('#sc_editor_undo').show();
 }
 
+// ─── Copilot Bridge: mirror memory into the Author's Note ─────────────
+// External OOC tools (e.g. ST-Copilot) can't read Summaryception's memory
+// directly — they only read native fields. The Author's Note is the one native
+// field that's meant to be written programmatically and that such tools read.
+// So we can copy the FULL memory (notepad + snippets + details) into it on
+// demand, and pull it back out — stashing any real Author's Note content in a
+// non-injected place so nothing is lost or permanently duplicated.
+const SC_AN_START = '[SUMMARYCEPTION MEMORY';
+const SC_AN_END = '[END SUMMARYCEPTION MEMORY]';
+
+function formatMemoryForAN() {
+    const dump = buildMemoryDump();
+    let out = `${SC_AN_START} — auto-generated snapshot for OOC analysis tools. This is compressed story memory/canon, NOT direction for the roleplay. Older ("ghosted") events the roleplay AI can no longer see live here as snippets.]\n\n`;
+    out += `NOTEPAD (permanent canon — highest authority):\n${dump.notepad && dump.notepad.trim() ? dump.notepad.trim() : '(empty)'}\n\n`;
+    out += `SNIPPETS (compressed event memory, oldest → newest):\n`;
+    if (dump.snippets.length === 0) {
+        out += '(none yet)\n';
+    } else {
+        for (const s of dump.snippets) {
+            const turns = s.turns ? ` (turns ${s.turns})` : ' (meta-summary)';
+            out += `- ${s.id}${turns}: ${s.text}`;
+            if (s.detail) out += `  [detail: ${s.detail}]`;
+            out += '\n';
+        }
+    }
+    out += `\n${SC_AN_END}`;
+    return out;
+}
+
+function _getAuthorsNote() {
+    const ctx = SillyTavern.getContext();
+    return (ctx.chatMetadata && ctx.chatMetadata.note_prompt) || '';
+}
+
+function _setAuthorsNote(text) {
+    const ctx = SillyTavern.getContext();
+    if (ctx.chatMetadata) {
+        ctx.chatMetadata.note_prompt = text;
+        if (typeof ctx.saveMetadata === 'function') ctx.saveMetadata();
+    }
+    // keep the on-screen Author's Note textarea in sync if it's rendered
+    const $an = $('#extension_floating_prompt');
+    if ($an.length) { $an.val(text).trigger('input'); }
+}
+
+async function mirrorMemoryToAN() {
+    const store = getChatStore();
+    const current = _getAuthorsNote();
+    // stash the REAL author's note (non-injected storage) only if it isn't already our block
+    if (!current.includes(SC_AN_START)) {
+        store.anStash = current;
+        await saveChatStore();
+    }
+    _setAuthorsNote(formatMemoryForAN());
+    toastr.success("Full memory mirrored to the Author's Note. Ask Copilot now — then hit Restore.", 'Summaryception', { timeOut: 5000 });
+}
+
+async function restoreAuthorsNoteFromStash() {
+    const store = getChatStore();
+    const stashed = store.anStash != null ? store.anStash : '';
+    _setAuthorsNote(stashed);
+    delete store.anStash;
+    await saveChatStore();
+    toastr.info(stashed.trim() ? "Author's Note restored." : "Author's Note cleared (nothing was there before).", 'Summaryception', { timeOut: 3000 });
+}
+
+async function clearAuthorsNoteHard() {
+    const store = getChatStore();
+    _setAuthorsNote('');
+    delete store.anStash;
+    await saveChatStore();
+    toastr.info("Author's Note wiped.", 'Summaryception', { timeOut: 2500 });
+}
+
 function bindUIEvents() {
     $(document).on('change', '#sc_enabled', function () {
         getSettings().enabled = $(this).prop('checked');
@@ -2519,6 +2593,11 @@ function bindUIEvents() {
         abortSummarization();
         toastr.info('Cancelling the co-writer…', 'Summaryception', { timeOut: 1500 });
     });
+
+    // ── Copilot Bridge (Author's Note) ──
+    $(document).on('click', '#sc_mirror_an', mirrorMemoryToAN);
+    $(document).on('click', '#sc_restore_an', restoreAuthorsNoteFromStash);
+    $(document).on('click', '#sc_clear_an', clearAuthorsNoteHard);
     $(document).on('input', '#sc_editor_system_prompt', function () {
         getSettings().editorSystemPrompt = $(this).val();
         saveSettings();
@@ -3287,7 +3366,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.7.1 (LO) loaded — Detail Auditor + Continuity Editor + Cancel.');
+            console.log(LOG_PREFIX, 'v5.8.0 (LO) loaded — Detail Auditor + Continuity Editor + Copilot Bridge.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

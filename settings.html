@@ -485,6 +485,20 @@
 
                     <hr class="sc-divider" />
 
+                    <h4 class="sc-section-title">🔗 Copilot Bridge (Author's Note)</h4>
+
+                    <div class="sc-row">
+                        <small class="sc-hint">External OOC tools like ST-Copilot can't read Summaryception's memory directly — they only read native fields. These buttons copy your <b>full</b> memory (notepad + every snippet + details) into the Author's Note so Copilot can see the ghosted past too, then let you pull it back out. Your existing Author's Note is stashed in a non-injected slot and returns on Restore. Note: while mirrored, the memory is briefly also sent to your roleplay AI (harmless — it's your own canon), so Restore when you're done. Tip: if you set your Author's Note to not inject (disable it), test whether Copilot still sees it — if so, you get zero duplication.</small>
+                    </div>
+
+                    <div class="sc-row sc-editor-actions">
+                        <button id="sc_mirror_an" class="menu_button">🔗 Mirror memory → Author's Note</button>
+                        <button id="sc_restore_an" class="menu_button">↩️ Restore Author's Note</button>
+                        <button id="sc_clear_an" class="menu_button menu_button_danger">🗑️ Wipe Author's Note</button>
+                    </div>
+
+                    <hr class="sc-divider" />
+
                     <!-- Strip Patterns -->
                     <div class="sc-row">
                         <label for="sc_strip_patterns">
