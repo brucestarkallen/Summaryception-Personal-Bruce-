@@ -47,9 +47,9 @@ const defaultSettings = Object.freeze({
     sisterEnabled: true,
     sisterInjectTemplate: '\n\n<details>\nSpecifics behind recent events (canon — do not contradict):\n{{details}}\n</details>\n',
     sisterSystemPrompt:
-        'Role: continuity auditor for an ongoing fiction. You receive a compact summary snippet and the exact passage it was made from. Your ONLY job: decide whether the snippet dropped important, hard-to-reconstruct specifics a future storyteller would need — exact numbers, named plans or tactics, specific commitments or conditions, precise capabilities, or identity details. If the snippet already captures everything important, output exactly: NONE. Otherwise output a single "DETAIL:" line containing ONLY the missing specifics, as terse director\'s notes (breaking the fourth wall is fine). Never repeat anything the snippet or prior context already contains. No preamble, no markdown, no commentary.',
+        'Role: continuity auditor for an ongoing fiction. You receive a compact summary snippet and the exact passage it was made from. Your ONLY job: decide whether the snippet dropped important, hard-to-reconstruct information a future storyteller would need — exact numbers, named plans or tactics, specific commitments or conditions, precise capabilities, identity details, or background canon (family structure, separations/divorces, custody or legal situations, relationships, personal history). The passage may include out-of-character material — parentheticals, analysis requests, or verification blocks before/after the scene; facts established there COUNT as part of the passage. Words like "Confirmed" or OOC framing do NOT make a fact already-established — only actual presence in the prior context does. If the snippet already captures everything important, output exactly: NONE. Otherwise output a single "DETAIL:" line containing ONLY the missing information, as terse director\'s notes (breaking the fourth wall is fine). Never repeat anything the snippet or prior context already contains. No preamble, no markdown, no commentary.',
     sisterUserPrompt:
-        `<player_name>{{player_name}}</player_name>\n<prior_context>{{context_str}}</prior_context>\n<passage>{{story_txt}}</passage>\n<snippet>{{snippet}}</snippet>\n\n<snippet> is the compact memory line already recorded for <passage>.\n\nDecide: does <snippet> omit any important specifics from <passage> that a storyteller would need and could NOT reconstruct from the gist alone? Consider: exact quantities/counts, named tactics or plans, specific conditional promises ("if X then Y"), precise capabilities or limits, and identity/title details.\n\nRecord ONLY omissions that are ALL of: (a) present in <passage>, (b) NOT already in <snippet>, (c) NOT already in <prior_context>.\n\nIf <snippet> already captures everything important, output exactly:\nNONE\n\nOtherwise output ONE line:\nDETAIL: <only the missing specifics, short phrases separated by semicolons>`,
+        `<player_name>{{player_name}}</player_name>\n<prior_context>{{context_str}}</prior_context>\n<passage>{{story_txt}}</passage>\n<snippet>{{snippet}}</snippet>\n\n<snippet> is the compact memory line already recorded for <passage>.\n\nDecide: does <snippet> omit any important information from <passage> that a storyteller would need and could NOT reconstruct from the gist alone? Consider: exact quantities/counts, named tactics or plans, specific conditional promises ("if X then Y"), precise capabilities or limits, identity/title details, and background canon (family structure, separations/divorces, custody or legal situations, relationships, personal history).\n\n<passage> may contain out-of-character material — parenthetical notes, analysis requests, or verification blocks (e.g. "Family Logic Confirmed") before or after the scene. Background facts established in such OOC material COUNT as present in <passage>. OOC framing or words like "Confirmed" do NOT make a fact already-established — only actual presence in <prior_context> does.\n\nRecord ONLY omissions that are ALL of: (a) present in <passage>, (b) NOT already in <snippet>, (c) NOT already in <prior_context>.\n\nIf <snippet> already captures everything important, output exactly:\nNONE\n\nOtherwise output ONE line:\nDETAIL: <only the missing information, short phrases separated by semicolons>`,
 
     // ── Continuity Editor ("Co-Writer / Master Novelist") prompts ──
     editorSystemPrompt:
@@ -58,28 +58,47 @@ const defaultSettings = Object.freeze({
         `<player_name>{{player_name}}</player_name>\n\n<instruction>\n{{command}}\n</instruction>\n\n<memory>\n{{memory}}\n</memory>\n\n<memory> has "notepad" (established canon) and "snippets" (each with an "id" like "L0#3", its "text", and optional "detail"). Apply <instruction> by editing memory so the whole story stays logical and consistent.\n\nReturn a JSON array of edit operations. Allowed ops:\n{"op":"edit_notepad","text":"<full new notepad>","reason":"<short why>"}\n{"op":"edit_snippet","id":"L0#3","text":"<new snippet text>","reason":"<short why>"}\n{"op":"delete_snippet","id":"L0#3","reason":"<short why>"}\n{"op":"edit_detail","id":"L0#3","text":"<new detail text>","reason":"<short why>"}\n{"op":"delete_detail","id":"L0#3","reason":"<short why>"}\n\nRules: reference snippets ONLY by their exact "id" from <memory>. Keep edits minimal — do not rewrite unaffected entries. Output ONLY the JSON array (or [] if nothing needs changing).`,
 
     summarizerSystemPrompt:
-        'Role: precise narrative-state tracker. Output only the summary line — no preamble, no commentary, no markdown.',
+        'You are a precise narrative-state tracker for an ongoing fiction. Output one line of short phrases — no preamble, no commentary, no markdown. Record only what the passage states. Never infer, never guess. Out-of-character material inside the passage (parenthetical notes, analysis or verification blocks before/after the scene) counts as part of the record when it establishes background facts not already in prior context; OOC framing or words like "Confirmed" do not make a fact established.',
 
     summarizerUserPrompt:
-        `<player_name>
-{{player_name}}
-</player_name>
+        `<player_name>{{player_name}}</player_name>
+<prior_context>{{context_str}}</prior_context>
+<passage>{{story_txt}}</passage>
 
-<prior_context>
-{{context_str}}
-</prior_context>
+Write ONE line recording only what is NEW in <passage> relative to <prior_context>.
 
-<passage_in_question>
-{{story_txt}}
-</passage_in_question>
+HARD EXCLUSIONS — do not record:
+- Anything already stated in <prior_context>, even indirectly. If a fact, location, relationship, spec, stat, or character trait appears in <prior_context>, it is ESTABLISHED. Never restate it.
+- CRITICAL: If <prior_context> already references an event, arrival, match, deployment, or location that <passage> now depicts in full scene form, treat the scene itself as established. Record ONLY the specific new details the prior reference did not contain.
+- Atmosphere, weather, particulate haze, lighting, crowd noise, body language without narrative consequence.
+- Repeated reactions ("X froze," "Y watched") unless they trigger a new action.
+- Ongoing states (repeated locations, reactor levels, recurring postures) — state these ONCE, then never again.
 
-Summarize only the necessary elements from the passage_in_question to coherently continue the prior_context. If the passage_in_question has 2nd person point of view, 'you' pronoun in prose refers to the player. Use the player name in the summary output instead of 'you'.
+RECORD (in priority order):
+1. {{player_name}}'s decisions, declarations, and actions.
+2. Other named characters' actions that change state, advance plot, or reveal information. In social or group scenes, each named character who approaches, addresses, or acts toward {{player_name}} or the focal character is a SEPARATE record — never collapse multiple participants into "others" or a single summary. Capture who did what, individually.
+3. New facts: identities, numbers, titles, troop counts, match results, tactical details, scale shifts (crowd size, social attraction, popularity, odds, distances). When multiple characters contribute personal knowledge about a previously unmentioned character or entity, treat the combined profile as high-priority canon — preserve the character's identity, key achievements, and each contributor's unique connection to them.
+4. Plans and strategy: the problem, the proposed solution, who proposed it. Include stated intentions, conditional promises, and "if-then" commitments.
+5. Character self-declarations and diagnostic reads: when a named character explicitly states their own motivation, principle, boundary, self-assessment, method, capability, or knowledge source in dialogue — OR delivers a strategic assessment of another character's transformation, capability, or position — record the substance (paraphrased, not quoted).
+6. Information asymmetries: when the text explicitly flags that one character knows or witnessed something another character doesn't know they know, record who saw/knows what.
+7. Temporal markers: if the passage states a specific day, date, month, season, or time-of-day transition (morning/afternoon/evening/night, Day 4, Tuesday, Mar 15, late March, etc.), you MUST prefix the ENTIRE line with the earliest such marker in compact form (e.g., "[Sept 1, 08:24] Jovan did X;..."). A temporal marker is a PREFIX ONLY — it is never by itself a reason to generate content. Omit if no temporal marker appears.
+8. Corrections & Retcons: If <passage> reveals that a fact, motive, or state in <prior_context> was a lie, a misunderstanding, or has logically changed, record this update explicitly. Format as: [Correction] [Subject]'s prior [state/action] was actually [new truth] because [reason].
+9. System & Stat Deltas: Extract any changed stats, tags, or UI variables (e.g., P:, R:, S:). You MUST compress ALL stat updates into a SINGLE phrase at the very END of the line, formatted as: STATS: Name(P:X/R:Y/S:Z), Name(P:X/R:Y/S:Z). Do not use multiple phrases for stats.
+10. OOC-established canon: <passage> may contain out-of-character material — parenthetical notes, analysis requests, or verification blocks (e.g. "Family Logic Confirmed") before or after the scene. If such material establishes background facts (family structure, separations/divorces, custody or legal situations, relationships, personal history) NOT already in <prior_context>, record their substance as priority-3 facts. OOC framing or words like "Confirmed" do NOT make a fact established — only actual presence in <prior_context> does.
 
-Focus on: character interactions, dialogue tone, and relationship dynamics; emotional beats and character motivations; atmosphere, mood, and sensory details that establish tone; narrative themes and subtext; names, location changes, and time; plot developments and unresolved tensions; details that distinguish this moment from any other.
+ACTOR RULES:
+- Every action needs an EXPLICIT actor named in the text. Presence ≠ actorship.
+- If no actor is named, write passive voice. Never guess.
+- ABSOLUTE PRONOUN BAN: Use character names everywhere. You must replace ALL pronouns (he, him, his, she, her, hers, they, them, their, it) with the specific character's name.
+- If the passage uses second-person ("you", "your") to refer to the player, replace with {{player_name}}.
+- Past events referenced in <passage> belong to whoever the text says performed them.
 
-Exclude anything insubstantial, fluff, atmospheric details, or events already covered in Prior Context.
+FORMAT:
+- One line. Short phrases separated by semicolons.
+- HARD LIMIT: 15 phrases. For dense scenes with 4+ named participants, 18 phrases maximum. The bundled STATS phrase counts as ONE phrase. If you exceed the limit, cut lowest-priority items first (priority order above) — never cut to fit by dropping high-priority canon or by collapsing distinct named participants together.
+- If <passage> has nothing new beyond <prior_context>, output exactly: (no new state)
 
-Write in short phrases, no more than 20; output must be a single line:`,
+BEFORE OUTPUTTING, verify: (1) the line starts with a temporal prefix if available; (2) no phrase duplicates anything in <prior_context>; (3) NO PRONOUNS remain — all replaced with names; (4) phrase count within limit; (5) every action has an explicit actor or is passive voice; (6) every named character who acted toward {{player_name}} or the focal character is recorded individually, not merged; (7) TIMELINE LOGIC — new facts do not create unexplained paradoxes with <prior_context>; if a paradox exists, resolve it with a [Correction] tag; (8) ALL stats are bundled into ONE phrase at the end; (9) OOC-established background facts (rule 10) are captured, not skipped as "already confirmed". If any check fails, revise.`,
 
     promptPreset: 'narrative',  // 'narrative' | 'gamestate' | 'custom'
     savedCustomPrompts: {},        // { name: promptText } — named custom prompt slots
@@ -2665,6 +2684,20 @@ function bindUIEvents() {
         btn.prop('disabled', false).text('✅ Apply All');
     });
 
+    // ── Universal "Reset to Default" for prompt/template fields ──
+    // Restores the field to the shipped default (the current best-known version),
+    // saves it, and re-runs the field's own input handler so everything downstream
+    // (preset detection, injection refresh) stays consistent.
+    $(document).on('click', '.sc-prompt-reset', function () {
+        const key = $(this).data('key');
+        const target = $(this).data('target');
+        if (!Object.hasOwn(defaultSettings, key)) return;
+        getSettings()[key] = defaultSettings[key];
+        saveSettings();
+        $(target).val(defaultSettings[key]).trigger('input');
+        toastr.success('Reset to default', 'Summaryception', { timeOut: 1500 });
+    });
+
     $(document).on('change', '#sc_debug_mode', function () {
         getSettings().debugMode = $(this).prop('checked');
         saveSettings();
@@ -3393,7 +3426,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.8.2 (LO) loaded — background auditor (fast summarize+ghost).');
+            console.log(LOG_PREFIX, 'v5.8.4 (LO) loaded — LO-edition defaults + Reset to Default everywhere.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

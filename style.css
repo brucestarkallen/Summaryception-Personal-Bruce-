@@ -562,3 +562,12 @@
 .sc-editor-btns .menu_button { padding: 2px 10px; font-size: 0.9em; }
 
 .sc-editor-count { opacity: 0.6; font-size: 0.85em; }
+
+/* ─── Prompt reset buttons ────────────────────────────────── */
+.sc-prompt-reset {
+    margin-top: 4px;
+    font-size: 0.8em;
+    padding: 2px 10px;
+    opacity: 0.7;
+}
+.sc-prompt-reset:hover { opacity: 1; }

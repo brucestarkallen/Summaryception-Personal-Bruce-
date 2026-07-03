@@ -309,6 +309,7 @@
                             <span>System Prompt</span>
                         </label>
                         <textarea id="sc_summarizer_system_prompt" class="text_pole sc-textarea" rows="3"></textarea>
+                        <button class="menu_button sc-prompt-reset" data-key="summarizerSystemPrompt" data-target="#sc_summarizer_system_prompt">↺ Reset to Default</button>
                     </div>
 
                     <div class="sc-setting-item">
@@ -368,6 +369,7 @@
                             </small>
                         </label>
                         <textarea id="sc_summarizer_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
+                        <button class="menu_button sc-prompt-reset" data-key="summarizerUserPrompt" data-target="#sc_summarizer_user_prompt">↺ Reset to Default</button>
                     </div>
 
                     <hr class="sc-divider" />
@@ -388,6 +390,7 @@
                             <small class="sc-hint">The auditor's role. Should instruct it to output <code>NONE</code> when the snippet already captures everything, or a <code>DETAIL:</code> line of only the missing specifics.</small>
                         </label>
                         <textarea id="sc_sister_system_prompt" class="text_pole sc-textarea" rows="4"></textarea>
+                        <button class="menu_button sc-prompt-reset" data-key="sisterSystemPrompt" data-target="#sc_sister_system_prompt">↺ Reset to Default</button>
                     </div>
 
                     <div class="sc-row">
@@ -398,6 +401,7 @@
                             </small>
                         </label>
                         <textarea id="sc_sister_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
+                        <button class="menu_button sc-prompt-reset" data-key="sisterUserPrompt" data-target="#sc_sister_user_prompt">↺ Reset to Default</button>
                     </div>
 
                     <div class="sc-row">
@@ -406,6 +410,7 @@
                             <small class="sc-hint">Wraps the assembled block. Use <code>{{summary}}</code> for the combined text.</small>
                         </label>
                         <textarea id="sc_injection_template" class="text_pole sc-textarea" rows="3"></textarea>
+                        <button class="menu_button sc-prompt-reset" data-key="injectionTemplate" data-target="#sc_injection_template">↺ Reset to Default</button>
                     </div>
 
                     <h4 class="sc-section-title">📍 Injection Placement</h4>
@@ -471,6 +476,7 @@
                             <small class="sc-hint">The editor's role. Should instruct it to return STRICT JSON edits only (op schema is in the User Prompt below).</small>
                         </label>
                         <textarea id="sc_editor_system_prompt" class="text_pole sc-textarea" rows="4"></textarea>
+                        <button class="menu_button sc-prompt-reset" data-key="editorSystemPrompt" data-target="#sc_editor_system_prompt">↺ Reset to Default</button>
                     </div>
 
                     <div class="sc-row">
@@ -481,6 +487,7 @@
                             </small>
                         </label>
                         <textarea id="sc_editor_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
+                        <button class="menu_button sc-prompt-reset" data-key="editorUserPrompt" data-target="#sc_editor_user_prompt">↺ Reset to Default</button>
                     </div>
 
                     <hr class="sc-divider" />
