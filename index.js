@@ -1010,27 +1010,54 @@ async function callAuditor(storyTxt, snippetText, contextStr) {
     return normalizeAuditorOutput(raw);
 }
 
-// Run the auditor for the snippet just pushed to Layer 0 and attach its detail
-// note (if any). Called right after each snippet push. Never throws upward.
-async function maybeAuditDetail(storyTxt, snippetText, contextStr) {
+// Queue the auditor for the snippet just pushed to Layer 0 and return IMMEDIATELY.
+// The audit runs in the background (sequentially, one at a time) so the
+// summarize→ghost cycle finishes at full speed — the detail note attaches when
+// ready. If the snippet is promoted/deleted/chat-switched before the audit
+// lands, the result is safely discarded. Never throws upward.
+let _auditQueue = [];
+let _auditActive = false;
+
+function queueAuditDetail(storyTxt, snippetText, contextStr) {
     const s = getSettings();
     if (!s.sisterEnabled) return;
     const store = getChatStore();
     const layer0 = store.layers && store.layers[0];
     if (!layer0 || layer0.length === 0) return;
-    const snip = layer0[layer0.length - 1];   // the snippet we just pushed
+    _auditQueue.push({ snip: layer0[layer0.length - 1], storyTxt, snippetText, contextStr });
+    processAuditQueue();   // fire and forget — deliberately NOT awaited
+}
+
+async function processAuditQueue() {
+    if (_auditActive) return;
+    _auditActive = true;
     try {
-        const detail = await callAuditor(storyTxt, snippetText, contextStr);
-        if (detail) {
-            snip.detail = detail;
-            await saveChatStore();
-            updateInjection();
-            log(`Detail auditor: attached ${detail.length} chars to snippet.`);
-        } else {
-            log('Detail auditor: snippet already complete — no detail added.');
+        while (_auditQueue.length > 0) {
+            const job = _auditQueue.shift();
+            try {
+                const detail = await callAuditor(job.storyTxt, job.snippetText, job.contextStr);
+                // Re-check the world: the snippet may have been promoted, deleted,
+                // or we may have switched chats while the audit was in flight.
+                const store = getChatStore();
+                const layer0 = store.layers && store.layers[0];
+                if (!layer0 || !layer0.includes(job.snip)) {
+                    log('Detail auditor: snippet no longer in Layer 0 — result discarded.');
+                    continue;
+                }
+                if (detail) {
+                    job.snip.detail = detail;
+                    await saveChatStore();
+                    updateInjection();
+                    log(`Detail auditor (background): attached ${detail.length} chars.`);
+                } else {
+                    log('Detail auditor (background): snippet already complete — no detail added.');
+                }
+            } catch (e) {
+                log('Detail auditor (background) failed for one snippet — kept without detail:', e);
+            }
         }
-    } catch (e) {
-        log('Detail auditor error — detail skipped, snippet kept:', e);
+    } finally {
+        _auditActive = false;
     }
 }
 
@@ -1182,7 +1209,7 @@ async function summarizeOneBatch(visibleTurns) {
         await ghostMessagesUpTo(endIdx);
 
         // Sister pass: check the snippet for dropped specifics; attach a detail note if any.
-        await maybeAuditDetail(storyTxt, summary, contextStr);
+        queueAuditDetail(storyTxt, summary, contextStr);   // non-blocking: audit runs in background
 
         log(`Layer 0 now has ${store.layers[0].length} snippets`);
 
@@ -1307,7 +1334,7 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
         await ghostMessagesUpTo(endIdx);
 
         // Sister pass: check the snippet for dropped specifics; attach a detail note if any.
-        await maybeAuditDetail(storyTxt, summary, contextStr);
+        queueAuditDetail(storyTxt, summary, contextStr);   // non-blocking: audit runs in background
 
         await maybePromoteLayer(0);
         await saveChatStore();
@@ -3366,7 +3393,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.8.1 (LO) loaded — Copilot Bridge (notepad+details, snippets via native integration).');
+            console.log(LOG_PREFIX, 'v5.8.2 (LO) loaded — background auditor (fast summarize+ghost).');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
