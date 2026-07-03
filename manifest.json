@@ -1,12 +1,12 @@
 {
-    "display_name": "Summaryception (LO)",
-    "loading_order": 50,
+    "display_name": "Continuity Copilot",
+    "loading_order": 100,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
-    "author": "Lodactio",
-    "version": "5.8.1",
-    "homePage": "https://github.com/Lodactio/Extension-Summaryception",
+    "author": "brucestarkallen",
+    "version": "0.7.0",
+    "homePage": "",
     "auto_update": false
 }
