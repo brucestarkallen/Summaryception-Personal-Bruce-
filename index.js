@@ -25,12 +25,12 @@ const LOG_PREFIX = '[Summaryception]';
 
 const defaultSettings = Object.freeze({
     enabled: true,
-    verbatimTurns: 10,
+    verbatimTurns: 9,
     turnsPerSummary: 3,
     snippetsPerLayer: 30,
-    snippetsPerPromotion: 3,
+    snippetsPerPromotion: 2,
     maxLayers: 5,
-    injectionTemplate: '\n\n<summary>\n{{summary}}\n</summary>\n\n',
+    injectionTemplate: '[Story memory continuation after brief plot essential — oldest → newest. Established canon; do not contradict.]\n{{summary}}',
 
     // ── Injection placement (previously hardcoded to IN_PROMPT / system) ──
     injectionPosition: 1,   // 0 = in-prompt (merged w/ system) · 1 = in-chat @ depth · 2 = before-prompt
@@ -100,7 +100,7 @@ FORMAT:
 
 BEFORE OUTPUTTING, verify: (1) the line starts with a temporal prefix if available; (2) no phrase duplicates anything in <prior_context>; (3) NO PRONOUNS remain — all replaced with names; (4) phrase count within limit; (5) every action has an explicit actor or is passive voice; (6) every named character who acted toward {{player_name}} or the focal character is recorded individually, not merged; (7) any canonical facts stated in OOC asides or parentheticals are captured — not skipped as "already confirmed" — while pure processing directives are ignored; (8) TIMELINE LOGIC — new facts do not create unexplained paradoxes with <prior_context>; if a paradox exists, resolve it with a [Correction] tag; (9) ALL stats are bundled into ONE phrase at the end. If any check fails, revise.`,
 
-    promptPreset: 'narrative',  // 'narrative' | 'gamestate' | 'custom'
+    promptPreset: 'custom',  // 'narrative' | 'gamestate' | 'custom'
     savedCustomPrompts: {},        // { name: promptText } — named custom prompt slots
     lastCustomPrompt: '',          // Auto-saved when switching away from custom
     pauseSummarization: false,  // true = stop processing, keep injecting
@@ -3443,7 +3443,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.9.1 (LO) loaded — external-editor guard for background audits.');
+            console.log(LOG_PREFIX, 'v5.9.2 (LO) loaded — defaults finalized (LO-proven values everywhere).');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
