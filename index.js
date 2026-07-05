@@ -1550,6 +1550,10 @@ async function showCatchupDialog(overflowCount, estimatedCalls) {
         <span class="sc-btn-desc">Summarize ${s.turnsPerSummary} turns now, deal with the rest later</span>
         </div>
         </button>
+        <button id="sc_catchup_later" class="menu_button sc-catchup-later">
+        <div class="sc-btn-text"><span class="sc-btn-label">Not now</span>
+        <span class="sc-btn-desc">Close this and ask again later</span></div>
+        </button>
         </div>
         </div>
         </div>
@@ -1567,6 +1571,13 @@ async function showCatchupDialog(overflowCount, estimatedCalls) {
         overlay.querySelector('#sc_catchup_partial').addEventListener('click', () => {
             overlay.remove();
             resolve('partial');
+        });
+        overlay.querySelector('#sc_catchup_later').addEventListener('click', () => {
+            overlay.remove();
+            resolve('later');
+        });
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) { overlay.remove(); resolve('later'); }
         });
     });
 }
@@ -3596,7 +3607,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.11.1 (LO) loaded — UI flattened: every section its own card (no nesting).');
+            console.log(LOG_PREFIX, 'v5.11.2 (LO) loaded — fixed transparent catch-up modal + Not-now dismiss.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
