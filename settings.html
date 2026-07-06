@@ -65,6 +65,23 @@
             </div>
 
 
+            <!-- ═══ Backfill / Maintenance ═══ -->
+                    </details>
+                    <details class="sc-collapse">
+                        <summary class="sc-section-title">🔧 Backfill / Maintenance</summary>
+
+            <div class="sc-row"><small class="sc-hint">For a story that already has summaries: the auditor and ledger only run on <em>new</em> batches, so existing snippets have no detail notes and the ledger starts empty. These replay the existing history to catch them up. Both run in the background, one item at a time, and can be stopped anytime (click the ✕ on the progress toast) — progress is saved. For a single snippet instead, use the 🪄 (detail) and 🧠 (ledger) buttons in the Snippet Browser.</small></div>
+            <div class="sc-button-row">
+                <button id="sc_ledger_build" class="menu_button">
+                    <i class="fa-solid fa-brain"></i> Build Ledger from History
+                </button>
+                <button id="sc_audit_all" class="menu_button">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i> Backfill Missing Details
+                </button>
+            </div>
+            <div class="sc-row"><small class="sc-hint sc-muted">Build Ledger replays the whole story in <code>Turns per Summary Batch</code>-sized passes and <strong>merges</strong> into the current ledger (Clear Ledger first for a clean rebuild). Backfill Missing Details audits only snippets that don't have a note yet — existing notes are untouched. Also available as <code>/sc-ledger-build</code> and <code>/sc-audit-all</code>.</small></div>
+
+
             <!-- ═══ Preview ═══ -->
                     </details>
                     <details class="sc-collapse">

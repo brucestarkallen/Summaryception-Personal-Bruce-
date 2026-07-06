@@ -1299,6 +1299,187 @@ async function processLedgerQueue() {
     }
 }
 
+// ─── Retroactive backfill (auditor + ledger over existing history) ───
+// The summarizer self-heals a backlog, but the auditor and ledger only run
+// forward on each new batch. For a story that already has summaries (or was
+// running before these passes existed), these drivers replay the existing
+// history to populate detail notes and the character ledger. All are
+// user-triggered, sequential, cancelable (via the progress toast), and reuse
+// callSummarizer's retry/abort. They never create snippets or ghost messages —
+// they only read source passages and write details / ledger entries.
+
+// Pure: split chronological assistant turns into sequential passages that mirror
+// the live summarizer's batching — each passage spans from the previous batch's
+// end+1 to this batch's last assistant-turn index, so every message is covered
+// exactly once. Returns [{passageStart, endIdx, count}].
+function _computeBackfillBatches(assistantTurns, perBatch) {
+    const batches = [];
+    if (!Array.isArray(assistantTurns) || assistantTurns.length === 0) return batches;
+    const step = Math.max(1, perBatch | 0);
+    let passageStart = 0;
+    for (let i = 0; i < assistantTurns.length; i += step) {
+        const slice = assistantTurns.slice(i, i + step);
+        const endIdx = slice[slice.length - 1].index;
+        if (endIdx < passageStart) continue;   // defensive: never go backwards
+        batches.push({ passageStart, endIdx, count: slice.length });
+        passageStart = endIdx + 1;
+    }
+    return batches;
+}
+
+async function backfillLedgerFromHistory() {
+    const s = getSettings();
+    if (!s.ledgerEnabled) { toastr.warning('Enable the Character Ledger first.', 'Summaryception'); return; }
+    if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
+    const { chat } = SillyTavern.getContext();
+    const turns = getAssistantTurns(chat);
+    if (turns.length === 0) { toastr.info('No story turns to build the ledger from yet.', 'Summaryception', { timeOut: 4000 }); return; }
+    const batches = _computeBackfillBatches(turns, s.turnsPerSummary);
+    if (batches.length === 0) { toastr.info('Nothing to process.', 'Summaryception'); return; }
+    if (!confirm(
+        `Build the Character Ledger from the whole story?\n\n` +
+        `Replays ${turns.length} turns in ${batches.length} passes (~${batches.length} background LLM calls) to populate/refresh the ledger. ` +
+        `It MERGES into the current ledger — use "Clear Ledger" first if you want a clean rebuild. You can stop anytime; progress is kept.`
+    )) return;
+
+    const store = getChatStore();
+    if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
+    _ledgerQueue = [];   // we drive the scribe directly here; drop pending background jobs
+
+    let done = 0, failed = 0, cancelled = false, consec = 0;
+    const contextStr = buildFullContext(0);   // whole-story gist as grounding (stable during backfill)
+    const toast = toastr.info(`Building ledger: 0 / ${batches.length} passes`, 'Summaryception Ledger', {
+        timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, closeButton: true,
+        onCloseClick: () => { cancelled = true; abortSummarization(); },
+    });
+    isSummarizing = true;
+    try {
+        for (const b of batches) {
+            if (cancelled) break;
+            const storyTxt = buildPassageFromRange(chat, b.passageStart, b.endIdx);
+            if (!storyTxt.trim()) { done++; continue; }
+            try {
+                const ledgerStr = serializeLedgerForScribe(store.ledger, s.ledgerContextMaxChars);
+                const deltas = await callLedgerScribe(storyTxt, contextStr, ledgerStr);
+                if (deltas) mergeLedgerDeltas(deltas);
+                consec = 0;
+            } catch (e) {
+                failed++; consec++;
+                log('Ledger backfill: pass failed:', e);
+                if (consec >= 3) { toastr.error('3 consecutive failures — pausing. Progress saved.', 'Summaryception', { timeOut: 7000 }); break; }
+            }
+            done++;
+            if (done % 5 === 0) await saveChatStore();
+            const pct = Math.round((done / batches.length) * 100);
+            $(toast).find('.toast-message').text(`Building ledger: ${done} / ${batches.length} passes (${pct}%)${failed ? ` | ${failed} failed` : ''}\nClick ✕ to stop`);
+            await new Promise(r => setTimeout(r, 60));
+        }
+        await saveChatStore();
+        updateInjection(true);
+        try { renderLedger(); } catch (_) {}
+        toastr.clear(toast);
+        const nChars = Object.keys(store.ledger).length;
+        if (cancelled) toastr.warning(`Stopped at ${done}/${batches.length}. Ledger has ${nChars} character(s). Progress saved.`, 'Summaryception', { timeOut: 5000 });
+        else toastr.success(`Ledger built — ${nChars} character(s) across ${done} passes${failed ? `, ${failed} failed` : ''}.`, 'Summaryception', { timeOut: 5000 });
+    } finally {
+        isSummarizing = false;
+        try { updateUI(); } catch (_) {}
+    }
+}
+
+// Selected ledger: read ONE snippet's source scene into the current ledger.
+async function runLedgerForSnippet(layerIdx, snippetIdx) {
+    const s = getSettings();
+    if (!s.ledgerEnabled) { toastr.warning('Enable the Character Ledger first.', 'Summaryception'); return; }
+    if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
+    const store = getChatStore();
+    const layer = store.layers[layerIdx];
+    if (!layer || !layer[snippetIdx] || !layer[snippetIdx].turnRange) { toastr.error('This snippet has no source turns to read.', 'Summaryception'); return; }
+    if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
+    const sn = layer[snippetIdx];
+    const { chat } = SillyTavern.getContext();
+    isSummarizing = true;
+    try {
+        const storyTxt = buildPassageFromRange(chat, sn.turnRange[0], sn.turnRange[1]);
+        if (!storyTxt.trim()) { toastr.error('Source turns are empty.', 'Summaryception'); return; }
+        const contextStr = buildFullContext(0);
+        toastr.info(`Reading scene ${sn.turnRange[0]}–${sn.turnRange[1]} into the ledger…`, 'Summaryception', { timeOut: 3000, progressBar: true });
+        const deltas = await callLedgerScribe(storyTxt, contextStr, serializeLedgerForScribe(store.ledger, s.ledgerContextMaxChars));
+        const changed = deltas ? mergeLedgerDeltas(deltas) : 0;
+        await saveChatStore();
+        updateInjection(true);
+        renderLedger();
+        if (changed > 0) toastr.success(`Ledger updated from this scene (${changed} character${changed === 1 ? '' : 's'}).`, 'Summaryception', { timeOut: 3000 });
+        else toastr.info('No character updates from this scene.', 'Summaryception', { timeOut: 3000 });
+    } finally {
+        isSummarizing = false;
+    }
+}
+
+// Whole audit: run the auditor over every Layer 0 snippet that has no detail yet.
+async function backfillAuditsForLayer0() {
+    const s = getSettings();
+    if (!s.sisterEnabled) { toastr.warning('Enable the Detail Auditor first.', 'Summaryception'); return; }
+    if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
+    const store = getChatStore();
+    const l0 = (store.layers && store.layers[0]) ? store.layers[0] : [];
+    const targets = [];
+    for (let i = 0; i < l0.length; i++) {
+        const sn = l0[i];
+        if (sn && sn.turnRange && !(sn.detail && String(sn.detail).trim())) targets.push(i);
+    }
+    if (targets.length === 0) { toastr.info('No snippets need auditing — every Layer 0 snippet already has a detail note (or none exist).', 'Summaryception', { timeOut: 4000 }); return; }
+    if (!confirm(
+        `Backfill detail notes for ${targets.length} snippet(s) that have none yet?\n\n` +
+        `Runs the auditor once per snippet (~${targets.length} LLM calls). Existing detail notes are left untouched. You can stop anytime; progress is kept.`
+    )) return;
+
+    const { chat } = SillyTavern.getContext();
+    let done = 0, added = 0, failed = 0, cancelled = false, consec = 0;
+    const toast = toastr.info(`Auditing: 0 / ${targets.length}`, 'Summaryception Auditor', {
+        timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, closeButton: true,
+        onCloseClick: () => { cancelled = true; abortSummarization(); },
+    });
+    isSummarizing = true;
+    try {
+        for (const idx of targets) {
+            if (cancelled) break;
+            const sn = store.layers[0] && store.layers[0][idx];
+            if (!sn || !sn.turnRange) { done++; continue; }
+            const storyTxt = buildPassageFromRange(chat, sn.turnRange[0], sn.turnRange[1]);
+            if (!storyTxt.trim()) { done++; continue; }
+            const parts = [];
+            for (let li = store.layers.length - 1; li >= 0; li--) {
+                const l = store.layers[li]; if (!l) continue;
+                for (let k = 0; k < l.length; k++) { if (li === 0 && k === idx) continue; parts.push(l[k].text); }
+            }
+            const contextStr = parts.length ? parts.join(' ') : '(none yet)';
+            try {
+                const detail = await callAuditor(storyTxt, sn.text, contextStr);
+                if (detail) { sn.detail = detail; added++; }
+                consec = 0;
+            } catch (e) {
+                failed++; consec++;
+                log('Audit backfill: snippet failed:', e);
+                if (consec >= 3) { toastr.error('3 consecutive failures — pausing. Progress saved.', 'Summaryception', { timeOut: 7000 }); break; }
+            }
+            done++;
+            if (done % 5 === 0) await saveChatStore();
+            const pct = Math.round((done / targets.length) * 100);
+            $(toast).find('.toast-message').text(`Auditing: ${done} / ${targets.length} (${pct}%) | +${added} notes${failed ? ` | ${failed} failed` : ''}\nClick ✕ to stop`);
+            await new Promise(r => setTimeout(r, 60));
+        }
+        await saveChatStore();
+        updateInjection(true);
+        toastr.clear(toast);
+        if (cancelled) toastr.warning(`Stopped at ${done}/${targets.length}. Added ${added} note(s). Progress saved.`, 'Summaryception', { timeOut: 5000 });
+        else toastr.success(`Audit backfill done — ${added} detail note(s) added across ${done} snippet(s)${failed ? `, ${failed} failed` : ''}.`, 'Summaryception', { timeOut: 5000 });
+    } finally {
+        isSummarizing = false;
+        try { updateSnippetBrowser(); } catch (_) {}
+    }
+}
+
 // ─── Core: Summarize Oldest Verbatim Turns ──────────────────────────
 
 async function maybeSummarizeTurns() {
@@ -2222,6 +2403,18 @@ function registerSlashCommands() {
             },
             helpString: 'Show the current per-character continuity ledger for this chat',
         }));
+
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'sc-ledger-build',
+            callback: () => { backfillLedgerFromHistory(); return ''; },
+            helpString: 'Build the character ledger from the whole existing story (replays it in batches; cancelable)',
+        }));
+
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'sc-audit-all',
+            callback: () => { backfillAuditsForLayer0(); return ''; },
+            helpString: 'Backfill detail notes for all Layer 0 snippets that have none yet (cancelable)',
+        }));
     } catch (e) {
         log('Could not register slash commands:', e);
     }
@@ -2465,7 +2658,8 @@ function updateSnippetBrowser() {
                     const detailDel = hasDetail
                         ? `<button class="sc-detail-delete menu_button fa-solid fa-eraser" title="Delete this detail"></button>`
                         : '';
-                    detailRow = `<div class="sc-detail-row" data-layer="${i}" data-idx="${j}">${detailText}${detailRedo}${detailDel}</div>`;
+                    const ledgerBtn = `<button class="sc-detail-ledger menu_button fa-solid fa-brain" title="Read this scene into the character ledger"></button>`;
+                    detailRow = `<div class="sc-detail-row" data-layer="${i}" data-idx="${j}">${detailText}${detailRedo}${detailDel}${ledgerBtn}</div>`;
                 }
 
                 html += `<div class="sc-snippet" data-layer="${i}" data-idx="${j}">
@@ -2725,6 +2919,19 @@ function updateSnippetBrowser() {
             updateInjection();
             updateSnippetBrowser();
             toastr.info('Detail removed', 'Summaryception', { timeOut: 1500 });
+        }
+    });
+
+    // Selected ledger: read this one scene into the character ledger
+    $('.sc-detail-ledger').off('click').on('click', async function () {
+        const layerIdx = parseInt($(this).closest('.sc-detail-row').data('layer'));
+        const snippetIdx = parseInt($(this).closest('.sc-detail-row').data('idx'));
+        const btn = $(this);
+        btn.prop('disabled', true).removeClass('fa-brain').addClass('fa-spinner fa-spin');
+        try {
+            await runLedgerForSnippet(layerIdx, snippetIdx);
+        } finally {
+            btn.prop('disabled', false).removeClass('fa-spinner fa-spin').addClass('fa-brain');
         }
     });
 }
@@ -3262,6 +3469,10 @@ function bindUIEvents() {
         renderLedger();
         toastr.success('Character ledger cleared for this chat.', 'Summaryception', { timeOut: 2500 });
     });
+
+    // ── Backfill / Maintenance ──
+    $(document).on('click', '#sc_ledger_build', function () { backfillLedgerFromHistory(); });
+    $(document).on('click', '#sc_audit_all', function () { backfillAuditsForLayer0(); });
 
     // ── Continuity Editor (Co-Writer / Master Novelist) ──
     $(document).on('click', '#sc_editor_review', runContinuityEditorReview);
@@ -4089,7 +4300,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.12.1 (LO) loaded — Character Ledger: a third background pass maintains a living per-character psychological model (nature/state/arc/open-threads); active cast injected each turn. Fix: on-screen detection now matches given/surname tokens.');
+            console.log(LOG_PREFIX, 'v5.13.0 (LO) loaded — Backfill/Maintenance: retroactively build the character ledger from an existing story (/sc-ledger-build) and backfill missing auditor detail notes (/sc-audit-all); per-snippet ledger + detail buttons for selected runs. Cancelable, non-blocking.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
