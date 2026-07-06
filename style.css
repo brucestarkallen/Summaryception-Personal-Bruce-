@@ -609,3 +609,32 @@ details.sc-collapse[open]>summary{border-bottom:1px solid rgba(255,255,255,.09)}
 details.sc-collapse>:not(summary){margin-left:14px;margin-right:14px}
 details.sc-collapse>:not(summary):first-of-type{margin-top:12px}
 details.sc-collapse>:last-child{margin-bottom:14px}
+
+/* ─── Character Ledger (psychologist) ───────────────────────── */
+.sc-ledger-view{
+    max-height:340px;overflow-y:auto;
+    border:1px solid var(--SmartThemeBorderColor, #444);
+    border-radius:6px;padding:6px;
+    background:var(--SmartThemeBlurTintColor, #1a1a2e);
+}
+.sc-ledger-card{
+    padding:7px 9px;margin-bottom:6px;border-radius:6px;
+    background:rgba(255,255,255,.035);
+    border-left:2px solid rgba(255,255,255,.14);
+    font-size:.83em;line-height:1.4;
+}
+.sc-ledger-card:last-child{margin-bottom:0}
+.sc-ledger-head{display:flex;align-items:center;gap:8px;margin-bottom:3px}
+.sc-ledger-name{font-weight:700;font-size:1.02em}
+.sc-ledger-badge{
+    font-size:.72em;font-weight:600;text-transform:uppercase;letter-spacing:.4px;
+    padding:1px 6px;border-radius:10px;
+    background:rgba(120,200,140,.16);color:#8fd6a3;
+    border:1px solid rgba(120,200,140,.3);
+}
+.sc-ledger-del{margin-left:auto;flex-shrink:0;opacity:.3;border:none;background:none;color:#ff6b6b}
+.sc-ledger-del:hover{opacity:1}
+.sc-ledger-field{margin:2px 0;word-break:break-word}
+.sc-ledger-flabel{font-weight:600;opacity:.6;margin-right:4px}
+.sc-ledger-threads{margin:2px 0 2px 0;padding-left:18px}
+.sc-ledger-threads li{margin:1px 0}

@@ -63,6 +63,57 @@ const defaultSettings = Object.freeze({
     sisterUserPrompt:
         `<player_name>{{player_name}}</player_name>\n<prior_context>{{context_str}}</prior_context>\n<passage>{{story_txt}}</passage>\n<snippet>{{snippet}}</snippet>\n\n<snippet> is the compact memory line already recorded for <passage>.\n\nDecide: does <snippet> omit any important information from <passage> that a storyteller would need and could NOT reconstruct from the gist alone? Consider: exact quantities/counts, named tactics or plans, specific conditional promises ("if X then Y"), precise capabilities or limits, identity/title details, and background canon (character backstory, family structure, separations/divorces, custody or legal situations, hidden truths, world rules, relationships, motives). Pure processing directives ("keep it short", "stay in character", "analyze before the header") are NOT information — never flag them as omissions.\n\n<passage> may contain out-of-character material — parenthetical notes, analysis requests, or verification blocks (e.g. "Family Logic Confirmed") before or after the scene. Background facts established in such OOC material COUNT as present in <passage>. OOC framing or words like "Confirmed" do NOT make a fact already-established — only actual presence in <prior_context> does.\n\nRecord ONLY omissions that are ALL of: (a) present in <passage>, (b) NOT already in <snippet>, (c) NOT already in <prior_context>.\n\nIf <snippet> already captures everything important, output exactly:\nNONE\n\nOtherwise output ONE line:\nDETAIL: <only the missing information, short phrases separated by semicolons>`,
 
+    // ── Character Ledger ("psychologist"): a THIRD background pass, per batch,
+    //    that maintains a living per-character model — stable nature (core),
+    //    current mood (state), relationship trajectory (arc), and open loose ends
+    //    (threads) — so characters stay in-voice and evolve realistically across
+    //    many turns. Only the ACTIVE cast (characters present in the recent
+    //    window) is injected. ──
+    ledgerEnabled: true,
+    ledgerActiveWindow: 12,        // recent messages scanned to decide who is "on screen"
+    ledgerMaxActive: 6,            // max characters injected at once
+    ledgerMaxCharsPerChar: 600,    // per-character injection cap (chars)
+    ledgerContextMaxChars: 6000,   // ledger context budget handed to the scribe
+    ledgerInjectTemplate: '\n\n<characters>\nWho these people are and where they stand right now — keep them consistent and in character; do not contradict:\n{{characters}}\n</characters>\n',
+    ledgerSystemPrompt:
+        `You are the character-continuity mind for an ongoing work of collaborative fiction — part psychologist, part continuity editor. You maintain a living ledger of the people in the story so a separate storyteller AI, often working many turns later from compressed memory, keeps every character consistent, in-voice, and evolving like a real person — never flattened into a generic or out-of-character reaction.
+
+You receive the CURRENT LEDGER (what is already known about each character), the PRIOR CONTEXT (established story), and a NEW PASSAGE (what just happened). For every character who appears or is materially involved in the NEW PASSAGE, output an updated entry. Do NOT output characters who are absent from the passage.
+
+Each entry tracks four fields. Update ONLY what the passage changes; OMIT any field that is unchanged.
+
+- core — the character's STABLE nature: temperament, values, and above all HOW THEY EXPRESS THEMSELVES, especially under stress (their tells, their register, what they would never do). This is the anchor that keeps them the same person across the whole story. Write it once when a character is first established, then change it only when the passage genuinely reveals a NEW stable trait — never for a passing mood. When you do write core, give the FULL stable picture (prior traits plus any new one) so nothing established is lost. Favor behavioral specifics a storyteller can act on: "masks embarrassment with clipped sarcasm; never raises her voice; deflects rather than confronts" beats "is shy and proud."
+- state — the character's CURRENT, volatile condition right after this passage: mood, what is on their mind, how they are carrying themselves now. This is overwritten every time they act. Path-dependent feelings live here (e.g. still rattled by a slight from earlier) and persist until the story resolves them — so a mood set now survives into later turns instead of vanishing.
+- arc — the SLOW trajectory of this character, above all their relationship with {{player_name}}: the direction it is moving (warming, fraying, trust building or breaking, respect shifting). One or two sentences. Update only when the passage actually advances it; otherwise omit. Evolve the existing arc — do not restart it.
+- threads — the character's CURRENTLY OPEN loose ends: concrete, unresolved things that will shape how they behave next (a pending promise, a lie unconfessed, an unaddressed slight, a question left hanging). Output the CURRENT open list: KEEP threads still unresolved, DROP any this passage resolved, ADD any it opened. A thread stays open until the STORY resolves it — never merely because time passed. Omit the field entirely if the character has no open threads and none changed; use an empty array [] ONLY to signal that all previously-open threads are now resolved.
+
+DISCIPLINE — this is a continuity record, not new fiction:
+- Record ONLY what the passage (with the prior context) EVIDENCES. Never invent traits, motives, feelings, or backstory the text does not support. Inventing is the worst failure — it corrupts the character.
+- Separate observation from inference. If you infer an inner state, hedge it ("seems", "reads as", "appears to") rather than asserting it as established fact.
+- Do NOT restate what the CURRENT LEDGER or PRIOR CONTEXT already holds. Add or evolve only.
+- Use each character's exact name as already established in the ledger or context. Do not rename or merge distinct characters.
+- Terse, concrete director's notes. No markdown, no preamble, no meta-commentary.
+
+OUTPUT — a single JSON array and NOTHING else (no code fence, no prose before or after). Each element:
+{"name":"<exact name>","core":"<...>","state":"<...>","arc":"<...>","threads":["<...>","<...>"]}
+Include only the fields you are updating for that character. If no character in the passage needs any update, output exactly: []`,
+    ledgerUserPrompt:
+        `<player_name>{{player_name}}</player_name>
+
+<current_ledger>
+{{ledger}}
+</current_ledger>
+
+<prior_context>
+{{context_str}}
+</prior_context>
+
+<new_passage>
+{{story_txt}}
+</new_passage>
+
+Update the character ledger for EVERY character who appears or is materially involved in <new_passage>. Use the four-field model (core / state / arc / threads) and OMIT every field that is unchanged. Evolve existing entries rather than restating them. Keep unresolved threads open; drop resolved ones. Ground every word in the passage and prior context — never invent. Output ONLY the JSON array (or [] if nothing changed).`,
+
     // ── Continuity Editor ("Co-Writer / Master Novelist") prompts ──
     editorSystemPrompt:
         'Role: master continuity editor and co-writer for an ongoing roleplay. You receive the story\'s full memory — a notepad of established canon (plot-essential lore), an ordered list of summary snippets, and their detail notes — plus an instruction describing a problem or retcon. Determine the MINIMAL set of edits that resolves the problem and keeps everything internally consistent. Change only what must change; preserve each entry\'s terse style. Output STRICT JSON ONLY: a single array of edit operations — no prose, no markdown, no commentary. If nothing needs changing, output [].',
@@ -329,6 +380,12 @@ function getChatStore() {
     // Manual notepad — per-chat story/lore memory you write yourself
     if (chatMetadata[MODULE_NAME].notepad === undefined) {
         chatMetadata[MODULE_NAME].notepad = '';
+    }
+    // Character Ledger — per-chat, per-character psychological continuity model,
+    // keyed by character name: { "<name>": {core, state, arc, threads[], updatedAt} }
+    const _lg = chatMetadata[MODULE_NAME].ledger;
+    if (!_lg || typeof _lg !== 'object' || Array.isArray(_lg)) {
+        chatMetadata[MODULE_NAME].ledger = {};
     }
     return chatMetadata[MODULE_NAME];
 }
@@ -879,6 +936,7 @@ async function callSummarizer(storyTxt, contextStr, opts = {}) {
         .replace('{{context_str}}', contextStr || '(none yet)')
         .replace('{{story_txt}}', storyTxt);
     if (userTpl.includes('{{snippet}}')) prompt = prompt.replace('{{snippet}}', opts.snippet || '(none)');
+    if (userTpl.includes('{{ledger}}')) prompt = prompt.replace('{{ledger}}', () => opts.ledger || '(none yet)');
 
     log('── Summarizer Call ──');
     log('Context str length:', contextStr.length, 'chars');
@@ -1101,6 +1159,146 @@ async function processAuditQueue() {
     }
 }
 
+// ─── Character Ledger ("psychologist") ───────────────────────────────
+// A THIRD background pass, per batch, that maintains a living per-character
+// model: stable nature (core), current mood (state), relationship trajectory
+// (arc), and open loose ends (threads). Runs after the summarize/ghost cycle,
+// non-blocking, and merges into chatMetadata. Only the ACTIVE cast (characters
+// present in the recent window) is injected. Failures log; never throw upward.
+
+let _chatEpoch = 0;      // bumped on chat change; guards ledger jobs in flight
+let _ledgerQueue = [];
+let _ledgerActive = false;
+
+// Compact, human-readable dump of the current ledger for the scribe's context,
+// most-recently-updated first, bounded by a char budget. Uses formatLedgerEntry
+// (no per-field cap) so the scribe sees the full established picture.
+function serializeLedgerForScribe(ledger, budgetChars) {
+    if (!ledger || typeof ledger !== 'object') return '(empty — no characters recorded yet)';
+    const names = Object.keys(ledger);
+    if (names.length === 0) return '(empty — no characters recorded yet)';
+    const entries = names
+        .map(name => ({ name, entry: ledger[name], u: (ledger[name] && ledger[name].updatedAt) || 0 }))
+        .sort((a, b) => b.u - a.u);
+    const budget = budgetChars || 6000;
+    const lines = [];
+    let used = 0, omitted = 0;
+    for (const { name, entry } of entries) {
+        const line = formatLedgerEntry(name, entry, 100000);
+        if (!line) continue;
+        if (lines.length > 0 && used + line.length > budget) { omitted++; continue; }
+        lines.push(line);
+        used += line.length + 1;
+    }
+    let out = lines.join('\n');
+    if (omitted > 0) out += `\n(+${omitted} less-recently-updated character(s) omitted for brevity)`;
+    return out || '(empty — no characters recorded yet)';
+}
+
+async function callLedgerScribe(storyTxt, contextStr, ledgerStr) {
+    const s = getSettings();
+    const raw = await callSummarizer(storyTxt, contextStr, {
+        systemPrompt: s.ledgerSystemPrompt,
+        userPrompt: s.ledgerUserPrompt,
+        ledger: ledgerStr,
+        quiet: true,   // ledger failures are logged, never shown as summarizer errors
+    });
+    return extractJsonArray(raw);   // [{name, core?, state?, arc?, threads?}] or null
+}
+
+// Case-insensitive key resolution so "mara" and "Mara" don't split into two
+// entries. Distinct characters keep distinct names (no fuzzy merging).
+function resolveLedgerKey(ledger, name) {
+    if (Object.prototype.hasOwnProperty.call(ledger, name)) return name;
+    const lower = name.toLowerCase();
+    for (const k of Object.keys(ledger)) {
+        if (k.toLowerCase() === lower) return k;
+    }
+    return name;
+}
+
+// Merge scribe deltas into the store's ledger. Partial semantics: a field
+// present on the delta REPLACES that field (the scribe emits the full evolved
+// value); an omitted field is left untouched. `threads` present replaces the
+// open list; [] clears it. Returns the count of characters changed.
+function mergeLedgerDeltas(deltas) {
+    if (!Array.isArray(deltas) || deltas.length === 0) return 0;
+    const store = getChatStore();
+    if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
+    let changed = 0;
+    for (const d of deltas) {
+        if (!d || typeof d !== 'object') continue;
+        const rawName = typeof d.name === 'string' ? d.name.trim() : '';
+        if (!rawName) continue;
+        const key = resolveLedgerKey(store.ledger, rawName);
+        const entry = store.ledger[key] || {};
+        let touched = false;
+        if (typeof d.core === 'string' && d.core.trim())   { entry.core  = d.core.trim();  touched = true; }
+        if (typeof d.state === 'string' && d.state.trim()) { entry.state = d.state.trim(); touched = true; }
+        if (typeof d.arc === 'string' && d.arc.trim())     { entry.arc   = d.arc.trim();   touched = true; }
+        if (Array.isArray(d.threads)) {
+            entry.threads = d.threads
+                .filter(t => typeof t === 'string' && t.trim())
+                .map(t => t.trim());
+            touched = true;
+        }
+        if (touched) {
+            entry.updatedAt = Date.now();
+            store.ledger[key] = entry;
+            changed++;
+        }
+    }
+    return changed;
+}
+
+// Queue a ledger update for the batch just summarized and return IMMEDIATELY.
+// The scribe runs in the background (sequentially, one at a time) so the
+// summarize→ghost cycle finishes at full speed. If we switch chats before the
+// scribe lands, the result is discarded via the epoch guard. Never awaited.
+function queueLedgerUpdate(storyTxt, contextStr) {
+    const s = getSettings();
+    if (!s.ledgerEnabled) return;
+    const store = getChatStore();
+    if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
+    _ledgerQueue.push({ storyTxt, contextStr, epoch: _chatEpoch });
+    processLedgerQueue();   // fire and forget — deliberately NOT awaited
+}
+
+async function processLedgerQueue() {
+    if (_ledgerActive) return;
+    _ledgerActive = true;
+    try {
+        while (_ledgerQueue.length > 0) {
+            const job = _ledgerQueue.shift();
+            try {
+                const s = getSettings();
+                const ledgerStr = serializeLedgerForScribe(getChatStore().ledger, s.ledgerContextMaxChars);
+                const deltas = await callLedgerScribe(job.storyTxt, job.contextStr, ledgerStr);
+                // Chat-switch guard: a result computed for the previous chat must
+                // never be written into this one.
+                if (job.epoch !== _chatEpoch) {
+                    log('Ledger (background): chat switched mid-update — result discarded.');
+                    continue;
+                }
+                if (!deltas) { log('Ledger (background): no parseable output — skipped.'); continue; }
+                const changed = mergeLedgerDeltas(deltas);
+                if (changed > 0) {
+                    await saveChatStore();
+                    updateInjection();
+                    try { renderLedger(); } catch (_) { /* panel may be closed */ }
+                    log(`Ledger (background): updated ${changed} character entr${changed === 1 ? 'y' : 'ies'}.`);
+                } else {
+                    log('Ledger (background): no changes to apply.');
+                }
+            } catch (e) {
+                log('Ledger (background) failed for one batch — ledger unchanged:', e);
+            }
+        }
+    } finally {
+        _ledgerActive = false;
+    }
+}
+
 // ─── Core: Summarize Oldest Verbatim Turns ──────────────────────────
 
 async function maybeSummarizeTurns() {
@@ -1250,6 +1448,8 @@ async function summarizeOneBatch(visibleTurns) {
 
         // Sister pass: check the snippet for dropped specifics; attach a detail note if any.
         queueAuditDetail(storyTxt, summary, contextStr);   // non-blocking: audit runs in background
+        // Ledger pass: evolve the per-character psychological model from this passage.
+        queueLedgerUpdate(storyTxt, contextStr);           // non-blocking: scribe runs in background
 
         log(`Layer 0 now has ${store.layers[0].length} snippets`);
 
@@ -1375,6 +1575,8 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
 
         // Sister pass: check the snippet for dropped specifics; attach a detail note if any.
         queueAuditDetail(storyTxt, summary, contextStr);   // non-blocking: audit runs in background
+        // Ledger pass: evolve the per-character psychological model from this passage.
+        queueLedgerUpdate(storyTxt, contextStr);           // non-blocking: scribe runs in background
 
         await maybePromoteLayer(0);
         await saveChatStore();
@@ -1674,6 +1876,110 @@ async function maybePromoteLayer(layerIndex) {
     }
 }
 
+// ─── Character Ledger: injection block ───────────────────────────────
+
+const _ESC_RE = /[.*+?^${}()|[\]\\]/g;
+function _escapeRegex(str) { return String(str).replace(_ESC_RE, '\\$&'); }
+
+// Aliases used to detect whether a character is "on screen" in recent text:
+// the full name plus its primary given-name token (the longest token > 2 chars,
+// usually the name spoken in dialogue).
+function characterAliases(name) {
+    const full = String(name || '').trim();
+    if (!full) return [];
+    const aliases = [full];
+    const tokens = full.split(/\s+/).filter(Boolean);
+    if (tokens.length > 1) {
+        const primary = tokens.filter(t => t.length > 2).sort((a, b) => b.length - a.length)[0];
+        if (primary && primary.toLowerCase() !== full.toLowerCase()) aliases.push(primary);
+    }
+    return aliases;
+}
+
+// Whole-word presence test (no substring false positives like "Ann" in
+// "announced"). Unicode-aware; falls back to \b if property escapes are
+// unsupported. `haystackLower` must already be lower-cased.
+function wordPresentInText(haystackLower, needle) {
+    const n = String(needle || '').trim().toLowerCase();
+    if (n.length < 2) return false;
+    try {
+        return new RegExp('(^|[^\\p{L}\\p{N}_])' + _escapeRegex(n) + '($|[^\\p{L}\\p{N}_])', 'iu').test(haystackLower);
+    } catch (_) {
+        return new RegExp('\\b' + _escapeRegex(n) + '\\b', 'i').test(haystackLower);
+    }
+}
+
+// One compact, prose-like line per character. Priority order Nature → Now →
+// Open → Arc means a length cap truncates the least-critical field (Arc) first.
+function formatLedgerEntry(name, entry, capChars) {
+    if (!entry || typeof entry !== 'object') return '';
+    const norm = (v) => String(v).trim().replace(/\s+/g, ' ');
+    const parts = [];
+    if (typeof entry.core === 'string' && entry.core.trim())   parts.push('Nature: ' + norm(entry.core));
+    if (typeof entry.state === 'string' && entry.state.trim()) parts.push('Now: ' + norm(entry.state));
+    if (Array.isArray(entry.threads)) {
+        const th = entry.threads.filter(t => typeof t === 'string' && t.trim()).map(norm);
+        if (th.length) parts.push('Open: ' + th.join('; '));
+    }
+    if (typeof entry.arc === 'string' && entry.arc.trim())     parts.push('Arc: ' + norm(entry.arc));
+    if (parts.length === 0) return '';
+    // Strip any trailing period so the ". " separator gives exactly one, never "..".
+    const cleaned = parts.map(p => p.replace(/[.\s]+$/, ''));
+    let line = norm(name) + ' — ' + cleaned.join('. ') + '.';
+    const cap = capChars || 600;
+    if (line.length > cap) line = line.slice(0, Math.max(1, cap - 1)).replace(/\s+\S*$/, '').trimEnd() + '…';
+    return line;
+}
+
+// The active-cast character block, injected every turn. "Active" = a ledger
+// character whose name (or given name) appears in the recent chat window — so
+// the storyteller always has their behavioral anchor and current state on hand,
+// which is what keeps a tsundere from suddenly screaming and a volatile mood
+// from evaporating between turns.
+function buildCharacterBlock() {
+    const s = getSettings();
+    if (!s.ledgerEnabled) return '';
+    const store = getChatStore();
+    const ledger = store.ledger;
+    if (!ledger || typeof ledger !== 'object') return '';
+    const names = Object.keys(ledger);
+    if (names.length === 0) return '';
+
+    let recentLower = '';
+    try {
+        const { chat } = SillyTavern.getContext();
+        const windowSize = Math.max(1, s.ledgerActiveWindow ?? 12);
+        recentLower = (chat || [])
+            .slice(-windowSize)
+            .map(m => (m && typeof m.mes === 'string') ? m.mes : '')
+            .join('\n')
+            .toLowerCase();
+    } catch (_) { return ''; }
+    if (!recentLower.trim()) return '';
+
+    const active = [];
+    for (const name of names) {
+        const entry = ledger[name];
+        if (!entry || typeof entry !== 'object') continue;
+        if (characterAliases(name).some(a => wordPresentInText(recentLower, a))) {
+            active.push({ name, entry, u: entry.updatedAt || 0 });
+        }
+    }
+    if (active.length === 0) return '';
+
+    active.sort((a, b) => b.u - a.u);   // most-recently-updated first
+    const maxActive = Math.max(1, s.ledgerMaxActive ?? 6);
+    const capChars = Math.max(80, s.ledgerMaxCharsPerChar ?? 600);
+    const blocks = active
+        .slice(0, maxActive)
+        .map(({ name, entry }) => formatLedgerEntry(name, entry, capChars))
+        .filter(Boolean);
+    if (blocks.length === 0) return '';
+
+    const tpl = s.ledgerInjectTemplate || '\n\n<characters>\n{{characters}}\n</characters>\n';
+    return tpl.replace('{{characters}}', () => blocks.join('\n'));
+}
+
 // ─── Core: Assemble Full Summary Block ──────────────────────────────
 
 function assembleSummaryBlock() {
@@ -1717,8 +2023,10 @@ function assembleSummaryBlock() {
         }
     }
 
-    // Notepad first (stable canon), then the summary (gist), then details (specifics).
-    return notesPart + buildPinnedBlock() + summaryPart + detailPart;
+    // Stable canon first (notepad → pinned → active-cast character state), then the
+    // narrative (summary gist → recent-detail specifics). Grouping "who these people
+    // are" ahead of "what happened" frames the scene for the storyteller.
+    return notesPart + buildPinnedBlock() + buildCharacterBlock() + summaryPart + detailPart;
 }
 
 // ─── Injection via setExtensionPrompt ────────────────────────────────
@@ -1785,6 +2093,8 @@ function onChatChanged() {
     _editorPending = [];
     _editorUndoSnapshot = null;
     _auditQueue = [];
+    _ledgerQueue = [];
+    _chatEpoch++;   // invalidate any ledger update still in flight for the previous chat
     $('#sc_editor_undo').hide();
     $('#sc_editor_review_list').empty();
     clearRecall();
@@ -1855,6 +2165,7 @@ function registerSlashCommands() {
                 store.layers.length = 0;
                 store.summarizedUpTo = -1;
                 store.ghostedIndices = [];
+                store.ledger = {};
 
                 const { chatMetadata } = SillyTavern.getContext();
                 chatMetadata[MODULE_NAME] = store;
@@ -1879,6 +2190,26 @@ function registerSlashCommands() {
                 return assembleSummaryBlock() || '(No summaries yet)';
             },
             helpString: 'Preview the summary block that would be injected',
+        }));
+
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'sc-ledger',
+            callback: () => {
+                const store = getChatStore();
+                const ledger = store.ledger || {};
+                const names = Object.keys(ledger);
+                if (names.length === 0) return '*Character ledger is empty for this chat.*';
+                const entries = names
+                    .map(name => ({ name, entry: ledger[name], u: (ledger[name] && ledger[name].updatedAt) || 0 }))
+                    .sort((a, b) => b.u - a.u);
+                const lines = ['**Character Ledger**'];
+                for (const { name, entry } of entries) {
+                    const line = formatLedgerEntry(name, entry, 100000);
+                    if (line) lines.push('- ' + line);
+                }
+                return lines.join('\n');
+            },
+            helpString: 'Show the current per-character continuity ledger for this chat',
         }));
     } catch (e) {
         log('Could not register slash commands:', e);
@@ -1915,6 +2246,15 @@ function updateUI() {
         $('#sc_sister_enabled').prop('checked', s.sisterEnabled !== false);
         $('#sc_sister_system_prompt').val(s.sisterSystemPrompt);
         $('#sc_sister_user_prompt').val(s.sisterUserPrompt);
+        $('#sc_ledger_enabled').prop('checked', s.ledgerEnabled !== false);
+        $('#sc_ledger_system_prompt').val(s.ledgerSystemPrompt);
+        $('#sc_ledger_user_prompt').val(s.ledgerUserPrompt);
+        $('#sc_ledger_active_window').val(s.ledgerActiveWindow ?? 12);
+        $('#sc_ledger_active_window_val').text(s.ledgerActiveWindow ?? 12);
+        $('#sc_ledger_max_active').val(s.ledgerMaxActive ?? 6);
+        $('#sc_ledger_max_active_val').text(s.ledgerMaxActive ?? 6);
+        $('#sc_ledger_max_chars').val(s.ledgerMaxCharsPerChar ?? 600);
+        $('#sc_ledger_max_chars_val').text(s.ledgerMaxCharsPerChar ?? 600);
         $('#sc_editor_system_prompt').val(s.editorSystemPrompt);
         $('#sc_editor_user_prompt').val(s.editorUserPrompt);
         $('#sc_recall_k').val(s.recallMaxSnippets??4);
@@ -1981,6 +2321,7 @@ function updateUI() {
         $('#sc_preview').val(preview || '(empty — no summaries yet)');
 
         updateSnippetBrowser();
+        renderLedger();
         updateCustomPromptSlots();
     } catch (e) {
         log('updateUI error:', e);
@@ -2010,6 +2351,70 @@ function updateCustomPromptSlots() {
         $('#sc_custom_prompt_manager').show();
     } else {
         $('#sc_custom_prompt_manager').hide();
+    }
+}
+
+// Names in current render order, so the manage-UI can delete by index without
+// round-tripping a character name (which may contain quotes/entities) through a
+// DOM attribute. Rebuilt on every renderLedger call, kept in lockstep with the DOM.
+let _ledgerOrder = [];
+
+function renderLedger() {
+    try {
+        const $box = $('#sc_ledger_view');
+        if ($box.length === 0) return;
+        const store = getChatStore();
+        const ledger = (store && store.ledger && typeof store.ledger === 'object') ? store.ledger : {};
+        const names = Object.keys(ledger);
+        if (names.length === 0) {
+            _ledgerOrder = [];
+            $box.html('<div class="sc-muted">No characters recorded yet for this chat. The ledger fills in automatically as the story is summarized.</div>');
+            return;
+        }
+
+        // Active-cast detection for the "on screen" badge — same logic as injection.
+        let recentLower = '';
+        try {
+            const s = getSettings();
+            const { chat } = SillyTavern.getContext();
+            const windowSize = Math.max(1, s.ledgerActiveWindow ?? 12);
+            recentLower = (chat || []).slice(-windowSize)
+                .map(m => (m && typeof m.mes === 'string') ? m.mes : '').join('\n').toLowerCase();
+        } catch (_) { /* no chat loaded */ }
+
+        const entries = names
+            .map(name => ({ name, entry: ledger[name], u: (ledger[name] && ledger[name].updatedAt) || 0 }))
+            .sort((a, b) => b.u - a.u);
+        _ledgerOrder = entries.map(e => e.name);
+
+        const field = (label, val) => {
+            if (val === undefined || val === null || !String(val).trim()) return '';
+            return `<div class="sc-ledger-field"><span class="sc-ledger-flabel">${label}</span> ${escapeHtml(String(val).trim())}</div>`;
+        };
+
+        let html = '';
+        entries.forEach(({ name, entry }, i) => {
+            const isActive = recentLower && characterAliases(name).some(a => wordPresentInText(recentLower, a));
+            const badge = isActive ? '<span class="sc-ledger-badge">on screen</span>' : '';
+            let threadsHtml = '';
+            if (Array.isArray(entry.threads) && entry.threads.length) {
+                const items = entry.threads.filter(t => t && String(t).trim())
+                    .map(t => `<li>${escapeHtml(String(t).trim())}</li>`).join('');
+                if (items) threadsHtml = `<div class="sc-ledger-field"><span class="sc-ledger-flabel">Open threads</span><ul class="sc-ledger-threads">${items}</ul></div>`;
+            }
+            html += `<div class="sc-ledger-card" data-idx="${i}">
+                <div class="sc-ledger-head"><span class="sc-ledger-name">${escapeHtml(name)}</span>${badge}
+                    <button class="sc-ledger-del menu_button fa-solid fa-xmark" title="Delete this character from the ledger"></button>
+                </div>
+                ${field('Nature', entry.core)}
+                ${field('Now', entry.state)}
+                ${threadsHtml}
+                ${field('Arc', entry.arc)}
+            </div>`;
+        });
+        $box.html(html);
+    } catch (e) {
+        log('renderLedger error:', e);
     }
 }
 
@@ -2748,6 +3153,9 @@ function bindUIEvents() {
         { id: '#sc_snippets_per_layer', key: 'snippetsPerLayer', display: '#sc_snippets_per_layer_val' },
         { id: '#sc_snippets_per_promotion', key: 'snippetsPerPromotion', display: '#sc_snippets_per_promotion_val' },
         { id: '#sc_max_layers', key: 'maxLayers', display: '#sc_max_layers_val' },
+        { id: '#sc_ledger_active_window', key: 'ledgerActiveWindow', display: '#sc_ledger_active_window_val' },
+        { id: '#sc_ledger_max_active', key: 'ledgerMaxActive', display: '#sc_ledger_max_active_val' },
+        { id: '#sc_ledger_max_chars', key: 'ledgerMaxCharsPerChar', display: '#sc_ledger_max_chars_val' },
     ];
 
     for (const sl of sliders) {
@@ -2806,6 +3214,42 @@ function bindUIEvents() {
     $(document).on('input', '#sc_sister_user_prompt', function () {
         getSettings().sisterUserPrompt = $(this).val();
         saveSettings();
+    });
+
+    // ── Character Ledger (psychologist) ──
+    $(document).on('change', '#sc_ledger_enabled', function () {
+        getSettings().ledgerEnabled = $(this).prop('checked');
+        saveSettings();
+        updateInjection(true);
+    });
+    $(document).on('input', '#sc_ledger_system_prompt', function () {
+        getSettings().ledgerSystemPrompt = $(this).val();
+        saveSettings();
+    });
+    $(document).on('input', '#sc_ledger_user_prompt', function () {
+        getSettings().ledgerUserPrompt = $(this).val();
+        saveSettings();
+    });
+    $(document).on('click', '.sc-ledger-del', function () {
+        const idx = $(this).closest('.sc-ledger-card').data('idx');
+        const name = _ledgerOrder[idx];
+        if (name === undefined || name === null) return;
+        const store = getChatStore();
+        if (store.ledger && Object.prototype.hasOwnProperty.call(store.ledger, name)) {
+            delete store.ledger[name];
+            saveChatStore();
+            updateInjection(true);
+            renderLedger();
+        }
+    });
+    $(document).on('click', '#sc_ledger_clear', async function () {
+        if (!confirm('Clear the entire character ledger for THIS chat?\n\nThis removes all recorded character nature, current state, arc, and open threads. It rebuilds automatically as the story continues.')) return;
+        const store = getChatStore();
+        store.ledger = {};
+        await saveChatStore();
+        updateInjection(true);
+        renderLedger();
+        toastr.success('Character ledger cleared for this chat.', 'Summaryception', { timeOut: 2500 });
     });
 
     // ── Continuity Editor (Co-Writer / Master Novelist) ──
@@ -3320,6 +3764,16 @@ function bindUIEvents() {
         s.stripPatterns = [...defaultSettings.stripPatterns];
         s.summarizerResponseLength = defaultSettings.summarizerResponseLength;
 
+        // Reset Character Ledger settings (NOT the ledger data — that is per-chat memory)
+        s.ledgerEnabled = defaultSettings.ledgerEnabled;
+        s.ledgerSystemPrompt = defaultSettings.ledgerSystemPrompt;
+        s.ledgerUserPrompt = defaultSettings.ledgerUserPrompt;
+        s.ledgerInjectTemplate = defaultSettings.ledgerInjectTemplate;
+        s.ledgerActiveWindow = defaultSettings.ledgerActiveWindow;
+        s.ledgerMaxActive = defaultSettings.ledgerMaxActive;
+        s.ledgerMaxCharsPerChar = defaultSettings.ledgerMaxCharsPerChar;
+        s.ledgerContextMaxChars = defaultSettings.ledgerContextMaxChars;
+
         // Reset debug
         s.debugMode = defaultSettings.debugMode;
         s.traceMode = defaultSettings.traceMode;
@@ -3624,7 +4078,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.11.4 (LO) loaded — promoted/merged snippets now carry a covering turnRange (recallable); max-snippets-per-layer default migrated to 100.');
+            console.log(LOG_PREFIX, 'v5.12.0 (LO) loaded — new Character Ledger: a third background pass maintains a living per-character psychological model (nature/state/arc/open-threads); active cast injected each turn.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

@@ -51,6 +51,20 @@
             <div id="sc_snippet_browser" class="sc-snippet-browser"></div>
 
 
+            <!-- ═══ Character Ledger ═══ -->
+                    </details>
+                    <details class="sc-collapse">
+                        <summary class="sc-section-title">🧠 Character Ledger</summary>
+
+            <div class="sc-row"><small class="sc-hint">The per-character continuity model the psychologist pass maintains for this chat — <em>Nature</em> (stable self), <em>Now</em> (current mood), <em>open threads</em>, and <em>Arc</em>. Characters marked <strong>on screen</strong> are injected this turn. Fills in automatically as the story is summarized. Configure it in "🧠 Character Ledger (psychologist)" below.</small></div>
+            <div id="sc_ledger_view" class="sc-ledger-view"></div>
+            <div class="sc-button-row">
+                <button id="sc_ledger_clear" class="menu_button menu_button_danger">
+                    <i class="fa-solid fa-trash"></i> Clear Ledger
+                </button>
+            </div>
+
+
             <!-- ═══ Preview ═══ -->
                     </details>
                     <details class="sc-collapse">
@@ -422,6 +436,71 @@
                         </label>
                         <textarea id="sc_injection_template" class="text_pole sc-textarea" rows="3"></textarea>
                         <button class="menu_button sc-prompt-reset" data-key="injectionTemplate" data-target="#sc_injection_template">↺ Reset to Default</button>
+                    </div>
+                    </details>
+                    <details class="sc-collapse">
+                        <summary class="sc-section-title">🧠 Character Ledger (psychologist)</summary>
+
+
+                    <div class="sc-row">
+                        <label class="checkbox_label" for="sc_ledger_enabled">
+                            <input type="checkbox" id="sc_ledger_enabled" />
+                            <span>Enable character ledger</span>
+                        </label>
+                        <small class="sc-hint">A third background pass, once per batch: it maintains a living per-character model — <em>Nature</em> (stable personality &amp; how they express themselves), <em>Now</em> (current volatile mood), <em>Arc</em> (slow relationship trajectory), and <em>open threads</em> (unresolved beats). Only the <strong>active cast</strong> (characters on screen in the recent window) is injected, so characters stay in-voice and evolve realistically instead of snapping out of character. Uses the same connection as the summarizer. View / delete entries in the Character Ledger panel above.</small>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_ledger_max_active">
+                            <span>Max characters injected</span>
+                            <small class="sc-hint">Upper bound on how many active characters are described at once (most-recently-updated first).</small>
+                        </label>
+                        <div class="sc-slider-row">
+                            <input type="range" id="sc_ledger_max_active" min="1" max="12" step="1" />
+                            <span id="sc_ledger_max_active_val" class="sc-val">6</span>
+                        </div>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_ledger_active_window">
+                            <span>"On screen" window (messages)</span>
+                            <small class="sc-hint">How many recent messages are scanned to decide who counts as active/on-screen right now.</small>
+                        </label>
+                        <div class="sc-slider-row">
+                            <input type="range" id="sc_ledger_active_window" min="4" max="40" step="1" />
+                            <span id="sc_ledger_active_window_val" class="sc-val">12</span>
+                        </div>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_ledger_max_chars">
+                            <span>Detail per character (chars)</span>
+                            <small class="sc-hint">Injection cap per character. Higher = richer but more tokens. Arc is trimmed first if over budget.</small>
+                        </label>
+                        <div class="sc-slider-row">
+                            <input type="range" id="sc_ledger_max_chars" min="150" max="1200" step="50" />
+                            <span id="sc_ledger_max_chars_val" class="sc-val">600</span>
+                        </div>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_ledger_system_prompt">
+                            <span>Ledger System Prompt</span>
+                            <small class="sc-hint">The scribe's role: a psychologist/continuity editor that tracks the four fields, evolves state, keeps open threads alive until resolved, and never invents. Must instruct JSON-array output.</small>
+                        </label>
+                        <textarea id="sc_ledger_system_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="10"></textarea>
+                        <button class="menu_button sc-prompt-reset" data-key="ledgerSystemPrompt" data-target="#sc_ledger_system_prompt">↺ Reset to Default</button>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_ledger_user_prompt">
+                            <span>Ledger User Prompt</span>
+                            <small class="sc-hint">
+                                Variables: <code>{{player_name}}</code> <code>{{ledger}}</code> (current ledger) <code>{{context_str}}</code> (established memory) <code>{{story_txt}}</code> (this batch's passage). Output a JSON array of updated character entries.
+                            </small>
+                        </label>
+                        <textarea id="sc_ledger_user_prompt" class="text_pole sc-textarea sc-textarea-tall" rows="8"></textarea>
+                        <button class="menu_button sc-prompt-reset" data-key="ledgerUserPrompt" data-target="#sc_ledger_user_prompt">↺ Reset to Default</button>
                     </div>
                     </details>
                     <details class="sc-collapse">
