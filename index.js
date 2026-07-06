@@ -1185,6 +1185,7 @@ async function processAuditQueue() {
 // present in the recent window) is injected. Failures log; never throw upward.
 
 let _chatEpoch = 0;      // bumped on chat change; guards ledger jobs in flight
+let _prevChatLen = -1;   // last-known chat length; used to detect deletions precisely
 let _ledgerQueue = [];
 let _ledgerActive = false;
 
@@ -2317,9 +2318,91 @@ function updateInjection(force = false) {
 
 // ─── Event Handlers ──────────────────────────────────────────────────
 
+// When a message is deleted, SillyTavern splices the chat array so every later
+// message's index shifts down. Our stored bookkeeping is index-based
+// (summarizedUpTo, each snippet's turnRange, ghostedIndices), so it must shift
+// too — otherwise recall / snippet-regen / backfill would later read the wrong
+// source turns. The ledger is name-keyed and carries no indices, so it is
+// untouched. These run only on deletion, do no model calls, and are O(snippets).
+
+// Precise single-deletion shift at index D. An index x maps: x>D -> x-1; x==D
+// was the deleted message. A snippet whose entire source was the deleted
+// message becomes unrecallable (turnRange nulled, text kept).
+function reindexAfterDeletion(store, D) {
+    if (!store || typeof D !== 'number' || D < 0) return;
+    if (typeof store.summarizedUpTo === 'number' && store.summarizedUpTo >= D) {
+        store.summarizedUpTo = store.summarizedUpTo - 1;
+    }
+    if (Array.isArray(store.layers)) {
+        for (const layer of store.layers) {
+            if (!Array.isArray(layer)) continue;
+            for (const sn of layer) {
+                if (!sn || !Array.isArray(sn.turnRange) || sn.turnRange.length < 2) continue;
+                let s = sn.turnRange[0], e = sn.turnRange[1];
+                if (typeof s !== 'number' || typeof e !== 'number') continue;
+                if (s > D) s -= 1;            // start shifts only if strictly after the deletion
+                if (e >= D) e -= 1;           // end shifts if at or after (the deleted msg leaves the span)
+                sn.turnRange = (s > e) ? null : [s, e];   // whole source gone -> unrecallable, keep text
+            }
+        }
+    }
+    if (Array.isArray(store.ghostedIndices)) {
+        store.ghostedIndices = store.ghostedIndices
+            .filter(i => i !== D)
+            .map(i => (i > D ? i - 1 : i));
+    }
+}
+
+// Safe fallback when we can't pinpoint the deletion (bulk/scattered/unknown
+// index): only fix anything that now points PAST the end of the chat, so
+// nothing references a non-existent message. Never mis-shifts in-range indices.
+function clampStoreToLength(store, newLen) {
+    if (!store) return;
+    const max = (newLen | 0) - 1;
+    if (typeof store.summarizedUpTo === 'number' && store.summarizedUpTo > max) store.summarizedUpTo = max;
+    if (Array.isArray(store.layers)) {
+        for (const layer of store.layers) {
+            if (!Array.isArray(layer)) continue;
+            for (const sn of layer) {
+                if (!sn || !Array.isArray(sn.turnRange) || sn.turnRange.length < 2) continue;
+                let s = sn.turnRange[0], e = sn.turnRange[1];
+                if (typeof s !== 'number' || typeof e !== 'number') continue;
+                if (s > max) { sn.turnRange = null; continue; }
+                if (e > max) e = max;
+                sn.turnRange = (s > e) ? null : [s, e];
+            }
+        }
+    }
+    if (Array.isArray(store.ghostedIndices)) store.ghostedIndices = store.ghostedIndices.filter(i => i <= max);
+}
+
+function onMessageDeleted(deletedIndex) {
+    try {
+        const { chat } = SillyTavern.getContext();
+        const newLen = Array.isArray(chat) ? chat.length : 0;
+        const delta = (_prevChatLen >= 0) ? (_prevChatLen - newLen) : -1;   // messages removed since last known length
+        _prevChatLen = newLen;
+        const store = getChatStore();
+        const D = (typeof deletedIndex === 'number' && isFinite(deletedIndex) && deletedIndex >= 0)
+            ? Math.floor(deletedIndex) : -1;
+
+        if (delta === 1 && D >= 0 && D <= newLen) {
+            reindexAfterDeletion(store, D);   // the common case: one message, known position — exact shift
+        } else if (delta >= 1 || D >= 0) {
+            clampStoreToLength(store, newLen);   // bulk / uncertain — safe overrun-only repair
+        } else {
+            return;   // no shrink detected
+        }
+        saveChatStore();
+        updateInjection(true);       // active cast may have changed if a recent message went away
+        try { updateUI(); } catch (_) {}
+    } catch (e) { log('onMessageDeleted error:', e); }
+}
+
 function onMessageReceived(messageIndex) {
     try {
         const { chat } = SillyTavern.getContext();
+        _prevChatLen = Array.isArray(chat) ? chat.length : _prevChatLen;
         const msg = chat[messageIndex];
         if (msg && !msg.is_user && !msg.is_system) {
             log('New assistant message at index', messageIndex);
@@ -2337,6 +2420,7 @@ function onMessageReceived(messageIndex) {
 function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
+    try { const { chat } = SillyTavern.getContext(); _prevChatLen = Array.isArray(chat) ? chat.length : -1; } catch (_) { _prevChatLen = -1; }
     // Editor + audit state is PER-CHAT. Never let a memory snapshot, pending
     // edits, or queued audits from the previous chat leak into this one —
     // an Undo here with the old chat's snapshot would corrupt this chat's memory.
@@ -3366,6 +3450,7 @@ async function runRecall(query, opts = {}){
 }
 
 function onGenerationEnded(){
+    try { const { chat } = SillyTavern.getContext(); _prevChatLen = Array.isArray(chat) ? chat.length : _prevChatLen; } catch (_) {}
     if(_recallRemaining>0){ _recallRemaining--; if(_recallRemaining<=0){ clearRecall(); log('Recall injection cleared (ephemeral).'); } }
     // Auto-recall: background, never blocks. Uses YOUR latest message as the query
     // and stages the recalled scene for your NEXT reply (one-turn continuity window).
@@ -4379,6 +4464,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
         eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
         eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
+        if (event_types.MESSAGE_DELETED) eventSource.on(event_types.MESSAGE_DELETED, onMessageDeleted);
         if (event_types.GENERATION_ENDED) eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
         else eventSource.on(event_types.MESSAGE_RECEIVED, onGenerationEnded);
         registerSlashCommands();
@@ -4386,7 +4472,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.14.1 (LO) loaded — hardening: backfill/selected-ledger now abandon on chat switch (no cross-chat contamination), ledger key resolution unifies short/full character names safely (no fragmentation), background-pass reentrancy guard, per-batch saves, object-based audit targets.');
+            console.log(LOG_PREFIX, 'v5.15.0 (LO) loaded — message-deletion resync: deleting a mid-chat message now shifts stored index bookkeeping (summarizedUpTo, snippet turnRanges, ghostedIndices) so recall/regen/backfill keep reading the right source turns. Precise for single deletions, safe overrun-clamp fallback otherwise. Ledger untouched (name-keyed).');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
