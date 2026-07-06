@@ -27,7 +27,7 @@ const defaultSettings = Object.freeze({
     enabled: true,
     verbatimTurns: 9,
     turnsPerSummary: 3,
-    snippetsPerLayer: 30,
+    snippetsPerLayer: 100,
     snippetsPerPromotion: 2,
     maxLayers: 9,
     injectionTemplate: '[Story memory continuation after brief plot essential — oldest → newest. Established canon; do not contradict.]\n{{summary}}',
@@ -1640,12 +1640,29 @@ async function maybePromoteLayer(layerIndex) {
         return;
     }
 
-    destLayer.push({
+    // Propagate a covering turnRange so the merged snippet stays recallable.
+    // Children created before this fix (or legacy range-less merges) may lack a
+    // range; compute from whatever VALID child ranges exist. If none do, leave
+    // the merged snippet range-less ("unrecallable legacy") rather than
+    // fuzzy-reconstructing — recall already degrades gracefully for these.
+    const childRanges = toMerge
+        .map(sn => sn.turnRange)
+        .filter(r => Array.isArray(r) && r.length === 2
+            && Number.isFinite(r[0]) && Number.isFinite(r[1]));
+
+    const merged = {
         text: metaSummary,
         fromLayer: layerIndex,
         mergedCount: toMerge.length,
         timestamp: Date.now(),
-    });
+    };
+    if (childRanges.length > 0) {
+        merged.turnRange = [
+            Math.min(...childRanges.map(r => r[0])),
+            Math.max(...childRanges.map(r => r[1])),
+        ];
+    }
+    destLayer.push(merged);
 
     log(`Layer ${layerIndex + 1} now has ${destLayer.length} snippets`);
 
@@ -3607,7 +3624,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.11.3 (LO) loaded — catch-up modal no longer clipped off top of screen.');
+            console.log(LOG_PREFIX, 'v5.11.4 (LO) loaded — promoted/merged snippets now carry a covering turnRange (recallable); max-snippets-per-layer default migrated to 100.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
