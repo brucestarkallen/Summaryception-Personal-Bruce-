@@ -1882,16 +1882,27 @@ const _ESC_RE = /[.*+?^${}()|[\]\\]/g;
 function _escapeRegex(str) { return String(str).replace(_ESC_RE, '\\$&'); }
 
 // Aliases used to detect whether a character is "on screen" in recent text:
-// the full name plus its primary given-name token (the longest token > 2 chars,
-// usually the name spoken in dialogue).
+// the full name plus its first and last name-tokens. Prose/dialogue usually
+// refers to a character by given name (and sometimes surname), so keying on the
+// first and last tokens — not the longest — is what reliably catches "Stella"
+// for "Stella Vermillion". Recall matters more than precision here: a missed
+// on-screen character loses its behavioral anchor (the whole point of the
+// ledger), whereas an occasional off-screen inject is merely a little wasteful.
 function characterAliases(name) {
     const full = String(name || '').trim();
     if (!full) return [];
     const aliases = [full];
     const tokens = full.split(/\s+/).filter(Boolean);
     if (tokens.length > 1) {
-        const primary = tokens.filter(t => t.length > 2).sort((a, b) => b.length - a.length)[0];
-        if (primary && primary.toLowerCase() !== full.toLowerCase()) aliases.push(primary);
+        const fullLower = full.toLowerCase();
+        const add = (tok) => {
+            if (!tok || tok.length <= 2) return;
+            if (tok.toLowerCase() === fullLower) return;
+            if (aliases.some(a => a.toLowerCase() === tok.toLowerCase())) return;
+            aliases.push(tok);
+        };
+        add(tokens[0]);                    // given name (most often spoken)
+        add(tokens[tokens.length - 1]);    // surname (formal address)
     }
     return aliases;
 }
@@ -4078,7 +4089,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.12.0 (LO) loaded — new Character Ledger: a third background pass maintains a living per-character psychological model (nature/state/arc/open-threads); active cast injected each turn.');
+            console.log(LOG_PREFIX, 'v5.12.1 (LO) loaded — Character Ledger: a third background pass maintains a living per-character psychological model (nature/state/arc/open-threads); active cast injected each turn. Fix: on-screen detection now matches given/surname tokens.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
