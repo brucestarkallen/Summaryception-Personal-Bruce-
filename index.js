@@ -37,6 +37,16 @@ const defaultSettings = Object.freeze({
     injectionDepth: 4,      // messages up from newest; only used when position = 1
     injectionRole: 0,       // 0 = system · 1 = user · 2 = assistant
 
+    // ── Injection contents: which assembled sections are actually sent to the
+    //    storyteller. All default ON (current behavior). These gate ONLY the
+    //    injection — they do not stop the background passes from running, so you
+    //    can keep the ledger/auditor building while excluding them from context. ──
+    injectNotepad: true,
+    injectPinned: true,
+    injectLedger: true,
+    injectSummary: true,
+    injectDetails: true,
+
     // ── Manual notepad wrapper (the note text itself is stored per-chat, in chat metadata) ──
     notepadTemplate: '\n\n<notes>\n{{notes}}\n</notes>\n',
 
@@ -72,26 +82,27 @@ const defaultSettings = Object.freeze({
     ledgerEnabled: true,
     ledgerActiveWindow: 12,        // recent messages scanned to decide who is "on screen"
     ledgerMaxActive: 6,            // max characters injected at once
-    ledgerMaxCharsPerChar: 600,    // per-character injection cap (chars)
+    ledgerMaxCharsPerChar: 700,    // per-character injection cap (chars)
     ledgerContextMaxChars: 6000,   // ledger context budget handed to the scribe
     ledgerInjectTemplate: '\n\n<characters>\nWho these people are and where they stand right now — keep them consistent and in character; do not contradict:\n{{characters}}\n</characters>\n',
     ledgerSystemPrompt:
-        `You are the character-continuity mind for an ongoing work of collaborative fiction — part psychologist, part continuity editor. You maintain a living ledger of the people in the story so a separate storyteller AI, often working many turns later from compressed memory, keeps every character consistent, in-voice, and evolving like a real person — never flattened into a generic or out-of-character reaction.
+        `You are the character-continuity mind for an ongoing work of collaborative fiction — part novelist, part psychologist. You maintain a living ledger of the people in the story so a separate storyteller AI, often working many turns later from compressed memory, can keep every character the SAME PERSON — consistent in voice, values, and behavior — while letting them change the way real people do: gradually, believably, and only for reasons the story earned. The failures you exist to prevent are (1) a character acting out of nowhere against who they are (a guarded cynic suddenly gushing; a gentle soul suddenly cruel), and (2) a real, felt emotion vanishing the instant the scene is compressed.
 
 You receive the CURRENT LEDGER (what is already known about each character), the PRIOR CONTEXT (established story), and a NEW PASSAGE (what just happened). For every character who appears or is materially involved in the NEW PASSAGE, output an updated entry. Do NOT output characters who are absent from the passage.
 
 Each entry tracks four fields. Update ONLY what the passage changes; OMIT any field that is unchanged.
 
-- core — the character's STABLE nature: temperament, values, and above all HOW THEY EXPRESS THEMSELVES, especially under stress (their tells, their register, what they would never do). This is the anchor that keeps them the same person across the whole story. Write it once when a character is first established, then change it only when the passage genuinely reveals a NEW stable trait — never for a passing mood. When you do write core, give the FULL stable picture (prior traits plus any new one) so nothing established is lost. Favor behavioral specifics a storyteller can act on: "masks embarrassment with clipped sarcasm; never raises her voice; deflects rather than confronts" beats "is shy and proud."
-- state — the character's CURRENT, volatile condition right after this passage: mood, what is on their mind, how they are carrying themselves now. This is overwritten every time they act. Path-dependent feelings live here (e.g. still rattled by a slight from earlier) and persist until the story resolves them — so a mood set now survives into later turns instead of vanishing.
-- arc — the SLOW trajectory of this character, above all their relationship with {{player_name}}: the direction it is moving (warming, fraying, trust building or breaking, respect shifting). One or two sentences. Update only when the passage actually advances it; otherwise omit. Evolve the existing arc — do not restart it.
-- threads — the character's CURRENTLY OPEN loose ends: concrete, unresolved things that will shape how they behave next (a pending promise, a lie unconfessed, an unaddressed slight, a question left hanging). Output the CURRENT open list: KEEP threads still unresolved, DROP any this passage resolved, ADD any it opened. A thread stays open until the STORY resolves it — never merely because time passed. Omit the field entirely if the character has no open threads and none changed; use an empty array [] ONLY to signal that all previously-open threads are now resolved.
+- core — the character's STABLE nature: temperament, values, and above all HOW THEY EXPRESS THEMSELVES. Capture what a writer needs to keep them in character: their default emotional register; how they behave under stress, embarrassment, or threat; their tells and defense mechanisms; how they speak (formal or plain, blunt or indirect, verbal habits) and specifically how they ADDRESS {{player_name}} and others (by name, nickname, title, coldly, teasingly); and the lines they would NOT cross. This is the anchor that keeps them recognizable across the whole story. Write it once when a character is established, then change it only when the passage reveals a genuinely NEW stable trait — never for a passing mood. When you do touch core, restate the FULL stable picture (everything already established plus the new trait) so nothing is lost. Favor concrete, actable specifics: "when flustered, goes clipped and sarcastic and changes the subject; never raises her voice" beats "proud but shy."
+- state — the character's CURRENT, volatile condition right after this passage: their mood, what is on their mind, what they want in this moment, how they are carrying themselves. This is overwritten each time they act, but it is NOT a blank slate — emotions have momentum. Carry forward the mood the ledger already records and evolve it realistically: a shock lingers and eases only with time or reassurance; a slight festers until addressed; warmth or anger set earlier still colors how they act now. If a character re-enters after being off-page, their last recorded state is where they resume unless the passage changes it. Record what would still be true a few beats later, not just the instant snapshot.
+- arc — the SLOW trajectory of this character's key relationships, above all with {{player_name}}: the DIRECTION things are moving (warming, fraying, trust building or breaking, respect or resentment growing) AND the formative moments that got them there — what {{player_name}} did that they will not forget (a kindness, a betrayal, a moment of being truly seen or let down). One to three sentences. This is relational memory: it is WHY they treat {{player_name}} the way they do. Update only when the passage actually moves it; evolve the existing arc rather than restarting it.
+- threads — the character's CURRENTLY OPEN loose ends: concrete, unresolved things that will shape how they behave next (a promise pending, a lie unconfessed, an unaddressed slight, a confession half-made, a question left hanging, a debt owed either way). Output the CURRENT open list: KEEP threads still unresolved, DROP any this passage resolved, ADD any it opened. A thread stays open until the STORY resolves it — never merely because time passed. Omit the field entirely if nothing changed; use an empty array [] ONLY to signal that all previously-open threads are now resolved.
 
 DISCIPLINE — this is a continuity record, not new fiction:
 - Record ONLY what the passage (with the prior context) EVIDENCES. Never invent traits, motives, feelings, or backstory the text does not support. Inventing is the worst failure — it corrupts the character.
-- Separate observation from inference. If you infer an inner state, hedge it ("seems", "reads as", "appears to") rather than asserting it as established fact.
+- Separate observation from inference. State what a character DID as fact; when you read their inner state from behavior, mark it as read ("seems", "reads as", "appears to"), not as certainty.
+- Respect what each character can plausibly know. Do not credit them with knowledge of events they did not witness or were not told; their state and choices follow from their own perspective, not the reader's.
 - Do NOT restate what the CURRENT LEDGER or PRIOR CONTEXT already holds. Add or evolve only.
-- Use each character's exact name as already established in the ledger or context. Do not rename or merge distinct characters.
+- Use each character's exact name as already established. Do not rename or merge distinct characters, and do not invent a name for an unnamed figure — skip anyone unnamed.
 - Terse, concrete director's notes. No markdown, no preamble, no meta-commentary.
 
 OUTPUT — a single JSON array and NOTHING else (no code fence, no prose before or after). Each element:
@@ -112,7 +123,14 @@ Include only the fields you are updating for that character. If no character in 
 {{story_txt}}
 </new_passage>
 
-Update the character ledger for EVERY character who appears or is materially involved in <new_passage>. Use the four-field model (core / state / arc / threads) and OMIT every field that is unchanged. Evolve existing entries rather than restating them. Keep unresolved threads open; drop resolved ones. Ground every word in the passage and prior context — never invent. Output ONLY the JSON array (or [] if nothing changed).`,
+Update the character ledger for EVERY character who appears or is materially involved in <new_passage>. Use the four-field model (core / state / arc / threads) and OMIT every field that is unchanged.
+
+- Evolve existing entries; do not restate them. Carry each character's recorded mood forward and move it realistically — emotions have momentum and do not reset between scenes.
+- Change core only for a genuinely new STABLE trait, never for a passing mood; when you touch it, keep everything already established.
+- Keep unresolved threads open; drop only what the passage actually resolves.
+- Ground every word in the passage and prior context — never invent, and never credit a character with knowledge they could not have.
+
+Output ONLY the JSON array (or [] if nothing changed).`,
 
     // ── Continuity Editor ("Co-Writer / Master Novelist") prompts ──
     editorSystemPrompt:
@@ -2180,14 +2198,14 @@ function assembleSummaryBlock() {
 
     // ── Manual notepad — per-chat story/lore memory (survives branches) ──
     let notesPart = '';
-    if (store.notepad && store.notepad.trim().length > 0) {
+    if (s.injectNotepad !== false && store.notepad && store.notepad.trim().length > 0) {
         const tpl = s.notepadTemplate || '\n\n<notes>\n{{notes}}\n</notes>\n';
         notesPart = tpl.replace('{{notes}}', store.notepad.trim());
     }
 
     // ── Auto-generated layered summary ──
     let summaryPart = '';
-    if (store.layers && !store.layers.every(l => !l || l.length === 0)) {
+    if (s.injectSummary !== false && store.layers && !store.layers.every(l => !l || l.length === 0)) {
         const snippets = [];
         for (let i = store.layers.length - 1; i >= 1; i--) {
             const layer = store.layers[i];
@@ -2205,7 +2223,7 @@ function assembleSummaryBlock() {
     // ── Sister detail notes — the specifics the compact snippets dropped, for
     //    recent (Layer 0) events. Rides along with the summary, clearly marked. ──
     let detailPart = '';
-    if (s.sisterEnabled && store.layers && store.layers[0]) {
+    if (s.injectDetails !== false && s.sisterEnabled && store.layers && store.layers[0]) {
         const notes = store.layers[0]
             .filter(sn => sn.detail && sn.detail.trim())
             .map(sn => '- ' + sn.detail.trim());
@@ -2215,10 +2233,15 @@ function assembleSummaryBlock() {
         }
     }
 
+    // Optional sections gated by their own injection toggles (independent of the
+    // background passes, which keep running so the data stays maintained).
+    const pinnedPart = (s.injectPinned !== false) ? buildPinnedBlock() : '';
+    const charPart   = (s.injectLedger !== false) ? buildCharacterBlock() : '';
+
     // Stable canon first (notepad → pinned → active-cast character state), then the
     // narrative (summary gist → recent-detail specifics). Grouping "who these people
     // are" ahead of "what happened" frames the scene for the storyteller.
-    return notesPart + buildPinnedBlock() + buildCharacterBlock() + summaryPart + detailPart;
+    return notesPart + pinnedPart + charPart + summaryPart + detailPart;
 }
 
 // ─── Injection via setExtensionPrompt ────────────────────────────────
@@ -2444,6 +2467,11 @@ function updateUI() {
         $('#sc_injection_position').val(String(s.injectionPosition ?? 1));
         $('#sc_injection_depth').val(s.injectionDepth ?? 4);
         $('#sc_injection_depth_val').text(s.injectionDepth ?? 4);
+        $('#sc_inject_notepad').prop('checked', s.injectNotepad !== false);
+        $('#sc_inject_pinned').prop('checked', s.injectPinned !== false);
+        $('#sc_inject_ledger').prop('checked', s.injectLedger !== false);
+        $('#sc_inject_summary').prop('checked', s.injectSummary !== false);
+        $('#sc_inject_details').prop('checked', s.injectDetails !== false);
         $('#sc_notepad').val(store.notepad || '');
         $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
@@ -3412,6 +3440,22 @@ function bindUIEvents() {
         updateInjection(true);
     });
 
+    // ── Injection contents (which sections are actually sent) ──
+    const injectToggles = [
+        ['#sc_inject_notepad', 'injectNotepad'],
+        ['#sc_inject_pinned',  'injectPinned'],
+        ['#sc_inject_ledger',  'injectLedger'],
+        ['#sc_inject_summary', 'injectSummary'],
+        ['#sc_inject_details', 'injectDetails'],
+    ];
+    for (const [id, key] of injectToggles) {
+        $(document).on('change', id, function () {
+            getSettings()[key] = $(this).prop('checked');
+            saveSettings();
+            updateInjection(true);
+        });
+    }
+
     // ── Manual notepad (per-chat, live) ──
     $(document).on('input', '#sc_notepad', function () {
         getChatStore().notepad = $(this).val();
@@ -3986,6 +4030,13 @@ function bindUIEvents() {
         s.stripPatterns = [...defaultSettings.stripPatterns];
         s.summarizerResponseLength = defaultSettings.summarizerResponseLength;
 
+        // Reset injection-content toggles
+        s.injectNotepad = defaultSettings.injectNotepad;
+        s.injectPinned = defaultSettings.injectPinned;
+        s.injectLedger = defaultSettings.injectLedger;
+        s.injectSummary = defaultSettings.injectSummary;
+        s.injectDetails = defaultSettings.injectDetails;
+
         // Reset Character Ledger settings (NOT the ledger data — that is per-chat memory)
         s.ledgerEnabled = defaultSettings.ledgerEnabled;
         s.ledgerSystemPrompt = defaultSettings.ledgerSystemPrompt;
@@ -4300,7 +4351,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.13.0 (LO) loaded — Backfill/Maintenance: retroactively build the character ledger from an existing story (/sc-ledger-build) and backfill missing auditor detail notes (/sc-audit-all); per-snippet ledger + detail buttons for selected runs. Cancelable, non-blocking.');
+            console.log(LOG_PREFIX, 'v5.14.0 (LO) loaded — Injection Contents toggles (choose which of notepad/pinned/ledger/summary/details are sent, independent of the background passes); sharper ledger prompt tuned for real-life continuity (emotional momentum, voice/address, relational memory, knowledge plausibility).');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
