@@ -4495,7 +4495,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.15.2 (LO) loaded — Reset All is now comprehensive: one click restores EVERY prompt/template/toggle (summarizer, auditor, ledger, editor, recall, injection) to the best-known defaults, preserving memory + connection. (Ledger injection is compact prose, never JSON.)');
+            console.log(LOG_PREFIX, 'Summaryception v5.15.3 loaded — full README added (architecture + fork differences + maintainer notes); display name cleaned. No functional changes.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
