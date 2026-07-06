@@ -1227,12 +1227,29 @@ async function callLedgerScribe(storyTxt, contextStr, ledgerStr) {
 // Case-insensitive key resolution so "mara" and "Mara" don't split into two
 // entries. Distinct characters keep distinct names (no fuzzy merging).
 function resolveLedgerKey(ledger, name) {
+    const keys = Object.keys(ledger);
+    // 1. exact match
     if (Object.prototype.hasOwnProperty.call(ledger, name)) return name;
+    // 2. case-insensitive exact match ("mara" -> "Mara")
     const lower = name.toLowerCase();
-    for (const k of Object.keys(ledger)) {
-        if (k.toLowerCase() === lower) return k;
-    }
-    return name;
+    for (const k of keys) if (k.toLowerCase() === lower) return k;
+    // 3. token-aware: unify a short/long form of the SAME character — the scribe
+    //    sending "Alexia" when the ledger holds "Alexia Valois" (or vice-versa) —
+    //    but ONLY when the match is unambiguous, so two characters who merely
+    //    share a given name or surname are NEVER merged.
+    const inTok = name.split(/\s+/).filter(Boolean).map(t => t.toLowerCase());
+    if (inTok.length === 0) return name;
+    const candidates = keys.filter(k => {
+        const kTok = k.split(/\s+/).filter(Boolean).map(t => t.toLowerCase());
+        if (!kTok.length) return false;
+        // exactly one side must be a single token (the short form) …
+        const oneSideShort = (inTok.length === 1) !== (kTok.length === 1);
+        if (!oneSideShort) return false;
+        // … and they must share the given name (first token) or surname (last).
+        return kTok[0] === inTok[0] || kTok[kTok.length - 1] === inTok[inTok.length - 1];
+    });
+    if (candidates.length === 1) return candidates[0];   // unambiguous → same character
+    return name;                                          // ambiguous or none → keep separate
 }
 
 // Merge scribe deltas into the store's ledger. Partial semantics: a field
@@ -1349,6 +1366,7 @@ async function backfillLedgerFromHistory() {
     const s = getSettings();
     if (!s.ledgerEnabled) { toastr.warning('Enable the Character Ledger first.', 'Summaryception'); return; }
     if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
+    if (_ledgerActive || _auditActive) { toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
     const { chat } = SillyTavern.getContext();
     const turns = getAssistantTurns(chat);
     if (turns.length === 0) { toastr.info('No story turns to build the ledger from yet.', 'Summaryception', { timeOut: 4000 }); return; }
@@ -1363,6 +1381,7 @@ async function backfillLedgerFromHistory() {
     const store = getChatStore();
     if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
     _ledgerQueue = [];   // we drive the scribe directly here; drop pending background jobs
+    const startEpoch = _chatEpoch;   // if the user switches chats mid-run, abandon — never write another chat's ledger
 
     let done = 0, failed = 0, cancelled = false, consec = 0;
     const contextStr = buildFullContext(0);   // whole-story gist as grounding (stable during backfill)
@@ -1373,12 +1392,13 @@ async function backfillLedgerFromHistory() {
     isSummarizing = true;
     try {
         for (const b of batches) {
-            if (cancelled) break;
+            if (cancelled || _chatEpoch !== startEpoch) break;
             const storyTxt = buildPassageFromRange(chat, b.passageStart, b.endIdx);
             if (!storyTxt.trim()) { done++; continue; }
             try {
                 const ledgerStr = serializeLedgerForScribe(store.ledger, s.ledgerContextMaxChars);
                 const deltas = await callLedgerScribe(storyTxt, contextStr, ledgerStr);
+                if (_chatEpoch !== startEpoch) break;   // switched during the call — discard, never merge into the wrong chat
                 if (deltas) mergeLedgerDeltas(deltas);
                 consec = 0;
             } catch (e) {
@@ -1387,18 +1407,22 @@ async function backfillLedgerFromHistory() {
                 if (consec >= 3) { toastr.error('3 consecutive failures — pausing. Progress saved.', 'Summaryception', { timeOut: 7000 }); break; }
             }
             done++;
-            if (done % 5 === 0) await saveChatStore();
+            await saveChatStore();   // per-batch: an interruption loses at most the current pass
             const pct = Math.round((done / batches.length) * 100);
             $(toast).find('.toast-message').text(`Building ledger: ${done} / ${batches.length} passes (${pct}%)${failed ? ` | ${failed} failed` : ''}\nClick ✕ to stop`);
             await new Promise(r => setTimeout(r, 60));
         }
-        await saveChatStore();
-        updateInjection(true);
-        try { renderLedger(); } catch (_) {}
         toastr.clear(toast);
-        const nChars = Object.keys(store.ledger).length;
-        if (cancelled) toastr.warning(`Stopped at ${done}/${batches.length}. Ledger has ${nChars} character(s). Progress saved.`, 'Summaryception', { timeOut: 5000 });
-        else toastr.success(`Ledger built — ${nChars} character(s) across ${done} passes${failed ? `, ${failed} failed` : ''}.`, 'Summaryception', { timeOut: 5000 });
+        if (_chatEpoch !== startEpoch) {
+            toastr.warning(`Stopped — you switched chats. The original chat kept its ledger progress through pass ${done}.`, 'Summaryception', { timeOut: 6000 });
+        } else {
+            await saveChatStore();
+            updateInjection(true);
+            try { renderLedger(); } catch (_) {}
+            const nChars = Object.keys(store.ledger).length;
+            if (cancelled) toastr.warning(`Stopped at ${done}/${batches.length}. Ledger has ${nChars} character(s). Progress saved.`, 'Summaryception', { timeOut: 5000 });
+            else toastr.success(`Ledger built — ${nChars} character(s) across ${done} passes${failed ? `, ${failed} failed` : ''}.`, 'Summaryception', { timeOut: 5000 });
+        }
     } finally {
         isSummarizing = false;
         try { updateUI(); } catch (_) {}
@@ -1410,12 +1434,14 @@ async function runLedgerForSnippet(layerIdx, snippetIdx) {
     const s = getSettings();
     if (!s.ledgerEnabled) { toastr.warning('Enable the Character Ledger first.', 'Summaryception'); return; }
     if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
+    if (_ledgerActive || _auditActive) { toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
     const store = getChatStore();
     const layer = store.layers[layerIdx];
     if (!layer || !layer[snippetIdx] || !layer[snippetIdx].turnRange) { toastr.error('This snippet has no source turns to read.', 'Summaryception'); return; }
     if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
     const sn = layer[snippetIdx];
     const { chat } = SillyTavern.getContext();
+    const startEpoch = _chatEpoch;
     isSummarizing = true;
     try {
         const storyTxt = buildPassageFromRange(chat, sn.turnRange[0], sn.turnRange[1]);
@@ -1423,6 +1449,7 @@ async function runLedgerForSnippet(layerIdx, snippetIdx) {
         const contextStr = buildFullContext(0);
         toastr.info(`Reading scene ${sn.turnRange[0]}–${sn.turnRange[1]} into the ledger…`, 'Summaryception', { timeOut: 3000, progressBar: true });
         const deltas = await callLedgerScribe(storyTxt, contextStr, serializeLedgerForScribe(store.ledger, s.ledgerContextMaxChars));
+        if (_chatEpoch !== startEpoch) { toastr.info('Chat changed — scene not applied.', 'Summaryception', { timeOut: 3000 }); return; }
         const changed = deltas ? mergeLedgerDeltas(deltas) : 0;
         await saveChatStore();
         updateInjection(true);
@@ -1439,12 +1466,13 @@ async function backfillAuditsForLayer0() {
     const s = getSettings();
     if (!s.sisterEnabled) { toastr.warning('Enable the Detail Auditor first.', 'Summaryception'); return; }
     if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
+    if (_ledgerActive || _auditActive) { toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
     const store = getChatStore();
     const l0 = (store.layers && store.layers[0]) ? store.layers[0] : [];
-    const targets = [];
+    const targets = [];   // capture snippet OBJECTS, not indices, so a mid-run deletion can't shift us onto the wrong snippet
     for (let i = 0; i < l0.length; i++) {
         const sn = l0[i];
-        if (sn && sn.turnRange && !(sn.detail && String(sn.detail).trim())) targets.push(i);
+        if (sn && sn.turnRange && !(sn.detail && String(sn.detail).trim())) targets.push(sn);
     }
     if (targets.length === 0) { toastr.info('No snippets need auditing — every Layer 0 snippet already has a detail note (or none exist).', 'Summaryception', { timeOut: 4000 }); return; }
     if (!confirm(
@@ -1453,6 +1481,7 @@ async function backfillAuditsForLayer0() {
     )) return;
 
     const { chat } = SillyTavern.getContext();
+    const startEpoch = _chatEpoch;   // abandon on chat switch — never write another chat's snippets
     let done = 0, added = 0, failed = 0, cancelled = false, consec = 0;
     const toast = toastr.info(`Auditing: 0 / ${targets.length}`, 'Summaryception Auditor', {
         timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, closeButton: true,
@@ -1460,20 +1489,22 @@ async function backfillAuditsForLayer0() {
     });
     isSummarizing = true;
     try {
-        for (const idx of targets) {
-            if (cancelled) break;
-            const sn = store.layers[0] && store.layers[0][idx];
-            if (!sn || !sn.turnRange) { done++; continue; }
+        for (const sn of targets) {
+            if (cancelled || _chatEpoch !== startEpoch) break;
+            const cur0 = store.layers && store.layers[0];
+            if (!cur0 || cur0.indexOf(sn) === -1 || !sn.turnRange) { done++; continue; }   // deleted/moved — skip
             const storyTxt = buildPassageFromRange(chat, sn.turnRange[0], sn.turnRange[1]);
             if (!storyTxt.trim()) { done++; continue; }
             const parts = [];
             for (let li = store.layers.length - 1; li >= 0; li--) {
                 const l = store.layers[li]; if (!l) continue;
-                for (let k = 0; k < l.length; k++) { if (li === 0 && k === idx) continue; parts.push(l[k].text); }
+                for (const other of l) { if (other === sn) continue; parts.push(other.text); }   // skip self by identity
             }
             const contextStr = parts.length ? parts.join(' ') : '(none yet)';
             try {
                 const detail = await callAuditor(storyTxt, sn.text, contextStr);
+                if (_chatEpoch !== startEpoch) break;                    // switched during the call
+                if (cur0.indexOf(sn) === -1) { done++; continue; }       // deleted during the call
                 if (detail) { sn.detail = detail; added++; }
                 consec = 0;
             } catch (e) {
@@ -1482,16 +1513,20 @@ async function backfillAuditsForLayer0() {
                 if (consec >= 3) { toastr.error('3 consecutive failures — pausing. Progress saved.', 'Summaryception', { timeOut: 7000 }); break; }
             }
             done++;
-            if (done % 5 === 0) await saveChatStore();
+            await saveChatStore();   // per-batch: an interruption loses at most the current snippet
             const pct = Math.round((done / targets.length) * 100);
             $(toast).find('.toast-message').text(`Auditing: ${done} / ${targets.length} (${pct}%) | +${added} notes${failed ? ` | ${failed} failed` : ''}\nClick ✕ to stop`);
             await new Promise(r => setTimeout(r, 60));
         }
-        await saveChatStore();
-        updateInjection(true);
         toastr.clear(toast);
-        if (cancelled) toastr.warning(`Stopped at ${done}/${targets.length}. Added ${added} note(s). Progress saved.`, 'Summaryception', { timeOut: 5000 });
-        else toastr.success(`Audit backfill done — ${added} detail note(s) added across ${done} snippet(s)${failed ? `, ${failed} failed` : ''}.`, 'Summaryception', { timeOut: 5000 });
+        if (_chatEpoch !== startEpoch) {
+            toastr.warning(`Stopped — you switched chats. The original chat kept its progress (${added} note(s) added).`, 'Summaryception', { timeOut: 6000 });
+        } else {
+            await saveChatStore();
+            updateInjection(true);
+            if (cancelled) toastr.warning(`Stopped at ${done}/${targets.length}. Added ${added} note(s). Progress saved.`, 'Summaryception', { timeOut: 5000 });
+            else toastr.success(`Audit backfill done — ${added} detail note(s) added across ${done} snippet(s)${failed ? `, ${failed} failed` : ''}.`, 'Summaryception', { timeOut: 5000 });
+        }
     } finally {
         isSummarizing = false;
         try { updateSnippetBrowser(); } catch (_) {}
@@ -4351,7 +4386,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'v5.14.0 (LO) loaded — Injection Contents toggles (choose which of notepad/pinned/ledger/summary/details are sent, independent of the background passes); sharper ledger prompt tuned for real-life continuity (emotional momentum, voice/address, relational memory, knowledge plausibility).');
+            console.log(LOG_PREFIX, 'v5.14.1 (LO) loaded — hardening: backfill/selected-ledger now abandon on chat switch (no cross-chat contamination), ledger key resolution unifies short/full character names safely (no fragmentation), background-pass reentrancy guard, per-batch saves, object-based audit targets.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
