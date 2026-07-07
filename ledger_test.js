@@ -28,7 +28,7 @@ function extractTopLevel(name) {
 
 const names = ['_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
-    'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas'];
+    'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -46,6 +46,7 @@ return {
   __setChat:     (v)=>{ __chat = v; },
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
+  subst,
 };
 `;
 const L = new Function(sandbox)();
@@ -277,6 +278,23 @@ section('buildCharacterBlock — the tsundere scenario (regression for the repor
     ok(b.includes('NEVER raises her voice'), 'behavioral anchor (no-outburst core) present in injection');
     ok(b.includes('still rattled'), 'volatile state persists into the injection');
     ok(b.includes('wrong-name slip unaddressed'), 'open thread kept alive until story resolves it');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+section('subst — $-sequence safety (regression: String.replace(token, string) corrupts $)');
+{
+    const tpl = 'A {{X}} B';
+    eq(L.subst(tpl, '{{X}}', '$$'), 'A $$ B', 'literal $$ preserved');
+    eq(L.subst(tpl, '{{X}}', '$&'), 'A $& B', 'literal $& preserved (not the matched token)');
+    eq(L.subst(tpl, '{{X}}', '$`'), 'A $` B', 'literal $backtick preserved (not the prefix)');
+    eq(L.subst(tpl, '{{X}}', "$'"), "A $' B", 'literal $prime preserved (not the suffix)');
+    eq(L.subst(tpl, '{{X}}', 'they paid $500, maybe $$'), 'A they paid $500, maybe $$ B', 'money/prose with $ preserved intact');
+    eq(L.subst(tpl, '{{X}}', null), 'A  B', 'null value -> empty, no throw');
+    eq(L.subst(tpl, '{{X}}', 42), 'A 42 B', 'non-string value coerced to string');
+    eq(L.subst(null, '{{X}}', 'z'), '', 'null template -> empty string');
+    // Sanity: prove the OLD plain-string path WAS broken, so a regression back to it fails here.
+    ok('A {{X}} B'.replace('{{X}}', '$$') !== 'A $$ B', 'sanity: plain String.replace DID corrupt $$ (the bug this fixes)');
+    ok('A {{X}} B'.replace('{{X}}', '$`') !== 'A $` B', 'sanity: plain String.replace DID corrupt $backtick');
 }
 
 // ─────────────────────────────────────────────────────────────────────

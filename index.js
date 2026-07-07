@@ -784,6 +784,7 @@ function getAssistantTurns(chat) {
     const turns = [];
     for (let i = 0; i < chat.length; i++) {
         const m = chat[i];
+        if (!m) continue;
         const isOurGhost = m.extra?.sc_ghosted === true;
         const isAssistant = !m.is_user && (!m.is_system || isOurGhost);
         if (isAssistant && m.mes && m.mes.trim().length > 0) {
@@ -797,6 +798,7 @@ function getVisibleAssistantTurns(chat) {
     const turns = [];
     for (let i = 0; i < chat.length; i++) {
         const m = chat[i];
+        if (!m) continue;
         if (!m.is_user && !m.is_system && !m.extra?.sc_ghosted && m.mes && m.mes.trim().length > 0) {
             turns.push({ index: i, mes: m.mes, name: m.name || 'Assistant' });
         }
@@ -982,6 +984,16 @@ function abortSummarization() {
 
 // ─── Core: LLM Summarization with Retry ──────────────────────────────
 
+// Literal template substitution. A plain String.replace(token, value) treats
+// $-sequences in `value` ($&, $`, $', $$) as replacement patterns, so a notepad,
+// summary, or story passage containing "$$" or "$'" would be silently corrupted
+// (and $` / $' would splice the rest of the prompt into it). A function replacer
+// inserts the value verbatim. Use for EVERY {{token}} whose value is user- or
+// model-supplied. Replaces the FIRST match, matching prior String.replace semantics.
+function subst(tpl, token, value) {
+    return String(tpl == null ? '' : tpl).replace(token, () => (value == null ? '' : String(value)));
+}
+
 async function callSummarizer(storyTxt, contextStr, opts = {}) {
     trace('>>> ENTERING callSummarizer');
     trace('  storyTxt length:', storyTxt?.length ?? 'UNDEFINED');
@@ -995,12 +1007,12 @@ async function callSummarizer(storyTxt, contextStr, opts = {}) {
 
     const sysPrompt = opts.systemPrompt || s.summarizerSystemPrompt;
     const userTpl = opts.userPrompt || s.summarizerUserPrompt;
-    let prompt = userTpl
-        .replace('{{player_name}}', getPlayerName())
-        .replace('{{context_str}}', contextStr || '(none yet)')
-        .replace('{{story_txt}}', storyTxt);
-    if (userTpl.includes('{{snippet}}')) prompt = prompt.replace('{{snippet}}', opts.snippet || '(none)');
-    if (userTpl.includes('{{ledger}}')) prompt = prompt.replace('{{ledger}}', () => opts.ledger || '(none yet)');
+    let prompt = userTpl;
+    prompt = subst(prompt, '{{player_name}}', getPlayerName());
+    prompt = subst(prompt, '{{context_str}}', contextStr || '(none yet)');
+    prompt = subst(prompt, '{{story_txt}}', storyTxt);
+    if (userTpl.includes('{{snippet}}')) prompt = subst(prompt, '{{snippet}}', opts.snippet || '(none)');
+    if (userTpl.includes('{{ledger}}')) prompt = subst(prompt, '{{ledger}}', opts.ledger || '(none yet)');
 
     log('── Summarizer Call ──');
     log('Context str length:', contextStr.length, 'chars');
@@ -2282,7 +2294,7 @@ function buildCharacterBlock() {
     if (blocks.length === 0) return '';
 
     const tpl = s.ledgerInjectTemplate || '\n\n<characters>\n{{characters}}\n</characters>\n';
-    return tpl.replace('{{characters}}', () => blocks.join('\n'));
+    return subst(tpl, '{{characters}}', blocks.join('\n'));
 }
 
 // ─── Core: Assemble Full Summary Block ──────────────────────────────
@@ -2295,7 +2307,7 @@ function assembleSummaryBlock() {
     let notesPart = '';
     if (s.injectNotepad !== false && store.notepad && store.notepad.trim().length > 0) {
         const tpl = s.notepadTemplate || '\n\n<notes>\n{{notes}}\n</notes>\n';
-        notesPart = tpl.replace('{{notes}}', store.notepad.trim());
+        notesPart = subst(tpl, '{{notes}}', store.notepad.trim());
     }
 
     // ── Auto-generated layered summary ──
@@ -2311,7 +2323,7 @@ function assembleSummaryBlock() {
             for (const sn of store.layers[0]) snippets.push(sn.text);
         }
         if (snippets.length > 0) {
-            summaryPart = s.injectionTemplate.replace('{{summary}}', snippets.join(' '));
+            summaryPart = subst(s.injectionTemplate, '{{summary}}', snippets.join(' '));
         }
     }
 
@@ -2324,7 +2336,7 @@ function assembleSummaryBlock() {
             .map(sn => '- ' + sn.detail.trim());
         if (notes.length > 0) {
             const tpl = s.sisterInjectTemplate || '\n\n<details>\n{{details}}\n</details>\n';
-            detailPart = tpl.replace('{{details}}', notes.join('\n'));
+            detailPart = subst(tpl, '{{details}}', notes.join('\n'));
         }
     }
 
@@ -3245,10 +3257,10 @@ async function runContinuityEditorReview() {
     $('#sc_editor_cancel').show();
     try {
         const memStr = JSON.stringify(dump, null, 1);
-        const userTpl = (s.editorUserPrompt || '')
-            .replace('{{command}}', command)
-            .replace('{{memory}}', memStr)
-            .replace('{{player_name}}', getPlayerName());
+        let userTpl = (s.editorUserPrompt || '');
+        userTpl = subst(userTpl, '{{command}}', command);
+        userTpl = subst(userTpl, '{{memory}}', memStr);
+        userTpl = subst(userTpl, '{{player_name}}', getPlayerName());
         toastr.info('Co-Writer is reviewing your full memory…', 'Summaryception', { timeOut: 4000, progressBar: true });
         const raw = await callSummarizer('(continuity edit)', '', {
             systemPrompt: s.editorSystemPrompt,
@@ -4555,7 +4567,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             migratePrompts();
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.16.1 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched.');
+            console.log(LOG_PREFIX, 'Summaryception v5.16.2 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
