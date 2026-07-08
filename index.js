@@ -916,7 +916,7 @@ async function repairIfBranched() {
     const _rewound = await tryAutoRewindLedger(chatLength - 1, 'branch');
     if (_rewound) {
         toastr.info(
-            `Branch repaired — summary rewound to turn ${store.summarizedUpTo}, ${unghosted} recent turn(s) back to verbatim, and the character ledger auto-rewound from a checkpoint.`,
+            `Branch repaired — summary rewound to turn ${store.summarizedUpTo}, ${unghosted} recent turn(s) back to verbatim. Snippets and audit notes past the branch were dropped; the character ledger is being brought back in line automatically.`,
             'Summaryception — Branch Repair',
             { timeOut: 7000 }
         );
@@ -1688,7 +1688,15 @@ async function tryAutoRewindLedger(targetTurn, label) {
         if (s.ledgerAutoRewind === false) return false;
         if (typeof targetTurn !== 'number' || targetTurn < 0) return false;
         const ckpt = _pickCheckpoint(listLedgerCheckpoints(), targetTurn);
-        if (!ckpt) return false;
+        if (!ckpt) {
+            // No snapshot that far back — but stay autonomous. If there's a ledger worth
+            // fixing, rebuild it from THIS branch's history automatically (clean slate,
+            // then re-derive). If the ledger is empty, nothing needs doing.
+            const cur = getChatStore();
+            const hasLedger = cur.ledger && typeof cur.ledger === 'object' && Object.keys(cur.ledger).length > 0;
+            if (hasLedger) backfillLedgerFromHistory({ auto: true }).catch(() => {});
+            return true;
+        }
         const store = getChatStore();
         const epoch = _chatEpoch;
         _ledgerQueue = [];   // drop pending background jobs — we're rewriting the ledger
@@ -1788,17 +1796,18 @@ function _computeBackfillBatches(assistantTurns, perBatch) {
     return batches;
 }
 
-async function backfillLedgerFromHistory() {
+async function backfillLedgerFromHistory(opts) {
+    const auto = !!(opts && opts.auto);   // autonomous rebuild (branch/trim fallback): no confirm, clean-slate first
     const s = getSettings();
-    if (!s.ledgerEnabled) { toastr.warning('Enable the Character Ledger first.', 'Summaryception'); return; }
-    if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
-    if (_ledgerActive || _auditActive) { toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
+    if (!s.ledgerEnabled) { if (!auto) toastr.warning('Enable the Character Ledger first.', 'Summaryception'); return; }
+    if (isSummarizing) { if (!auto) toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
+    if (_ledgerActive || _auditActive) { if (!auto) toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
     const { chat } = SillyTavern.getContext();
     const turns = getAssistantTurns(chat);
     if (turns.length === 0) { toastr.info('No story turns to build the ledger from yet.', 'Summaryception', { timeOut: 4000 }); return; }
     const batches = _computeBackfillBatches(turns, s.turnsPerSummary);
     if (batches.length === 0) { toastr.info('Nothing to process.', 'Summaryception'); return; }
-    if (!confirm(
+    if (!auto && !confirm(
         `Build the Character Ledger from the whole story?\n\n` +
         `Replays ${turns.length} turns in ${batches.length} passes (~${batches.length} background LLM calls) to populate/refresh the ledger. ` +
         `It MERGES into the current ledger — use "Clear Ledger" first if you want a clean rebuild. You can stop anytime; progress is kept.`
@@ -1806,12 +1815,13 @@ async function backfillLedgerFromHistory() {
 
     const store = getChatStore();
     if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
+    if (auto) { store.ledger = {}; store.ledgerLiveIdx = -1; }   // clean slate before re-deriving from this branch
     _ledgerQueue = [];   // we drive the scribe directly here; drop pending background jobs
     const startEpoch = _chatEpoch;   // if the user switches chats mid-run, abandon — never write another chat's ledger
 
     let done = 0, failed = 0, cancelled = false, consec = 0;
     const contextStr = buildFullContext(0);   // whole-story gist as grounding (stable during backfill)
-    const toast = toastr.info(`Building ledger: 0 / ${batches.length} passes`, 'Summaryception Ledger', {
+    const toast = toastr.info(`${auto ? 'Auto-rebuilding' : 'Building'} ledger: 0 / ${batches.length} passes`, 'Summaryception Ledger', {
         timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, closeButton: true,
         onCloseClick: () => { cancelled = true; abortSummarization(); },
     });
@@ -5061,7 +5071,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             migratePrompts();
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.23.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger can auto-rewind from a checkpoint on branch/trim instead of a full rebuild.');
+            console.log(LOG_PREFIX, 'Summaryception v5.24.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
