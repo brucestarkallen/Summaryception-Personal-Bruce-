@@ -409,6 +409,21 @@ section('Continuity — normalizeContinuityOutput');
 }
 
 // ─────────────────────────────────────────────────────────────────────
+section('Continuity — where classification (snippet vs source)');
+{
+    const w = L.normalizeContinuityOutput('[{"issue":"i1","fix":"f1","kind":"drift"},{"issue":"i2","fix":"f2","kind":"continuity","where":"source"},{"issue":"i3","fix":"f3","kind":"continuity"},{"issue":"i4","fix":"f4","kind":"continuity","where":"snippet"}]');
+    eq(w.length, 4, 'four parsed');
+    eq(w[0].where, 'snippet', 'drift defaults to where=snippet (always snippet-level)');
+    eq(w[1].where, 'source', 'explicit where=source preserved');
+    eq(w[2].where, 'source', 'continuity w/o where defaults to source (conservative — no snippet auto-edit)');
+    eq(w[3].where, 'snippet', 'explicit where=snippet preserved for a continuity flag');
+    // merge carries where onto the stored flag
+    const store = { continuityFlags: [], continuityDismissed: [] };
+    L.mergeContinuityFlags(store, [3, 5], [{ issue: 'X', fix: 'x', kind: 'continuity', where: 'source' }]);
+    eq(store.continuityFlags[0].where, 'source', 'stored flag keeps where');
+}
+
+// ─────────────────────────────────────────────────────────────────────
 section('Continuity — _continuitySig + mergeContinuityFlags');
 {
     eq(L._continuitySig({ issue: 'Alexia On  TRAIN', kind: 'continuity' }),

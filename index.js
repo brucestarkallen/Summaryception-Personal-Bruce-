@@ -64,9 +64,9 @@ const defaultSettings = Object.freeze({
     continuityNudge: false,        // global "nudge the story" toggle: inject unresolved fixes as OOC corrections so the Storyteller self-corrects
     continuityNudgeMax: 6,         // cap how many unresolved fixes are injected at once
     continuitySystemPrompt:
-        `Role: continuity auditor for an ongoing collaborative fiction. You receive the exact recent PASSAGE, the compact SNIPPET written from it, and the established RECORD (character ledger, notepad, earlier summaries). Your ONLY job is to catch genuine continuity problems of two kinds: (1) DRIFT — the SNIPPET distorts, misattributes, or drops something materially important from the PASSAGE; (2) CONTINUITY — the PASSAGE or SNIPPET contradicts the established RECORD: a character in the wrong place, someone knowing or referencing something they never witnessed, a broken timeline or sequence, an inconsistent relationship or stat, or a confused/renamed entity. Report ONLY real contradictions or material distortions — never style, pacing, speculation, or trivial omissions, and never processing directives. Do NOT invent facts; base every finding strictly on the given text. If everything is consistent, output exactly: NONE. Otherwise output ONLY a compact JSON array, each element {"issue":"<one concise sentence naming what contradicts what>","fix":"<one concise sentence stating the correction>","kind":"drift"|"continuity"}. No preamble, no markdown, no commentary.`,
+        `Role: continuity auditor for an ongoing collaborative fiction. You receive the exact recent PASSAGE, the compact SNIPPET written from it, and the established RECORD (character ledger, notepad, earlier summaries). Your ONLY job is to catch genuine continuity problems of two kinds: (1) DRIFT — the SNIPPET distorts, misattributes, or drops something materially important from the PASSAGE; (2) CONTINUITY — the PASSAGE or SNIPPET contradicts the established RECORD: a character in the wrong place, someone knowing or referencing something they never witnessed, a broken timeline or sequence, an inconsistent relationship or stat, or a confused/renamed entity. Report ONLY real contradictions or material distortions — never style, pacing, speculation, or trivial omissions, and never processing directives. Do NOT invent facts; base every finding strictly on the given text. If everything is consistent, output exactly: NONE. Otherwise output ONLY a compact JSON array, each element {"issue":"<what contradicts what>","fix":"<the correction>","kind":"drift"|"continuity","where":"snippet"|"source"}. Set "where":"snippet" when the SNIPPET is the wrong one (it misrepresents a correct SOURCE, or states something the SOURCE does not) — fixable by rewriting the snippet to match the source. Set "where":"source" when the SOURCE passage itself is wrong (it contradicts the RECORD and the snippet only faithfully repeats it) — that needs a message edit; a snippet rewrite would just make the snippet disagree with its source. No preamble, no markdown, no commentary.`,
     continuityUserPrompt:
-        `<player_name>{{player_name}}</player_name>\n<record>{{context_str}}</record>\n<passage>{{story_txt}}</passage>\n<snippet>{{snippet}}</snippet>\n\n<snippet> is the compact memory line recorded for <passage>. <record> is what the story has already established elsewhere.\n\nCheck for exactly two things:\n1) DRIFT — does <snippet> distort, misattribute, or omit something materially important that IS in <passage>?\n2) CONTINUITY — does anything in <passage> or <snippet> CONTRADICT <record> — wrong location/presence, knowledge a character could not have, broken timeline, inconsistent relationship/stat, confused identity?\n\nFlag ONLY genuine problems, grounded in the text. Ignore style, pacing, and trivial detail. Do not invent.\n\nIf all consistent, output exactly:\nNONE\n\nOtherwise output ONLY a JSON array, e.g.:\n[{"issue":"Snippet says Alexia boarded the train, but the record places her at the academy","fix":"Alexia is at the academy, not on the train","kind":"continuity"}]`,
+        `<player_name>{{player_name}}</player_name>\n<record>{{context_str}}</record>\n<passage>{{story_txt}}</passage>\n<snippet>{{snippet}}</snippet>\n\n<snippet> is the compact memory line recorded for <passage>. <record> is what the story has already established elsewhere.\n\nCheck for exactly two things:\n1) DRIFT — does <snippet> distort, misattribute, or omit something materially important that IS in <passage>?\n2) CONTINUITY — does anything in <passage> or <snippet> CONTRADICT <record> — wrong location/presence, knowledge a character could not have, broken timeline, inconsistent relationship/stat, confused identity?\n\nFlag ONLY genuine problems, grounded in the text. Ignore style, pacing, and trivial detail. Do not invent.\n\nFor each problem set "where": "snippet" if the SNIPPET is the wrong one (it misrepresents a correct <passage> — fixable by rewriting the snippet), or "source" if <passage> itself is wrong (it contradicts <record> and the snippet only repeats it — needs a message edit, not a snippet rewrite).\n\nIf all consistent, output exactly:\nNONE\n\nOtherwise output ONLY a JSON array, e.g.:\n[{"issue":"Snippet says Alexia boarded the train, but the passage says she stayed at the academy","fix":"Alexia stayed at the academy; she did not board the train","kind":"drift","where":"snippet"},{"issue":"The passage itself puts Alexia on the train, but the record establishes she is at the academy and never left","fix":"Alexia is at the academy, not on the train","kind":"continuity","where":"source"}]`,
     continuityAutoFix: false,       // when on, apply snippet-level fixes automatically (oldest -> newest) as issues are found, instead of leaving them as flags to review
     continuityFixSystemPrompt:
         `Role: you correct a single memory-snippet to remove a continuity error. You get the current SNIPPET and a CORRECTION (the established truth). Rewrite the snippet so it is fully consistent with the correction, changing ONLY what the correction requires and preserving everything else — length, tone, and all other facts. Do not add commentary or new events. Output ONLY the corrected snippet text — no preamble, no quotes, no labels. If the snippet already matches the correction, output it unchanged.`,
@@ -1353,7 +1353,9 @@ function normalizeContinuityOutput(raw) {
         if (!issue && !fix) continue;
         let kind = String(it.kind == null ? '' : it.kind).trim().toLowerCase();
         if (kind !== 'drift' && kind !== 'continuity') kind = 'continuity';
-        out.push({ issue: issue || fix, fix: fix || issue, kind });
+        let where = String(it.where == null ? '' : it.where).trim().toLowerCase();
+        if (where !== 'snippet' && where !== 'source') where = (kind === 'drift') ? 'snippet' : 'source';   // drift is always snippet-level; otherwise assume source (conservative — no snippet auto-edit)
+        out.push({ issue: issue || fix, fix: fix || issue, kind, where });
     }
     return out;
 }
@@ -1382,7 +1384,7 @@ function mergeContinuityFlags(store, turnRange, newFlags) {
         store.continuityFlags.push({
             id: 'cf_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7),
             turnRange: Array.isArray(turnRange) ? [turnRange[0], turnRange[1]] : null,
-            issue: nf.issue, fix: nf.fix, kind: nf.kind,
+            issue: nf.issue, fix: nf.fix, kind: nf.kind, where: nf.where || 'source',
             createdAt: Date.now(), status: 'open',
         });
         openSigs.add(sig);
@@ -2144,7 +2146,7 @@ async function processContinuityQueue() {
                         log(`Continuity (background): ${added} flag(s) added.`);
                         if (getSettings().continuityAutoFix) {
                             const tr = job.snip.turnRange;
-                            const mine = (getChatStore().continuityFlags || []).filter(f => f && f.status === 'open' && Array.isArray(f.turnRange) && tr && f.turnRange[0] === tr[0] && f.turnRange[1] === tr[1]);
+                            const mine = (getChatStore().continuityFlags || []).filter(f => f && f.status === 'open' && f.where === 'snippet' && Array.isArray(f.turnRange) && tr && f.turnRange[0] === tr[0] && f.turnRange[1] === tr[1]);
                             let fixed = 0;
                             for (const f of mine) { try { if (await applyContinuityFix(f.id)) fixed++; } catch (_) {} }
                             if (fixed > 0) toastr.info(`Continuity: auto-fixed ${fixed} issue${fixed === 1 ? '' : 's'} in a snippet.`, 'Summaryception', { timeOut: 4000 });
@@ -2204,7 +2206,7 @@ async function backfillContinuityForLayer0() {
                 if (_chatEpoch !== startEpoch) break;
                 if (typeof sn.text === 'string') { const rc = reconcileSnippetFlags(store, sn.turnRange, flags); flagged += rc.added; cleared += rc.cleared; }
                 if (getSettings().continuityAutoFix && sn.turnRange) {
-                    const mine = (store.continuityFlags || []).filter(f => f && f.status === 'open' && Array.isArray(f.turnRange) && f.turnRange[0] === sn.turnRange[0] && f.turnRange[1] === sn.turnRange[1]);
+                    const mine = (store.continuityFlags || []).filter(f => f && f.status === 'open' && f.where === 'snippet' && Array.isArray(f.turnRange) && f.turnRange[0] === sn.turnRange[0] && f.turnRange[1] === sn.turnRange[1]);
                     for (const f of mine) { try { await applyContinuityFix(f.id); } catch (_) {} }
                 }
                 consec = 0;
@@ -2298,6 +2300,13 @@ async function applyContinuityFix(id) {
     const list = store.continuityFlags || [];
     const flag = (id && typeof id === 'object') ? id : list.find(f => f && f.id === id);
     if (!flag || !flag.fix) return false;
+    if (flag.where && flag.where !== 'snippet') {
+        // Source-level: the message itself is wrong. Rewriting the snippet would make it
+        // disagree with its source and cause a perpetual drift flag — leave it for the
+        // copilot to fix at the message level.
+        log(`Continuity: flag ${flag.id} is source-level — left for the copilot (message edit), snippet untouched.`);
+        return false;
+    }
     const found = _findSnippetByTurnRange(store, flag.turnRange);
     if (!found || !found.snippet) { await resolveContinuityFlag(flag.id); return false; }   // snippet gone — just clear the flag
     const sn = found.snippet;
@@ -2321,9 +2330,11 @@ async function applyContinuityFix(id) {
 // snippets that follow it are touched (no cascading errors).
 async function applyAllContinuityFixes() {
     const store = getChatStore();
-    const open = (store.continuityFlags || []).filter(f => f && f.status === 'open' && f.fix).slice();
+    const allOpen = (store.continuityFlags || []).filter(f => f && f.status === 'open' && f.fix);
+    const open = allOpen.filter(f => f.where === 'snippet').slice();
+    const sourceCount = allOpen.length - open.length;
     open.sort((a, b) => ((a.turnRange && a.turnRange[0]) || 0) - ((b.turnRange && b.turnRange[0]) || 0));
-    if (open.length === 0) { toastr.info('No open continuity fixes to apply.', 'Summaryception', { timeOut: 3000 }); return; }
+    if (open.length === 0) { toastr.info(`No snippet-level fixes to apply${sourceCount ? ` — ${sourceCount} source-level flag(s) need the copilot (message edits).` : '.'}`, 'Summaryception', { timeOut: 4500 }); return; }
     if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
     const startEpoch = _chatEpoch;
     let done = 0, applied = 0, cancelled = false;
@@ -2343,7 +2354,7 @@ async function applyAllContinuityFixes() {
     toastr.clear(toast);
     if (_chatEpoch === startEpoch) {
         updateInjection(true);
-        toastr.success(`Applied ${applied} continuity fix${applied === 1 ? '' : 'es'} (oldest → newest).`, 'Summaryception', { timeOut: 5000 });
+        toastr.success(`Applied ${applied} snippet-level fix${applied === 1 ? '' : 'es'} (oldest → newest)${sourceCount ? `; ${sourceCount} source-level flag(s) left for the copilot.` : '.'}`, 'Summaryception', { timeOut: 5500 });
     } else {
         toastr.warning('Chat changed — stopped applying fixes; progress kept.', 'Summaryception', { timeOut: 5000 });
     }
@@ -5502,7 +5513,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             migratePrompts();
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.27.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot.');
+            console.log(LOG_PREFIX, 'Summaryception v5.28.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot. Flags now record where the error lives (snippet vs source); auto-fix only rewrites snippet-level ones (aligning the snippet to its source, so no drift loop), leaving source-level errors for the copilot to fix at the message.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
