@@ -28,7 +28,7 @@ function extractTopLevel(name) {
 
 const names = ['_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
-    'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent'];
+    'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -46,7 +46,7 @@ return {
   __setChat:     (v)=>{ __chat = v; },
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
-  subst, _storeHasContent,
+  subst, _storeHasContent, _computeLiveLedgerRange,
 };
 `;
 const L = new Function(sandbox)();
@@ -219,7 +219,7 @@ section('serializeLedgerForScribe — ordering, budget, empty');
 // ─────────────────────────────────────────────────────────────────────
 section('buildCharacterBlock — active-cast detection & caps (end-to-end injection)');
 {
-    L.__setSettings(Object.assign({}, defaultSettings));
+    L.__setSettings(Object.assign({}, defaultSettings, { ledgerInjectRoster: false }));
     setStore({
         'Stella Vermillion': { core: 'fiery; proud', state: 'annoyed', threads: ['rivalry with MC'], updatedAt: 30 },
         'Alexia Valois': { core: 'analytical; cool', state: 'curious', updatedAt: 20 },
@@ -239,7 +239,7 @@ section('buildCharacterBlock — active-cast detection & caps (end-to-end inject
     ok(block.includes('rivalry with MC'), 'threads rendered in injection');
 
     // maxActive cap
-    const s2 = Object.assign({}, defaultSettings, { ledgerMaxActive: 1 });
+    const s2 = Object.assign({}, defaultSettings, { ledgerMaxActive: 1, ledgerInjectRoster: false });
     L.__setSettings(s2);
     const capped = L.buildCharacterBlock();
     const hasStella = capped.includes('Stella'), hasAlexia = capped.includes('Alexia');
@@ -249,10 +249,22 @@ section('buildCharacterBlock — active-cast detection & caps (end-to-end inject
     L.__setSettings(Object.assign({}, defaultSettings, { ledgerEnabled: false }));
     eq(L.buildCharacterBlock(), '', 'ledgerEnabled=false → empty block');
 
-    // no active cast → empty
+    // a ledger character OFF-screen → roster keeps them present (identity only)
     L.__setSettings(Object.assign({}, defaultSettings));
+    setStore({ 'Stella': { core: 'proud knight; blunt but loyal', state: 'anxious and pacing', updatedAt: 3 } });
     L.__setChat([{ mes: 'nobody named here at all' }]);
-    eq(L.buildCharacterBlock(), '', 'no on-screen ledger character → empty block');
+    {
+        const b = L.buildCharacterBlock();
+        ok(b.includes('Stella'), 'off-screen ledger character still injected via roster');
+        ok(b.includes('Others in this story'), 'roster header present for off-screen cast');
+        ok(!b.includes('anxious'), 'roster is identity-only — off-screen volatile state NOT injected');
+    }
+
+    // roster OFF + no active cast → empty
+    L.__setSettings(Object.assign({}, defaultSettings, { ledgerInjectRoster: false }));
+    setStore({ 'Stella': { core: 'x', updatedAt: 1 } });
+    L.__setChat([{ mes: 'nobody named here at all' }]);
+    eq(L.buildCharacterBlock(), '', 'roster off + no on-screen character → empty block');
 
     // empty ledger → empty
     setStore({});
@@ -278,6 +290,42 @@ section('buildCharacterBlock — the tsundere scenario (regression for the repor
     ok(b.includes('NEVER raises her voice'), 'behavioral anchor (no-outburst core) present in injection');
     ok(b.includes('still rattled'), 'volatile state persists into the injection');
     ok(b.includes('wrong-name slip unaddressed'), 'open thread kept alive until story resolves it');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+section('_computeLiveLedgerRange — live-pass window');
+{
+    eq(L._computeLiveLedgerRange(-1, -1, 5), [0, 5], 'fresh: cover turns 0..latest');
+    eq(L._computeLiveLedgerRange(-1, 5, 5), null, 'caught up: nothing new');
+    eq(L._computeLiveLedgerRange(-1, 3, 6), [4, 6], 'advance: only new turns since pointer');
+    eq(L._computeLiveLedgerRange(10, 3, 15), [11, 15], 'skips summarized turns (start = summarizedUpTo+1)');
+    eq(L._computeLiveLedgerRange(10, 12, 15), [13, 15], 'pointer ahead of summarized: continue from pointer');
+    eq(L._computeLiveLedgerRange(2, 99, 5), [3, 5], 'stale-high pointer (post-deletion) resyncs to summarized+1');
+    eq(L._computeLiveLedgerRange(2, 99, 1), null, 'stale-high pointer, chat shorter than summarized: nothing');
+    eq(L._computeLiveLedgerRange(-1, -1, -1), null, 'no turns yet');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+section('buildCharacterBlock — roster (off-screen cast never vanishes)');
+{
+    L.__setSettings(Object.assign({}, defaultSettings));
+    setStore({
+        'Mira': { core: 'guarded tsundere; clipped sarcasm', state: 'flustered', updatedAt: 30 },
+        'Professor Halden': { core: 'stern academy mentor; speaks in measured warnings', state: 'absent from the room', updatedAt: 5 },
+        'Kai': { core: 'reckless rival; goads everyone', state: 'went home early', updatedAt: 8 },
+    });
+    L.__setChat([{ mes: 'Mira glared across the courtyard.' }]);
+    const b = L.buildCharacterBlock();
+    ok(b.includes('flustered'), 'on-screen character gets a FULL card (volatile state present)');
+    ok(b.includes('Professor Halden'), 'off-screen professor kept alive in the roster');
+    ok(b.includes('Kai'), 'off-screen rival kept alive in the roster');
+    ok(!b.includes('absent from the room') && !b.includes('went home early'), 'roster entries are identity-only, not volatile state');
+    ok(b.indexOf('Mira') < b.indexOf('Others in this story'), 'active full cards come before the roster');
+    // roster respects the cap
+    L.__setSettings(Object.assign({}, defaultSettings, { ledgerRosterMax: 1 }));
+    const b2 = L.buildCharacterBlock();
+    const inRoster = (b2.match(/;/g) || []).length;
+    ok(b2.includes('Others in this story'), 'roster still present at cap=1');
 }
 
 // ─────────────────────────────────────────────────────────────────────

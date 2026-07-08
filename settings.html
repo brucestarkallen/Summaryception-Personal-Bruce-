@@ -524,6 +524,44 @@
                     </div>
 
                     <div class="sc-row">
+                        <label class="checkbox_label" for="sc_ledger_live">
+                            <input type="checkbox" id="sc_ledger_live" />
+                            <span>Live update (track the current scene)</span>
+                        </label>
+                        <small class="sc-hint">Update the ledger over the recent, <strong>not-yet-summarized</strong> turns every turn, so <em>Now</em>, arcs, and threads reflect the current scene instead of lagging behind the summary. Costs extra background calls; leave on for tight continuity.</small>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_ledger_live_every">
+                            <span>Live update every N turns</span>
+                            <small class="sc-hint">1 = every turn (freshest). Raise it to update less often for fewer calls.</small>
+                        </label>
+                        <div class="sc-slider-row">
+                            <input type="range" id="sc_ledger_live_every" min="1" max="10" step="1" />
+                            <span id="sc_ledger_live_every_val" class="sc-val">1</span>
+                        </div>
+                    </div>
+
+                    <div class="sc-row">
+                        <label class="checkbox_label" for="sc_ledger_roster">
+                            <input type="checkbox" id="sc_ledger_roster" />
+                            <span>Inject full-cast roster</span>
+                        </label>
+                        <small class="sc-hint">Also inject a compact one-line-per-character roster of <em>everyone</em> off-screen right now, so characters from long ago are never forgotten and return consistently. On-screen characters still get their full card.</small>
+                    </div>
+
+                    <div class="sc-row">
+                        <label for="sc_ledger_roster_max">
+                            <span>Roster size cap</span>
+                            <small class="sc-hint">Max off-screen characters listed in the roster (most-recently-updated first). 0 disables the roster.</small>
+                        </label>
+                        <div class="sc-slider-row">
+                            <input type="range" id="sc_ledger_roster_max" min="0" max="80" step="5" />
+                            <span id="sc_ledger_roster_max_val" class="sc-val">40</span>
+                        </div>
+                    </div>
+
+                    <div class="sc-row">
                         <label for="sc_ledger_system_prompt">
                             <span>Ledger System Prompt</span>
                             <small class="sc-hint">The scribe's role: a psychologist/continuity editor that tracks the four fields, evolves state, keeps open threads alive until resolved, and never invents. Must instruct JSON-array output.</small>

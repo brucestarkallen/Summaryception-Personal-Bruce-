@@ -84,6 +84,10 @@ const defaultSettings = Object.freeze({
     ledgerMaxActive: 6,            // max characters injected at once
     ledgerMaxCharsPerChar: 1000,   // per-character injection cap (chars) — sized for a dense CURRENT card (behavioral anchor + whereabouts + compressed arc), not for saving tokens. The cap's real job is bounding accumulation so stale/redundant detail can't pile into noise that drifts the model; keep cards dense and current, not merely small.
     ledgerContextMaxChars: 6000,   // ledger context budget handed to the scribe
+    ledgerLiveUpdate: true,        // update the ledger over the recent (not-yet-summarized) window every turn, not only when a batch is summarized — keeps "Now"/arcs/threads tracking the current scene instead of lagging ~verbatimTurns behind
+    ledgerLiveEveryTurns: 1,       // run the live pass every N assistant turns (1 = every turn = freshest)
+    ledgerInjectRoster: true,      // also inject a compact one-line-per-character roster of EVERYONE off-screen, so long-absent characters are never forgotten and return consistently
+    ledgerRosterMax: 40,           // cap on roster entries (most-recently-updated first)
     ledgerInjectTemplate: '\n\n<characters>\nWho these people are and where they stand right now — keep them consistent and in character; do not contradict:\n{{characters}}\n</characters>\n',
     ledgerSystemPrompt:
         `You are the character-continuity mind for an ongoing work of collaborative fiction — part novelist, part psychologist. You maintain a living ledger of the people in the story so a separate storyteller AI, often working many turns later from compressed memory, can keep every character the SAME PERSON — consistent in voice, values, and behavior — while letting them change the way real people do: gradually, believably, and only for reasons the story earned. The failures you exist to prevent are (1) a character acting out of nowhere against who they are (a guarded cynic suddenly gushing; a gentle soul suddenly cruel), and (2) a real, felt emotion vanishing the instant the scene is compressed.
@@ -1487,6 +1491,64 @@ function mergeLedgerDeltas(deltas) {
 // The scribe runs in the background (sequentially, one at a time) so the
 // summarize→ghost cycle finishes at full speed. If we switch chats before the
 // scribe lands, the result is discarded via the epoch guard. Never awaited.
+// ─── Live ledger pass (decoupled from summarization) ─────────────────
+// The per-batch ledger update only sees turns as they get SUMMARIZED, so the most
+// recent ~verbatimTurns of character development never reach the ledger and "Now"
+// lags the current scene. The live pass closes that gap: every N turns it runs the
+// scribe over the recent, not-yet-summarized window so states, arcs, and threads
+// track the present. It hands off cleanly to the summarization pass — it only
+// covers turns AFTER summarizedUpTo and advances a persisted pointer (ledgerLiveIdx)
+// so no turn is reprocessed. Same queue, same guards; failures are non-fatal.
+let _turnsSinceLive = 0;
+
+// Pure: which [start,end] turn range the live pass should cover, or null if nothing
+// new. Skips already-summarized turns; resyncs if the pointer is stale-high (e.g.
+// after a deletion left it past the chat end).
+function _computeLiveLedgerRange(summarizedUpTo, ledgerLiveIdx, latestIdx) {
+    if (typeof latestIdx !== 'number' || latestIdx < 0) return null;
+    const su = (typeof summarizedUpTo === 'number') ? summarizedUpTo : -1;
+    let li = (typeof ledgerLiveIdx === 'number') ? ledgerLiveIdx : -1;
+    if (li > latestIdx) li = su;   // pointer past chat end (deletion/branch) — resync to summarized
+    const start = Math.max(su + 1, li + 1);
+    if (start > latestIdx) return null;
+    return [start, latestIdx];
+}
+
+// Queue a live scribe pass over the recent window. Returns true iff a job was
+// pushed. Skips when a batch/backfill is running or the queue is non-empty, so live
+// jobs never pile up or fight the summarization pass — the next turn retries.
+function queueLiveLedgerUpdate() {
+    try {
+        const s = getSettings();
+        if (!s.ledgerEnabled || s.ledgerLiveUpdate === false) return false;
+        if (isSummarizing || _ledgerActive || _ledgerQueue.length > 0) return false;
+        const { chat } = SillyTavern.getContext();
+        if (!Array.isArray(chat) || chat.length === 0) return false;
+        const store = getChatStore();
+        const turns = getAssistantTurns(chat);
+        if (turns.length === 0) return false;
+        const latestIdx = turns[turns.length - 1].index;
+        const range = _computeLiveLedgerRange(store.summarizedUpTo, store.ledgerLiveIdx, latestIdx);
+        if (!range) return false;
+        const storyTxt = buildPassageFromRange(chat, range[0], range[1]);
+        if (!storyTxt.trim()) return false;
+        const contextStr = buildFullContext(0);
+        _ledgerQueue.push({ storyTxt, contextStr, epoch: _chatEpoch, live: true, liveEnd: range[1] });
+        processLedgerQueue();   // fire and forget
+        return true;
+    } catch (e) { try { log('queueLiveLedgerUpdate failed (non-fatal):', e); } catch (_) {} return false; }
+}
+
+// Cadence gate: called once per assistant turn. Resets the counter only when a live
+// pass is actually queued, so a skipped (busy) turn is retried rather than dropped.
+function maybeQueueLiveLedger() {
+    const s = getSettings();
+    if (!s.ledgerEnabled || s.ledgerLiveUpdate === false) return;
+    _turnsSinceLive++;
+    if (_turnsSinceLive < Math.max(1, s.ledgerLiveEveryTurns ?? 1)) return;
+    if (queueLiveLedgerUpdate()) _turnsSinceLive = 0;
+}
+
 function queueLedgerUpdate(storyTxt, contextStr) {
     const s = getSettings();
     if (!s.ledgerEnabled) return;
@@ -1514,6 +1576,10 @@ async function processLedgerQueue() {
                 }
                 if (!deltas) { log('Ledger (background): no parseable output — skipped.'); continue; }
                 const changed = mergeLedgerDeltas(deltas);
+                if (job.live && typeof job.liveEnd === 'number') {
+                    const _st = getChatStore();
+                    if (typeof _st.ledgerLiveIdx !== 'number' || job.liveEnd > _st.ledgerLiveIdx) _st.ledgerLiveIdx = job.liveEnd;
+                }
                 if (changed > 0) {
                     await saveChatStore();
                     updateInjection();
@@ -1521,6 +1587,7 @@ async function processLedgerQueue() {
                     log(`Ledger (background): updated ${changed} character entr${changed === 1 ? 'y' : 'ies'}.`);
                 } else {
                     log('Ledger (background): no changes to apply.');
+                    if (job.live) { try { await saveChatStore(); } catch (_) {} }
                 }
             } catch (e) {
                 log('Ledger (background) failed for one batch — ledger unchanged:', e);
@@ -1614,6 +1681,7 @@ async function backfillLedgerFromHistory() {
             toastr.warning(`Stopped — you switched chats. The original chat kept its ledger progress through pass ${done}.`, 'Summaryception', { timeOut: 6000 });
         } else {
             await saveChatStore();
+            store.ledgerLiveIdx = turns.length ? turns[turns.length - 1].index : (typeof store.ledgerLiveIdx === 'number' ? store.ledgerLiveIdx : -1);
             updateInjection(true);
             try { renderLedger(); } catch (_) {}
             const nChars = Object.keys(store.ledger).length;
@@ -2407,19 +2475,46 @@ function buildCharacterBlock() {
             active.push({ name, entry, u: entry.updatedAt || 0 });
         }
     }
-    if (active.length === 0) return '';
-
     active.sort((a, b) => b.u - a.u);   // most-recently-updated first
     const maxActive = Math.max(1, s.ledgerMaxActive ?? 6);
     const capChars = Math.max(80, s.ledgerMaxCharsPerChar ?? 600);
-    const blocks = active
-        .slice(0, maxActive)
+    const shown = active.slice(0, maxActive);
+    const blocks = shown
         .map(({ name, entry }) => formatLedgerEntry(name, entry, capChars))
         .filter(Boolean);
-    if (blocks.length === 0) return '';
+
+    // Roster: one compact line per character NOT currently on screen (name + the
+    // first clause of their stable nature), so the storyteller never forgets a
+    // character exists and can bring them back consistently instead of dropping or
+    // contradicting them. Identity only — no volatile state — so it stays cheap
+    // enough to carry the whole cast. In an academy where no one should vanish, this
+    // is what keeps the long-absent professor or classmate a real, returnable person.
+    let rosterLine = '';
+    if (s.ledgerInjectRoster !== false) {
+        const shownNames = new Set(shown.map(a => a.name));
+        const rosterCap = Math.max(0, s.ledgerRosterMax ?? 40);
+        const others = names
+            .filter(n => !shownNames.has(n))
+            .map(n => ({ name: n, entry: ledger[n], u: (ledger[n] && ledger[n].updatedAt) || 0 }))
+            .filter(o => o.entry && typeof o.entry === 'object')
+            .sort((a, b) => b.u - a.u)
+            .slice(0, rosterCap);
+        const items = others.map(({ name, entry }) => {
+            let core = (typeof entry.core === 'string') ? entry.core.trim().replace(/\s+/g, ' ') : '';
+            if (core) { const cut = core.search(/[.;]\s/); if (cut > 0) core = core.slice(0, cut); }
+            if (core.length > 100) core = core.slice(0, 99).replace(/\s+\S*$/, '').trimEnd() + '…';
+            return core ? (name + ' — ' + core) : name;
+        }).filter(Boolean);
+        if (items.length > 0) rosterLine = 'Others in this story (off-screen now — keep them alive and consistent for when they return): ' + items.join('; ') + '.';
+    }
+
+    if (blocks.length === 0 && !rosterLine) return '';
+
+    let body = blocks.join('\n');
+    if (rosterLine) body += (body ? '\n\n' : '') + rosterLine;
 
     const tpl = s.ledgerInjectTemplate || '\n\n<characters>\n{{characters}}\n</characters>\n';
-    return subst(tpl, '{{characters}}', blocks.join('\n'));
+    return subst(tpl, '{{characters}}', body);
 }
 
 // ─── Core: Assemble Full Summary Block ──────────────────────────────
@@ -2604,6 +2699,7 @@ function onMessageReceived(messageIndex) {
             log('New assistant message at index', messageIndex);
             setTimeout(async () => {
                 await maybeSummarizeTurns();
+                maybeQueueLiveLedger();   // live ledger: keep recent character states current, independent of summarization cadence
                 updateInjection();
                 updateUI();
             }, 500);
@@ -2807,6 +2903,12 @@ function updateUI() {
         $('#sc_ledger_max_active').val(s.ledgerMaxActive ?? 6);
         $('#sc_ledger_max_active_val').text(s.ledgerMaxActive ?? 6);
         $('#sc_ledger_max_chars').val(s.ledgerMaxCharsPerChar ?? 600);
+        $('#sc_ledger_live').prop('checked', s.ledgerLiveUpdate !== false);
+        $('#sc_ledger_live_every').val(s.ledgerLiveEveryTurns ?? 1);
+        $('#sc_ledger_live_every_val').text(s.ledgerLiveEveryTurns ?? 1);
+        $('#sc_ledger_roster').prop('checked', s.ledgerInjectRoster !== false);
+        $('#sc_ledger_roster_max').val(s.ledgerRosterMax ?? 40);
+        $('#sc_ledger_roster_max_val').text(s.ledgerRosterMax ?? 40);
         $('#sc_ledger_max_chars_val').text(s.ledgerMaxCharsPerChar ?? 600);
         $('#sc_editor_system_prompt').val(s.editorSystemPrompt);
         $('#sc_editor_user_prompt').val(s.editorUserPrompt);
@@ -3724,6 +3826,8 @@ function bindUIEvents() {
         { id: '#sc_ledger_active_window', key: 'ledgerActiveWindow', display: '#sc_ledger_active_window_val' },
         { id: '#sc_ledger_max_active', key: 'ledgerMaxActive', display: '#sc_ledger_max_active_val' },
         { id: '#sc_ledger_max_chars', key: 'ledgerMaxCharsPerChar', display: '#sc_ledger_max_chars_val' },
+        { id: '#sc_ledger_live_every', key: 'ledgerLiveEveryTurns', display: '#sc_ledger_live_every_val' },
+        { id: '#sc_ledger_roster_max', key: 'ledgerRosterMax', display: '#sc_ledger_roster_max_val' },
     ];
 
     for (const sl of sliders) {
@@ -3803,6 +3907,15 @@ function bindUIEvents() {
     // ── Character Ledger (psychologist) ──
     $(document).on('change', '#sc_ledger_enabled', function () {
         getSettings().ledgerEnabled = $(this).prop('checked');
+        saveSettings();
+        updateInjection(true);
+    });
+    $(document).on('change', '#sc_ledger_live', function () {
+        getSettings().ledgerLiveUpdate = $(this).prop('checked');
+        saveSettings();
+    });
+    $(document).on('change', '#sc_ledger_roster', function () {
+        getSettings().ledgerInjectRoster = $(this).prop('checked');
         saveSettings();
         updateInjection(true);
     });
@@ -4696,7 +4809,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             migratePrompts();
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.17.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it.');
+            console.log(LOG_PREFIX, 'Summaryception v5.18.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster so off-screen characters are never forgotten.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
