@@ -751,57 +751,59 @@ async function ghostMessagesUpTo(endIndex) {
     const store = getChatStore();
     const s = getSettings();
 
-    const progressToast = !s.disableGhosting ? toastr.info(
-        `Hiding messages: 0 / ${endIndex + 1}`,
-        'Summaryception — Ghosting',
-        {
-            timeOut: 0,
-            extendedTimeOut: 0,
-            tapToDismiss: false,
-        }
-    ) : null;
-
-    let processed = 0;
-    for (let i = 0; i <= endIndex; i++) {
+    // First pass (in memory, cheap): mark every message WE should newly ghost and
+    // collect its index. We do NOT call /hide per message — in SillyTavern each /hide
+    // writes the whole chat file, so per-message hiding is O(messages) full-chat saves
+    // and is exactly why bulk summarizing crawled. Instead we hide CONTIGUOUS RUNS in
+    // single /hide <a>-<b> calls (ST's /hide accepts a range and saves once per call),
+    // turning it into O(runs) saves — one per batch in the common case.
+    const toHide = [];
+    const upto = Math.min(endIndex, chat.length - 1);
+    for (let i = 0; i <= upto; i++) {
         const msg = chat[i];
         if (!msg) continue;
-        if (msg.is_system && !msg.extra?.sc_ghosted) continue;
+        if (msg.is_system && !msg.extra?.sc_ghosted) continue;   // hidden by user/system, not by us
         if (!msg.extra) msg.extra = {};
-        if (msg.extra.sc_ghosted) continue;
-
-        // Check if the message is already hidden by the user (not by us)
-        if (msg.is_hidden) {
-            log(`Skipping message ${i} — already hidden by user`);
-            continue;
-        }
-
+        if (msg.extra.sc_ghosted) continue;                       // already ours
+        if (msg.is_hidden) continue;                              // already hidden by the user
         msg.extra.sc_ghosted = true;
-
-        // Track that WE ghosted this message
-        if (!store.ghostedIndices.includes(i)) {
-            store.ghostedIndices.push(i);
-        }
-
-        // Only visually hide if ghosting is enabled
-        if (!s.disableGhosting) {
-            try {
-                await SillyTavern.getContext().executeSlashCommandsWithOptions(`/hide ${i}`, { showOutput: false });
-            } catch (e) {
-                log(`Failed to hide message ${i}:`, e);
-            }
-        }
-
-        processed++;
-        if (!s.disableGhosting && progressToast && processed % 10 === 0) {
-            const pct = Math.round((i / (endIndex + 1)) * 100);
-            $(progressToast).find('.toast-message').text(
-                `Hiding messages: ${i} / ${endIndex + 1} (${pct}%)`
-            );
-        }
+        if (!store.ghostedIndices.includes(i)) store.ghostedIndices.push(i);
+        toHide.push(i);
     }
 
-    if (progressToast) toastr.clear(progressToast);
-    log(`Ghosted messages from index 0 to ${endIndex}${s.disableGhosting ? ' (hiding disabled — metadata only)' : ''}`);
+    if (toHide.length === 0) return;
+    if (s.disableGhosting) {
+        log(`Ghosted ${toHide.length} message(s) up to ${upto} — metadata only (hiding disabled).`);
+        return;
+    }
+
+    // Collapse the indices into contiguous [start,end] ranges.
+    const ranges = [];
+    let start = toHide[0], prev = toHide[0];
+    for (let k = 1; k < toHide.length; k++) {
+        if (toHide[k] === prev + 1) { prev = toHide[k]; continue; }
+        ranges.push([start, prev]); start = toHide[k]; prev = toHide[k];
+    }
+    ranges.push([start, prev]);
+
+    const progressToast = ranges.length > 3 ? toastr.info(
+        'Hiding summarized messages…', 'Summaryception — Ghosting',
+        { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false }
+    ) : null;
+    try {
+        const ctx = SillyTavern.getContext();
+        for (const [a, b] of ranges) {
+            const cmd = (a === b) ? `/hide ${a}` : `/hide ${a}-${b}`;
+            try {
+                await ctx.executeSlashCommandsWithOptions(cmd, { showOutput: false });
+            } catch (e) {
+                log(`Failed to hide range ${a}-${b}:`, e);
+            }
+        }
+    } finally {
+        if (progressToast) toastr.clear(progressToast);
+    }
+    log(`Ghosted ${toHide.length} message(s) up to ${upto} in ${ranges.length} range call(s).`);
 }
 
 // ─── Branch Detection & Repair ───────────────────────────────────────
@@ -1676,7 +1678,6 @@ async function backfillLedgerFromHistory() {
             await saveChatStore();   // per-batch: an interruption loses at most the current pass
             const pct = Math.round((done / batches.length) * 100);
             $(toast).find('.toast-message').text(`Building ledger: ${done} / ${batches.length} passes (${pct}%)${failed ? ` | ${failed} failed` : ''}\nClick ✕ to stop`);
-            await new Promise(r => setTimeout(r, 60));
         }
         toastr.clear(toast);
         if (_chatEpoch !== startEpoch) {
@@ -1783,7 +1784,6 @@ async function backfillAuditsForLayer0() {
             await saveChatStore();   // per-batch: an interruption loses at most the current snippet
             const pct = Math.round((done / targets.length) * 100);
             $(toast).find('.toast-message').text(`Auditing: ${done} / ${targets.length} (${pct}%) | +${added} notes${failed ? ` | ${failed} failed` : ''}\nClick ✕ to stop`);
-            await new Promise(r => setTimeout(r, 60));
         }
         toastr.clear(toast);
         if (_chatEpoch !== startEpoch) {
@@ -1957,13 +1957,6 @@ async function summarizeOneBatch(visibleTurns) {
         await maybePromoteLayer(0);
         await saveChatStore();
 
-        try {
-            const ctx = SillyTavern.getContext();
-            if (ctx.saveChat) await ctx.saveChat();
-        } catch (e) {
-            log('Could not save chat:', e);
-        }
-
         toastr.success(`Summary saved (Layer 0: ${store.layers[0].length} snippets)`, 'Summaryception', { timeOut: 2000 });
         trace('<<< EXITING summarizeOneBatch - SUCCESS');
         return true;
@@ -2071,7 +2064,6 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
         store.summarizedUpTo = Math.max(store.summarizedUpTo, endIdx);
         trace('  Updated store.summarizedUpTo to:', store.summarizedUpTo);
 
-        await saveChatStore();
         await ghostMessagesUpTo(endIdx);
 
         // Sister pass: check the snippet for dropped specifics; attach a detail note if any.
@@ -2081,13 +2073,6 @@ async function summarizeOneBatchFromTurns(visibleTurns) {
 
         await maybePromoteLayer(0);
         await saveChatStore();
-
-        try {
-            const ctx = SillyTavern.getContext();
-            if (ctx.saveChat) await ctx.saveChat();
-        } catch (e) {
-            log('Could not save chat:', e);
-        }
 
         trace('<<< EXITING summarizeOneBatchFromTurns - SUCCESS');
         return true;
@@ -2182,8 +2167,6 @@ async function runCatchup(visibleTurns, overflow) {
             $(progressToast).find('.toast-message').text(
                 `Processing: ${completed} / ${totalBatches} batches (${pct}%)${failStr}\nClick ✕ to pause`
             );
-
-            await new Promise(r => setTimeout(r, 200));
         }
 
         toastr.clear(progressToast);
@@ -4896,7 +4879,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             migratePrompts();
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.20.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits.');
+            console.log(LOG_PREFIX, 'Summaryception v5.21.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
