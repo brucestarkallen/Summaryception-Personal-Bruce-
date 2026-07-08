@@ -89,6 +89,7 @@ const defaultSettings = Object.freeze({
     ledgerInjectRoster: true,      // also inject a compact one-line-per-character roster of EVERYONE off-screen, so long-absent characters are never forgotten and return consistently
     ledgerRosterMax: 12,           // cap on how many off-screen characters the roster lists at once (most-recently-updated first)
     ledgerRosterRotate: true,      // when the off-screen cast exceeds the cap: keep the most-recent anchored and ROTATE the rest through the remaining slots one step per turn, so a small cap still refreshes everyone over time
+    ledgerAutoRewind: true,        // on branch/bulk-trim, auto-rewind the ledger from a periodic checkpoint and re-derive only the small delta, instead of rebuilding from the whole history
     ledgerInjectTemplate: '\n\n<characters>\nWho these people are and where they stand right now — keep them consistent and in character; do not contradict:\n{{characters}}\n</characters>\n',
     ledgerSystemPrompt:
         `You are the character-continuity mind for an ongoing work of collaborative fiction — part novelist, part psychologist. You maintain a living ledger of the people in the story so a separate storyteller AI, often working many turns later from compressed memory, can keep every character the SAME PERSON — consistent in voice, values, and behavior — while letting them change the way real people do: gradually, believably, and only for reasons the story earned. The failures you exist to prevent are (1) a character acting out of nowhere against who they are (a guarded cynic suddenly gushing; a gentle soul suddenly cruel), and (2) a real, felt emotion vanishing the instant the scene is compressed.
@@ -908,13 +909,24 @@ async function repairIfBranched() {
         .filter(idx => idx < chatLength && idx <= store.summarizedUpTo);
 
     await saveChatStore();
-
     log(`Branch repair complete. summarizedUpTo: ${oldSummarizedUpTo} → ${store.summarizedUpTo}, un-ghosted ${unghosted} turn(s).`);
-    toastr.info(
-        `Branch repaired — rewound the summary to turn ${store.summarizedUpTo} and restored ${unghosted} recent turn(s) to verbatim. Snippets and their audit notes past the branch were dropped. The character ledger keeps what characters had already become (it doesn't auto-rewind); if this branch diverges a lot, use Clear Ledger + Build ledger from history for a clean rebuild.`,
-        'Summaryception — Branch Repair',
-        { timeOut: 9000 }
-    );
+
+    // Try to auto-rewind the cumulative ledger from a checkpoint (restore the nearest
+    // snapshot at/before the branch and re-derive only the small delta — no full rebuild).
+    const _rewound = await tryAutoRewindLedger(chatLength - 1, 'branch');
+    if (_rewound) {
+        toastr.info(
+            `Branch repaired — summary rewound to turn ${store.summarizedUpTo}, ${unghosted} recent turn(s) back to verbatim, and the character ledger auto-rewound from a checkpoint.`,
+            'Summaryception — Branch Repair',
+            { timeOut: 7000 }
+        );
+    } else {
+        toastr.info(
+            `Branch repaired — rewound the summary to turn ${store.summarizedUpTo} and restored ${unghosted} recent turn(s) to verbatim. Snippets and their audit notes past the branch were dropped. The character ledger keeps what characters had already become; for a clean rewind use Clear Ledger + Build ledger from history (or enable auto-rewind).`,
+            'Summaryception — Branch Repair',
+            { timeOut: 9000 }
+        );
+    }
 }
 
 // ─── Assistant Turn Utilities ────────────────────────────────────────
@@ -1560,6 +1572,144 @@ function maybeQueueLiveLedger() {
     if (queueLiveLedgerUpdate()) _turnsSinceLive = 0;
 }
 
+// ─── Ledger checkpoints + smart rewind (branch / bulk-trim) ──────────
+// The character ledger is cumulative and can't be trimmed by turn, so a branch or
+// bulk delete would otherwise force a rebuild from the WHOLE history. Instead we
+// snapshot the ledger into localStorage every few turns (keyed by a content signature
+// that survives rename/branch, so a freshly-branched chat can still find its parent's
+// checkpoints). On a branch/trim to turn X we restore the nearest snapshot at/before X
+// and re-derive only the small remaining delta with one scribe call — no full rebuild.
+const _CKPT_PREFIX = 'sc_ledgerckpt::';
+const CKPT_EVERY = 5;    // snapshot cadence in turns
+const CKPT_KEEP = 16;    // max snapshots kept per chat (covers ~80 recent turns)
+let _lastCkptTurn = -999;
+
+function _chatSig() {
+    try {
+        const { chat } = SillyTavern.getContext();
+        if (!Array.isArray(chat) || chat.length === 0) return null;
+        const pick = (m) => m ? (String(m.send_date == null ? '' : m.send_date) + '|' + String(m.name == null ? '' : m.name) + '|' + String(m.mes == null ? '' : m.mes).slice(0, 100)) : '';
+        let firstAsst = null;
+        for (const m of chat) { if (m && !m.is_user) { firstAsst = m; break; } }
+        const raw = pick(chat[0]) + '||' + pick(firstAsst);
+        let h = 5381;
+        for (let i = 0; i < raw.length; i++) h = ((h << 5) + h + raw.charCodeAt(i)) & 0xFFFFFFFF;
+        return (h >>> 0).toString(36) + '_' + raw.length;
+    } catch (_) { return null; }
+}
+
+function _pruneCheckpoints(sig, keep) {
+    try {
+        if (typeof localStorage === 'undefined' || !sig) return;
+        const prefix = _CKPT_PREFIX + sig + '::';
+        const entries = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (!k || k.indexOf(prefix) !== 0) continue;
+            let at = 0; try { at = (JSON.parse(localStorage.getItem(k)) || {}).atTurn || 0; } catch (_) {}
+            entries.push([k, at]);
+        }
+        if (entries.length <= keep) return;
+        entries.sort((a, b) => a[1] - b[1]);   // oldest first
+        for (const pair of entries.slice(0, entries.length - keep)) localStorage.removeItem(pair[0]);
+    } catch (_) {}
+}
+
+function saveLedgerCheckpoint(atTurn) {
+    try {
+        if (typeof localStorage === 'undefined' || typeof atTurn !== 'number' || atTurn < 0) return;
+        const sig = _chatSig();
+        if (!sig) return;
+        const store = getChatStore();
+        if (!store.ledger || typeof store.ledger !== 'object' || Object.keys(store.ledger).length === 0) return;
+        const payload = JSON.stringify({ atTurn, ledger: store.ledger, savedAt: Date.now() });
+        const key = _CKPT_PREFIX + sig + '::' + atTurn;
+        try { localStorage.setItem(key, payload); }
+        catch (_) { _pruneCheckpoints(sig, Math.max(2, Math.floor(CKPT_KEEP / 2))); try { localStorage.setItem(key, payload); } catch (_) {} }
+        _pruneCheckpoints(sig, CKPT_KEEP);
+    } catch (_) {}
+}
+
+function listLedgerCheckpoints() {
+    const out = [];
+    try {
+        if (typeof localStorage === 'undefined') return out;
+        const sig = _chatSig();
+        if (!sig) return out;
+        const prefix = _CKPT_PREFIX + sig + '::';
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (!k || k.indexOf(prefix) !== 0) continue;
+            try { const v = JSON.parse(localStorage.getItem(k)); if (v && typeof v.atTurn === 'number' && v.ledger) out.push(v); } catch (_) {}
+        }
+        out.sort((a, b) => a.atTurn - b.atTurn);
+    } catch (_) {}
+    return out;
+}
+
+// Pure: the newest checkpoint at or before targetTurn, or null.
+function _pickCheckpoint(list, targetTurn) {
+    if (!Array.isArray(list) || typeof targetTurn !== 'number') return null;
+    let best = null;
+    for (const c of list) {
+        if (c && typeof c.atTurn === 'number' && c.atTurn <= targetTurn && (!best || c.atTurn > best.atTurn)) best = c;
+    }
+    return best;
+}
+
+function maybeCheckpointLedger() {
+    try {
+        const idx = getChatStore().ledgerLiveIdx;
+        if (typeof idx !== 'number' || idx < 0) return;
+        if (idx < _lastCkptTurn + CKPT_EVERY) return;   // throttle by cadence
+        _lastCkptTurn = idx;
+        saveLedgerCheckpoint(idx);
+    } catch (_) {}
+}
+
+// One scribe pass over the (small) delta (fromExclusive, toInclusive], merged in.
+async function replayLedgerDelta(fromExclusive, toInclusive) {
+    const { chat } = SillyTavern.getContext();
+    if (!Array.isArray(chat) || fromExclusive + 1 > toInclusive) return;
+    const storyTxt = buildPassageFromRange(chat, fromExclusive + 1, Math.min(toInclusive, chat.length - 1));
+    if (!storyTxt.trim()) return;
+    const s = getSettings();
+    const contextStr = buildFullContext(0);
+    const ledgerStr = serializeLedgerForScribe(getChatStore().ledger, s.ledgerContextMaxChars);
+    const deltas = await callLedgerScribe(storyTxt, contextStr, ledgerStr);
+    if (deltas) mergeLedgerDeltas(deltas);
+}
+
+// Restore the nearest checkpoint at/before targetTurn and re-derive the delta forward.
+// Returns true if it rewound; false if no usable checkpoint (caller suggests manual rebuild).
+async function tryAutoRewindLedger(targetTurn, label) {
+    try {
+        const s = getSettings();
+        if (s.ledgerAutoRewind === false) return false;
+        if (typeof targetTurn !== 'number' || targetTurn < 0) return false;
+        const ckpt = _pickCheckpoint(listLedgerCheckpoints(), targetTurn);
+        if (!ckpt) return false;
+        const store = getChatStore();
+        const epoch = _chatEpoch;
+        _ledgerQueue = [];   // drop pending background jobs — we're rewriting the ledger
+        store.ledger = JSON.parse(JSON.stringify(ckpt.ledger || {}));
+        store.ledgerLiveIdx = ckpt.atTurn;
+        let replayed = 0;
+        if (ckpt.atTurn < targetTurn) {
+            const t = toastr.info(`Rewinding ledger (${label}) to turn ${targetTurn}…`, 'Summaryception', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false });
+            try { await replayLedgerDelta(ckpt.atTurn, targetTurn); replayed = targetTurn - ckpt.atTurn; }
+            finally { toastr.clear(t); }
+            if (_chatEpoch !== epoch) return true;   // chat switched mid-replay — stop touching this store
+        }
+        store.ledgerLiveIdx = targetTurn;
+        _lastCkptTurn = targetTurn;
+        await saveChatStore();
+        try { updateInjection(true); renderLedger(); } catch (_) {}
+        toastr.success(`Ledger auto-rewound to turn ${targetTurn} from a checkpoint at turn ${ckpt.atTurn}${replayed ? ` (re-derived ${replayed} turn${replayed === 1 ? '' : 's'})` : ''} — no full rebuild needed.`, 'Summaryception', { timeOut: 6000 });
+        return true;
+    } catch (e) { try { log('tryAutoRewindLedger failed (non-fatal):', e); } catch (_) {} return false; }
+}
+
 function queueLedgerUpdate(storyTxt, contextStr) {
     const s = getSettings();
     if (!s.ledgerEnabled) return;
@@ -1590,6 +1740,7 @@ async function processLedgerQueue() {
                 if (job.live && typeof job.liveEnd === 'number') {
                     const _st = getChatStore();
                     if (typeof _st.ledgerLiveIdx !== 'number' || job.liveEnd > _st.ledgerLiveIdx) _st.ledgerLiveIdx = job.liveEnd;
+                    maybeCheckpointLedger();
                 }
                 if (changed > 0) {
                     await saveChatStore();
@@ -2745,16 +2896,24 @@ function onMessageDeleted(deletedIndex) {
         const D = (typeof deletedIndex === 'number' && isFinite(deletedIndex) && deletedIndex >= 0)
             ? Math.floor(deletedIndex) : -1;
 
+        let _bulkTrim = false;
         if (delta === 1 && D >= 0 && D <= newLen) {
             reindexAfterDeletion(store, D);   // the common case: one message, known position — exact shift
         } else if (delta >= 1 || D >= 0) {
             clampStoreToLength(store, newLen);   // bulk / uncertain — safe overrun-only repair
+            _bulkTrim = true;
         } else {
             return;   // no shrink detected
         }
         saveChatStore();
         updateInjection(true);       // active cast may have changed if a recent message went away
         try { updateUI(); } catch (_) {}
+        if (_bulkTrim && newLen > 0) {
+            // A bulk trim back to an earlier turn is a branch in disguise — try to
+            // auto-rewind the cumulative ledger from a checkpoint (single deletes are
+            // low-impact and skip this).
+            tryAutoRewindLedger(newLen - 1, 'trim').catch(() => {});
+        }
     } catch (e) { log('onMessageDeleted error:', e); }
 }
 
@@ -2781,6 +2940,7 @@ function onMessageReceived(messageIndex) {
 function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
+    _lastCkptTurn = -999;
     try { const { chat } = SillyTavern.getContext(); _prevChatLen = Array.isArray(chat) ? chat.length : -1; } catch (_) { _prevChatLen = -1; }
     // Editor + audit state is PER-CHAT. Never let a memory snapshot, pending
     // edits, or queued audits from the previous chat leak into this one —
@@ -2979,6 +3139,7 @@ function updateUI() {
         $('#sc_ledger_roster_max').val(s.ledgerRosterMax ?? 12);
         $('#sc_ledger_roster_max_val').text(s.ledgerRosterMax ?? 12);
         $('#sc_ledger_roster_rotate').prop('checked', s.ledgerRosterRotate !== false);
+        $('#sc_ledger_auto_rewind').prop('checked', s.ledgerAutoRewind !== false);
         $('#sc_ledger_max_chars_val').text(s.ledgerMaxCharsPerChar ?? 600);
         $('#sc_editor_system_prompt').val(s.editorSystemPrompt);
         $('#sc_editor_user_prompt').val(s.editorUserPrompt);
@@ -3998,6 +4159,10 @@ function bindUIEvents() {
         saveSettings();
         updateInjection(true);
     });
+    $(document).on('change', '#sc_ledger_auto_rewind', function () {
+        getSettings().ledgerAutoRewind = $(this).prop('checked');
+        saveSettings();
+    });
     $(document).on('input', '#sc_ledger_system_prompt', function () {
         getSettings().ledgerSystemPrompt = $(this).val();
         saveSettings();
@@ -4896,7 +5061,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             migratePrompts();
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.22.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes.');
+            console.log(LOG_PREFIX, 'Summaryception v5.23.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger can auto-rewind from a checkpoint on branch/trim instead of a full rebuild.');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

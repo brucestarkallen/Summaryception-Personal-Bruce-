@@ -28,7 +28,7 @@ function extractTopLevel(name) {
 
 const names = ['_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
-    'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins'];
+    'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -47,7 +47,7 @@ return {
   __setChat:     (v)=>{ __chat = v; },
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
-  subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster,
+  subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint,
 };
 `;
 const L = new Function(sandbox)();
@@ -372,6 +372,19 @@ section('_composeRoster — pins: always present, uncapped, no rotation, no dup'
     ok(!L._composeRoster(['A', 'B'], ['Zed'], 6, 0, true).includes('Zed'), 'pin for an on-screen/absent character does not surface in the roster (no redundancy with full cards)');
     // case-insensitive pin match against the ledger name
     ok(L._composeRoster(['Akane', 'Bob'], ['akane'], 6, 0, true).includes('Akane'), 'pin matches ledger name case-insensitively');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+section('_pickCheckpoint — nearest snapshot at/before target');
+{
+    const cks = [{ atTurn: 0 }, { atTurn: 5 }, { atTurn: 10 }, { atTurn: 15 }];
+    eq(L._pickCheckpoint(cks, 12) && L._pickCheckpoint(cks, 12).atTurn, 10, 'newest checkpoint <= target');
+    eq(L._pickCheckpoint(cks, 15) && L._pickCheckpoint(cks, 15).atTurn, 15, 'exact match allowed');
+    eq(L._pickCheckpoint(cks, 100) && L._pickCheckpoint(cks, 100).atTurn, 15, 'clamps to newest when target is beyond all');
+    eq(L._pickCheckpoint(cks, 3) && L._pickCheckpoint(cks, 3).atTurn, 0, 'earliest when target is low');
+    eq(L._pickCheckpoint(cks, -1), null, 'nothing at/before a negative target');
+    eq(L._pickCheckpoint([], 10), null, 'empty list -> null');
+    eq(L._pickCheckpoint([{ atTurn: 10 }, { atTurn: 2 }, { atTurn: 7 }], 8).atTurn, 7, 'unsorted list handled');
 }
 
 // ─────────────────────────────────────────────────────────────────────

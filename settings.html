@@ -570,6 +570,14 @@
                     </div>
 
                     <div class="sc-row">
+                        <label class="checkbox_label" for="sc_ledger_auto_rewind">
+                            <input type="checkbox" id="sc_ledger_auto_rewind" />
+                            <span>Auto-rewind ledger on branch/trim</span>
+                        </label>
+                        <small class="sc-hint">When you branch or trim the chat back to an earlier turn, automatically rewind the character ledger from a periodic checkpoint and re-derive only the small remaining delta — instead of rebuilding from the whole history. Falls back to a manual suggestion if the branch is older than the checkpoint window.</small>
+                    </div>
+
+                    <div class="sc-row">
                         <label for="sc_ledger_system_prompt">
                             <span>Ledger System Prompt</span>
                             <small class="sc-hint">The scribe's role: a psychologist/continuity editor that tracks the four fields, evolves state, keeps open threads alive until resolved, and never invents. Must instruct JSON-array output.</small>
