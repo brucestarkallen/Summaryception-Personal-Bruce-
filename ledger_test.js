@@ -29,7 +29,7 @@ function extractTopLevel(name) {
 const names = ['_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint',
-    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags'];
+    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -49,7 +49,7 @@ return {
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint,
-  normalizeContinuityOutput, _continuitySig, mergeContinuityFlags,
+  normalizeContinuityOutput, _continuitySig, mergeContinuityFlags, reconcileSnippetFlags,
 };
 `;
 const L = new Function(sandbox)();
@@ -427,6 +427,35 @@ section('Continuity — _continuitySig + mergeContinuityFlags');
     eq(store.continuityFlags.length, 2, 'two flags total');
     ok(store.continuityFlags[0].id && store.continuityFlags[0].status === 'open' && store.continuityFlags[0].turnRange[0] === 3,
        'stored flag has id, open status, and turnRange');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+section('Continuity — reconcileSnippetFlags (re-check clears fixed, keeps valid)');
+{
+    const store = { continuityFlags: [], continuityDismissed: [] };
+    L.mergeContinuityFlags(store, [3, 5], [{ issue: 'A', fix: 'a', kind: 'continuity' }, { issue: 'B', fix: 'b', kind: 'drift' }]);
+    eq(store.continuityFlags.length, 2, 'two flags to start');
+    const idA = store.continuityFlags.find(f => f.issue === 'A').id;
+    // fresh pass still reports A only -> B cleared, A kept without churn, nothing new
+    const r = L.reconcileSnippetFlags(store, [3, 5], [{ issue: 'A', fix: 'a', kind: 'continuity' }]);
+    eq(r.cleared, 1, 'B (no longer reported) cleared');
+    eq(r.added, 0, 'A already open -> not re-added');
+    eq(store.continuityFlags.length, 1, 'only A remains');
+    eq(store.continuityFlags[0].id, idA, 'A kept its id (no churn)');
+    // fresh pass reports nothing -> A cleared (issue fixed)
+    const r2 = L.reconcileSnippetFlags(store, [3, 5], []);
+    eq(r2.cleared, 1, 'A cleared when the fresh pass is clean');
+    eq(store.continuityFlags.length, 0, 'snippet now flag-free');
+    // reconcile only touches the matching turnRange
+    L.mergeContinuityFlags(store, [10, 12], [{ issue: 'Z', fix: 'z', kind: 'continuity' }]);
+    const r3 = L.reconcileSnippetFlags(store, [3, 5], []);
+    eq(r3.cleared, 0, 'a different snippet\'s flags are untouched');
+    eq(store.continuityFlags.length, 1, 'Z on [10,12] preserved');
+    // a dismissed issue is never (re-)added by a reconcile (real dismiss = flag removed + sig recorded)
+    const store2 = { continuityFlags: [], continuityDismissed: [L._continuitySig({ issue: 'Z', kind: 'continuity' })] };
+    const r4 = L.reconcileSnippetFlags(store2, [10, 12], [{ issue: 'Z', fix: 'z', kind: 'continuity' }]);
+    eq(r4.added, 0, 'dismissed Z not added even though re-reported');
+    eq(store2.continuityFlags.length, 0, 'dismissed Z stays gone');
 }
 
 // ─────────────────────────────────────────────────────────────────────

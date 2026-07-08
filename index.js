@@ -1386,6 +1386,25 @@ function mergeContinuityFlags(store, turnRange, newFlags) {
     return added;
 }
 
+// Re-check reconcile for one snippet: clear its OPEN flags the fresh pass no longer
+// reports (the issue was fixed), keep the ones still reported (same id, no churn), add
+// any new ones, and never re-raise a dismissed sig. Returns {added, cleared}. Only
+// touches flags whose turnRange matches this snippet.
+function reconcileSnippetFlags(store, turnRange, freshFlags) {
+    if (!store || !Array.isArray(turnRange)) return { added: 0, cleared: 0 };
+    if (!Array.isArray(store.continuityFlags)) store.continuityFlags = [];
+    const a = turnRange[0], b = turnRange[1];
+    const freshSigs = new Set((freshFlags || []).map(_continuitySig));
+    let cleared = 0;
+    store.continuityFlags = store.continuityFlags.filter(f => {
+        const sameRange = f && Array.isArray(f.turnRange) && f.turnRange[0] === a && f.turnRange[1] === b;
+        if (sameRange && f.status !== 'resolved' && !freshSigs.has(_continuitySig(f))) { cleared++; return false; }
+        return true;
+    });
+    const added = mergeContinuityFlags(store, turnRange, freshFlags || []);
+    return { added, cleared };
+}
+
 // ─── Detail Auditor ("sister") ───────────────────────────────────────
 // A second, per-batch pass that checks whether the compact snippet dropped
 // important specifics from the same passage. Reuses callSummarizer's machinery
@@ -2152,7 +2171,7 @@ async function backfillContinuityForLayer0() {
 
     const { chat } = SillyTavern.getContext();
     const startEpoch = _chatEpoch;
-    let done = 0, flagged = 0, failed = 0, cancelled = false, consec = 0;
+    let done = 0, flagged = 0, cleared = 0, failed = 0, cancelled = false, consec = 0;
     const toast = toastr.info(`Checking continuity: 0 / ${targets.length}`, 'Summaryception Continuity', {
         timeOut: 0, extendedTimeOut: 0, tapToDismiss: false, closeButton: true,
         onCloseClick: () => { cancelled = true; abortSummarization(); },
@@ -2168,7 +2187,7 @@ async function backfillContinuityForLayer0() {
                 const recordStr = buildContinuityRecord();
                 const flags = await callContinuityChecker(storyTxt, sn.text, recordStr);
                 if (_chatEpoch !== startEpoch) break;
-                if (typeof sn.text === 'string' && flags.length > 0) flagged += mergeContinuityFlags(store, sn.turnRange, flags);
+                if (typeof sn.text === 'string') { const rc = reconcileSnippetFlags(store, sn.turnRange, flags); flagged += rc.added; cleared += rc.cleared; }
                 consec = 0;
             } catch (e) {
                 failed++; consec++;
@@ -2178,7 +2197,7 @@ async function backfillContinuityForLayer0() {
             done++;
             if (done % 6 === 0) await saveChatStore();
             const pct = Math.round((done / targets.length) * 100);
-            $(toast).find('.toast-message').text(`Checking continuity: ${done} / ${targets.length} (${pct}%) | ${flagged} flagged${failed ? ` | ${failed} failed` : ''}\nClick ✕ to stop`);
+            $(toast).find('.toast-message').text(`Checking continuity: ${done} / ${targets.length} (${pct}%) | ${flagged} flagged${cleared ? `, ${cleared} cleared` : ''}${failed ? ` | ${failed} failed` : ''}\nClick ✕ to stop`);
         }
         toastr.clear(toast);
         if (_chatEpoch !== startEpoch) {
@@ -2187,8 +2206,8 @@ async function backfillContinuityForLayer0() {
             await saveChatStore();
             updateInjection(true);
             try { renderLedger(); } catch (_) {}
-            if (cancelled) toastr.warning(`Stopped at ${done}/${targets.length}. ${flagged} issue(s) flagged. Progress saved.`, 'Summaryception', { timeOut: 5000 });
-            else toastr.success(`Continuity check done — ${flagged} issue${flagged === 1 ? '' : 's'} flagged across ${done} snippet(s)${failed ? `, ${failed} failed` : ''}.`, 'Summaryception', { timeOut: 6000 });
+            if (cancelled) toastr.warning(`Stopped at ${done}/${targets.length}. ${flagged} flagged, ${cleared} cleared. Progress saved.`, 'Summaryception', { timeOut: 5000 });
+            else toastr.success(`Continuity re-check done — ${flagged} new issue${flagged === 1 ? '' : 's'} flagged, ${cleared} fixed issue${cleared === 1 ? '' : 's'} cleared, across ${done} snippet(s)${failed ? `, ${failed} failed` : ''}.`, 'Summaryception', { timeOut: 6000 });
         }
     } finally {
         isSummarizing = false;
@@ -5376,7 +5395,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             migratePrompts();
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.25.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle.');
+            console.log(LOG_PREFIX, 'Summaryception v5.26.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed).');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
