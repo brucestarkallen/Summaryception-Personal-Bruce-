@@ -1913,21 +1913,31 @@ async function backfillLedgerFromHistory(opts) {
     if (!s.ledgerEnabled) { if (!auto) toastr.warning('Enable the Character Ledger first.', 'Summaryception'); return; }
     if (isSummarizing) { if (!auto) toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
     if (_ledgerActive || _auditActive) { if (!auto) toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
+
+    const store = getChatStore();
+    if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
+    if (auto) { store.ledger = {}; store.ledgerLiveIdx = -1; }   // clean slate FIRST — so a branch with no earlier turns (e.g. back to turn 0) still ends up cleared
+
     const { chat } = SillyTavern.getContext();
     const turns = getAssistantTurns(chat);
-    if (turns.length === 0) { toastr.info('No story turns to build the ledger from yet.', 'Summaryception', { timeOut: 4000 }); return; }
+    if (turns.length === 0) {
+        if (auto) { await saveChatStore(); updateInjection(true); try { renderLedger(); } catch (_) {} toastr.info('Ledger cleared — this branch has no earlier turns to rebuild from.', 'Summaryception', { timeOut: 4000 }); }
+        else toastr.info('No story turns to build the ledger from yet.', 'Summaryception', { timeOut: 4000 });
+        return;
+    }
     const batches = _computeBackfillBatches(turns, s.turnsPerSummary);
-    if (batches.length === 0) { toastr.info('Nothing to process.', 'Summaryception'); return; }
+    if (batches.length === 0) {
+        if (auto) { await saveChatStore(); updateInjection(true); try { renderLedger(); } catch (_) {} }
+        else toastr.info('Nothing to process.', 'Summaryception');
+        return;
+    }
     if (!auto && !confirm(
         `Build the Character Ledger from the whole story?\n\n` +
         `Replays ${turns.length} turns in ${batches.length} passes (~${batches.length} background LLM calls) to populate/refresh the ledger. ` +
         `It MERGES into the current ledger — use "Clear Ledger" first if you want a clean rebuild. You can stop anytime; progress is kept.`
     )) return;
 
-    const store = getChatStore();
-    if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
-    if (auto) { store.ledger = {}; store.ledgerLiveIdx = -1; }   // clean slate before re-deriving from this branch
-    _ledgerQueue = [];   // we drive the scribe directly here; drop pending background jobs
+    _ledgerQueue = [];   // we drive the scribe directly here; drop pending background jobs (store was cleared above)
     const startEpoch = _chatEpoch;   // if the user switches chats mid-run, abandon — never write another chat's ledger
 
     let done = 0, failed = 0, cancelled = false, consec = 0;
@@ -3412,10 +3422,12 @@ function onMessageDeleted(deletedIndex) {
         saveChatStore();
         updateInjection(true);       // active cast may have changed if a recent message went away
         try { updateUI(); } catch (_) {}
-        if (_bulkTrim && newLen > 0) {
-            // A bulk trim back to an earlier turn is a branch in disguise — try to
-            // auto-rewind the cumulative ledger from a checkpoint (single deletes are
-            // low-impact and skip this).
+        if (_bulkTrim && delta > 1 && newLen > 0) {
+            // A bulk trim (more than one message removed) is a branch in disguise —
+            // auto-rewind the cumulative ledger from a checkpoint. A single-message
+            // deletion (delta === 1) skips this and stays INSTANT: no scribe call. Its
+            // one turn of lingering ledger content is negligible, and the live pass
+            // smooths recent turns on the next message anyway.
             tryAutoRewindLedger(newLen - 1, 'trim').catch(() => {});
         }
     } catch (e) { log('onMessageDeleted error:', e); }
@@ -5651,7 +5663,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             migratePrompts();
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.30.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot. Flags now record where the error lives (snippet vs source); auto-fix only rewrites snippet-level ones (aligning the snippet to its source, so no drift loop), leaving source-level errors for the copilot to fix at the message. Editing an already-summarized message now auto-re-checks just that snippet (debounced), so a fixed message realigns its snippet on its own. NEW: an in-app Continuity panel (flag list with per-flag Apply/Dismiss, Re-check All / Apply All buttons, enable/auto-fix/nudge toggles, and prompt editors).');
+            console.log(LOG_PREFIX, 'Summaryception v5.31.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot. Flags now record where the error lives (snippet vs source); auto-fix only rewrites snippet-level ones (aligning the snippet to its source, so no drift loop), leaving source-level errors for the copilot to fix at the message. Editing an already-summarized message now auto-re-checks just that snippet (debounced), so a fixed message realigns its snippet on its own. NEW: an in-app Continuity panel (flag list with per-flag Apply/Dismiss, Re-check All / Apply All buttons, enable/auto-fix/nudge toggles, and prompt editors).');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
