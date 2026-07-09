@@ -446,6 +446,34 @@ function migratePrompts() {
     return migrated;
 }
 
+// Surgical, idempotent fix for the #1 cause of slow ledger passes: the default ledger
+// prompt tells the scribe to "restate the FULL stable picture" for core, so it re-emits
+// each character's entire (growing) entry every pass — huge, slow responses. This rewrites
+// that instruction (and adds an efficiency directive) IN the stored prompt, whether stock or
+// lightly customized. The ledger DATA keeps all its richness; the model just stops rewriting
+// unchanged fields. Runs on load; once patched, the old phrases are gone so it no-ops.
+function patchLedgerPrompt() {
+    let s; try { s = getSettings(); } catch (_) { return; }
+    let cur = (typeof s.ledgerSystemPrompt === 'string') ? s.ledgerSystemPrompt : '';
+    if (!cur) return;
+    let changed = false;
+
+    const RESTATE_OLD = 'When you do touch core, restate the FULL stable picture (everything already established plus the new trait) so nothing is lost.';
+    const RESTATE_NEW = "If a character's core is already recorded and this passage adds no new permanent trait, OMIT core entirely \u2014 do NOT reproduce it (re-emitting an unchanged core is the single biggest cause of slow, oversized output). Only when you genuinely change it, restate the full integrated core so nothing is lost.";
+    if (cur.indexOf(RESTATE_OLD) !== -1) { cur = cur.replace(RESTATE_OLD, RESTATE_NEW); changed = true; }
+
+    const EFF_ANCHOR = 'Update ONLY what the passage changes; OMIT any field that is unchanged.';
+    const EFF_TAG = 'EFFICIENCY (as important as accuracy):';
+    const EFF_ADD = ' ' + EFF_TAG + ' the CURRENT LEDGER already holds everything recorded so far \u2014 you are EVOLVING it, not rewriting it. In a typical passage output ONLY the state (and any genuinely changed threads) for the one to three characters who appear; re-emitting an unchanged core or arc, or a character absent from the passage, bloats the response and must be avoided \u2014 when unsure whether a field changed, OMIT it.';
+    if (cur.indexOf(EFF_ANCHOR) !== -1 && cur.indexOf(EFF_TAG) === -1) { cur = cur.replace(EFF_ANCHOR, EFF_ANCHOR + EFF_ADD); changed = true; }
+
+    if (changed) {
+        s.ledgerSystemPrompt = cur;
+        try { saveSettings(); } catch (_) {}
+        log('Ledger prompt patched to stop re-emitting unchanged fields (much faster ledger passes; ledger content unchanged).');
+    }
+}
+
 function saveSettings() {
     SillyTavern.getContext().saveSettingsDebounced();
 }
@@ -5814,9 +5842,10 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         } catch (_) {}
         eventSource.on(event_types.APP_READY, () => {
             migratePrompts();
+            try { patchLedgerPrompt(); } catch (_) {}
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.36.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot. Flags now record where the error lives (snippet vs source); auto-fix only rewrites snippet-level ones (aligning the snippet to its source, so no drift loop), leaving source-level errors for the copilot to fix at the message. Editing an already-summarized message now auto-re-checks just that snippet (debounced), so a fixed message realigns its snippet on its own. NEW: an in-app Continuity panel (flag list with per-flag Apply/Dismiss, Re-check All / Apply All buttons, enable/auto-fix/nudge toggles, and prompt editors).');
+            console.log(LOG_PREFIX, 'Summaryception v5.37.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot. Flags now record where the error lives (snippet vs source); auto-fix only rewrites snippet-level ones (aligning the snippet to its source, so no drift loop), leaving source-level errors for the copilot to fix at the message. Editing an already-summarized message now auto-re-checks just that snippet (debounced), so a fixed message realigns its snippet on its own. NEW: an in-app Continuity panel (flag list with per-flag Apply/Dismiss, Re-check All / Apply All buttons, enable/auto-fix/nudge toggles, and prompt editors).');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
