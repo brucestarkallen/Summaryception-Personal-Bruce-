@@ -28,7 +28,7 @@ function extractTopLevel(name) {
 
 const names = ['_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
-    'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint',
+    'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps',
     'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering'];
 
 const body = names.map(extractTopLevel).join('\n\n');
@@ -48,7 +48,7 @@ return {
   __setChat:     (v)=>{ __chat = v; },
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
-  subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint,
+  subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps,
   normalizeContinuityOutput, _continuitySig, mergeContinuityFlags, reconcileSnippetFlags, _findSnippetByTurnRange, _findSnippetsCovering,
 };
 `;
@@ -387,6 +387,48 @@ section('_pickCheckpoint — nearest snapshot at/before target');
     eq(L._pickCheckpoint(cks, -1), null, 'nothing at/before a negative target');
     eq(L._pickCheckpoint([], 10), null, 'empty list -> null');
     eq(L._pickCheckpoint([{ atTurn: 10 }, { atTurn: 2 }, { atTurn: 7 }], 8).atTurn, 7, 'unsorted list handled');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+section('_computeReplayChunks — bounded background rewind batches');
+{
+    eq(JSON.stringify(L._computeReplayChunks(287, 292, 3)), JSON.stringify([[288, 290], [291, 292]]), 'delta split into summarizer-sized chunks');
+    eq(JSON.stringify(L._computeReplayChunks(290, 292, 5)), JSON.stringify([[291, 292]]), 'small delta -> single chunk');
+    eq(L._computeReplayChunks(292, 292, 5).length, 0, 'empty span -> no chunks');
+    eq(L._computeReplayChunks(293, 292, 5).length, 0, 'inverted span -> no chunks');
+    const big = L._computeReplayChunks(-1, 291, 3);   // full 292-turn replay
+    eq(big.length, Math.ceil(292 / 3), 'full-history replay is fully chunked');
+    eq(JSON.stringify(big[0]), JSON.stringify([0, 2]), 'first chunk starts at fromExclusive+1');
+    eq(big[big.length - 1][1], 291, 'last chunk ends exactly at target');
+    ok(big.every(([a, b]) => b - a + 1 <= 3 && a <= b), 'every chunk within step and well-formed');
+    // contiguity: no turn skipped, none doubled
+    ok(big.every((c, i) => i === 0 || c[0] === big[i - 1][1] + 1), 'chunks are contiguous');
+    eq(L._computeReplayChunks(0, 10, 0).length, Math.ceil(10 / 1), 'step 0 clamps to 1');
+    eq(L._computeReplayChunks(null, 10, 3).length, 0, 'non-numeric input -> no chunks');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+section('_selectCheckpointKeeps — dense recent + thinned tail');
+{
+    const turns = []; for (let t = 5; t <= 290; t += 5) turns.push(t);   // 58 checkpoints, cadence 5
+    const keeps = L._selectCheckpointKeeps(turns, 16, 25);
+    for (let t = 215; t <= 290; t += 5) ok(keeps.has(t), `dense window keeps turn ${t}`);
+    ok(keeps.size > 16, 'tail is thinned, not dropped');
+    ok(keeps.size <= 16 + Math.ceil(215 / 25) + 1, 'tail stays sparse (roughly one per bucket)');
+    // every old turn (past the first bucket) is within one bucket of a kept checkpoint
+    // -> a deep branch rewinds from a nearby snapshot instead of full-rebuilding
+    for (let target = 25; target <= 290; target += 5) {
+        const nearest = Math.max(...[...keeps].filter(t => t <= target), -1);
+        ok(nearest >= 0 && target - nearest < 30, `branch to ${target} finds a checkpoint within a bucket (got ${nearest})`);
+    }
+    // below the first bucket's kept snapshot there's nothing to restore — but the
+    // fallback rebuild there covers at most a bucket's worth of turns, which is cheap
+    ok(Math.min(...keeps) <= 25, 'oldest kept checkpoint sits inside the first bucket');
+    eq([...L._selectCheckpointKeeps([10, 20, 30], 16, 25)].length, 3, 'fewer than keepRecent -> all kept');
+    const hard = L._selectCheckpointKeeps(turns, 8, 0);
+    eq(hard.size, 8, 'sparseEvery 0 -> hard prune, tail dropped (quota path)');
+    ok(hard.has(290) && hard.has(255), 'hard prune keeps the newest');
+    eq(L._selectCheckpointKeeps([], 16, 25).size, 0, 'empty -> empty');
 }
 
 // ─────────────────────────────────────────────────────────────────────

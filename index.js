@@ -1792,11 +1792,14 @@ function maybeQueueLiveLedger() {
 // bulk delete would otherwise force a rebuild from the WHOLE history. Instead we
 // snapshot the ledger into localStorage every few turns (keyed by a content signature
 // that survives rename/branch, so a freshly-branched chat can still find its parent's
-// checkpoints). On a branch/trim to turn X we restore the nearest snapshot at/before X
-// and re-derive only the small remaining delta with one scribe call — no full rebuild.
+// checkpoints; old snapshots are thinned, not dropped, so deep branches still land near
+// one). On a branch/trim to turn X we restore the nearest snapshot at/before X instantly
+// and re-derive the remaining delta as bounded BACKGROUND scribe jobs — no blocking
+// foreground call, no sticky toast, no full rebuild.
 const _CKPT_PREFIX = 'sc_ledgerckpt::';
 const CKPT_EVERY = 5;    // snapshot cadence in turns
-const CKPT_KEEP = 16;    // max snapshots kept per chat (covers ~80 recent turns)
+const CKPT_KEEP = 16;    // dense recent snapshots kept per chat (covers ~80 recent turns)
+const CKPT_SPARSE_EVERY = 25;   // beyond the dense window, keep one snapshot per this many turns — a deep branch rewinds from a nearby old checkpoint instead of forcing a full rebuild
 let _lastCkptTurn = -999;
 
 function _chatSig() {
@@ -1813,7 +1816,24 @@ function _chatSig() {
     } catch (_) { return null; }
 }
 
-function _pruneCheckpoints(sig, keep) {
+// Pure: which checkpoint turns survive a prune. The newest `keepRecent` stay dense;
+// older ones are thinned to one per `sparseEvery`-turn bucket (newest in each bucket
+// wins). sparseEvery <= 0 drops the tail entirely (quota-pressure hard prune).
+function _selectCheckpointKeeps(turnsAsc, keepRecent, sparseEvery) {
+    const keep = new Set();
+    if (!Array.isArray(turnsAsc) || turnsAsc.length === 0) return keep;
+    const recentStart = Math.max(0, turnsAsc.length - Math.max(1, keepRecent | 0));
+    for (let i = recentStart; i < turnsAsc.length; i++) keep.add(turnsAsc[i]);
+    const every = sparseEvery | 0;
+    if (every > 0) {
+        const byBucket = new Map();
+        for (let i = 0; i < recentStart; i++) byBucket.set(Math.floor(turnsAsc[i] / every), turnsAsc[i]);   // ascending — newest per bucket wins
+        for (const t of byBucket.values()) keep.add(t);
+    }
+    return keep;
+}
+
+function _pruneCheckpoints(sig, keep, sparseEvery) {
     try {
         if (typeof localStorage === 'undefined' || !sig) return;
         const prefix = _CKPT_PREFIX + sig + '::';
@@ -1826,7 +1846,9 @@ function _pruneCheckpoints(sig, keep) {
         }
         if (entries.length <= keep) return;
         entries.sort((a, b) => a[1] - b[1]);   // oldest first
-        for (const pair of entries.slice(0, entries.length - keep)) localStorage.removeItem(pair[0]);
+        const every = (sparseEvery === undefined) ? CKPT_SPARSE_EVERY : sparseEvery;
+        const keeps = _selectCheckpointKeeps(entries.map(e => e[1]), keep, every);
+        for (const [k, at] of entries) if (!keeps.has(at)) localStorage.removeItem(k);
     } catch (_) {}
 }
 
@@ -1840,7 +1862,7 @@ function saveLedgerCheckpoint(atTurn) {
         const payload = JSON.stringify({ atTurn, ledger: store.ledger, savedAt: Date.now() });
         const key = _CKPT_PREFIX + sig + '::' + atTurn;
         try { localStorage.setItem(key, payload); }
-        catch (_) { _pruneCheckpoints(sig, Math.max(2, Math.floor(CKPT_KEEP / 2))); try { localStorage.setItem(key, payload); } catch (_) {} }
+        catch (_) { _pruneCheckpoints(sig, Math.max(2, Math.floor(CKPT_KEEP / 2)), 0); try { localStorage.setItem(key, payload); } catch (_) {} }
         _pruneCheckpoints(sig, CKPT_KEEP);
     } catch (_) {}
 }
@@ -1882,17 +1904,40 @@ function maybeCheckpointLedger() {
     } catch (_) {}
 }
 
-// One scribe pass over the (small) delta (fromExclusive, toInclusive], merged in.
-async function replayLedgerDelta(fromExclusive, toInclusive) {
-    const { chat } = SillyTavern.getContext();
-    if (!Array.isArray(chat) || fromExclusive + 1 > toInclusive) return;
-    const storyTxt = buildPassageFromRange(chat, fromExclusive + 1, Math.min(toInclusive, chat.length - 1));
-    if (!storyTxt.trim()) return;
-    const s = getSettings();
-    const contextStr = buildLedgerContext(fromExclusive + 1, LEDGER_GIST_CAP);   // bounded, past-only (was whole-gist)
-    const ledgerStr = serializeLedgerForScribe(getChatStore().ledger, s.ledgerContextMaxChars);
-    const deltas = await callLedgerScribe(storyTxt, contextStr, ledgerStr);
-    if (deltas) mergeLedgerDeltas(deltas);
+// Pure: split the replay span (fromExclusive, toInclusive] into summarizer-sized
+// [start,end] chunks, so a stale checkpoint never produces one monster prompt.
+function _computeReplayChunks(fromExclusive, toInclusive, step) {
+    const chunks = [];
+    if (typeof fromExclusive !== 'number' || typeof toInclusive !== 'number') return chunks;
+    const st = Math.max(1, step | 0);
+    for (let a = fromExclusive + 1; a <= toInclusive; a += st) chunks.push([a, Math.min(a + st - 1, toInclusive)]);
+    return chunks;
+}
+
+// Queue the (fromExclusive, toInclusive] delta as bounded BACKGROUND scribe jobs —
+// one per summarizer-sized batch — instead of one blocking foreground call. Each job
+// advances ledgerLiveIdx as it lands (live/liveEnd) and re-checkpoints along the way,
+// so an interrupted replay resumes from the last finished chunk instead of restarting.
+// The queue already carries the epoch guard and serializes against live passes.
+// Returns the number of jobs queued.
+function queueLedgerReplay(fromExclusive, toInclusive) {
+    try {
+        const { chat } = SillyTavern.getContext();
+        if (!Array.isArray(chat) || chat.length === 0) return 0;
+        const s = getSettings();
+        const end = Math.min(toInclusive, chat.length - 1);
+        const chunks = _computeReplayChunks(fromExclusive, end, (s.turnsPerSummary | 0) || 5);
+        let queued = 0;
+        for (const [a, b] of chunks) {
+            const storyTxt = buildPassageFromRange(chat, a, b);
+            if (!storyTxt.trim()) continue;   // empty span — a later chunk's liveEnd covers the gap
+            const contextStr = buildLedgerContext(a, LEDGER_GIST_CAP);   // bounded, past-only
+            _ledgerQueue.push({ storyTxt, contextStr, epoch: _chatEpoch, live: true, liveEnd: b });
+            queued++;
+        }
+        if (queued > 0) processLedgerQueue();   // fire and forget — the queue serializes
+        return queued;
+    } catch (e) { try { log('queueLedgerReplay failed (non-fatal):', e); } catch (_) {} return 0; }
 }
 
 // Restore the nearest checkpoint at/before targetTurn and re-derive the delta forward.
@@ -1931,22 +1976,24 @@ async function tryAutoRewindLedger(targetTurn, label) {
             return true;
         }
         const store = getChatStore();
-        const epoch = _chatEpoch;
         _ledgerQueue = [];   // drop pending background jobs — we're rewriting the ledger
         store.ledger = JSON.parse(JSON.stringify(ckpt.ledger || {}));
         store.ledgerLiveIdx = ckpt.atTurn;
-        let replayed = 0;
-        if (ckpt.atTurn < targetTurn) {
-            const t = toastr.info(`Rewinding ledger (${label}) to turn ${targetTurn}…`, 'Summaryception', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false });
-            try { await replayLedgerDelta(ckpt.atTurn, targetTurn); replayed = targetTurn - ckpt.atTurn; }
-            finally { toastr.clear(t); }
-            if (_chatEpoch !== epoch) return true;   // chat switched mid-replay — stop touching this store
-        }
-        store.ledgerLiveIdx = targetTurn;
-        _lastCkptTurn = targetTurn;
+        _lastCkptTurn = ckpt.atTurn;   // re-arm checkpointing from the restore point
+        // The restore itself is instant. The delta re-derivation is NOT a foreground
+        // concern — summary/injection repair already finished — so it runs as bounded
+        // background jobs instead of one blocking scribe call with a sticky toast.
+        // liveIdx stays at the checkpoint until each chunk lands, so an interruption
+        // (mobile app backgrounded mid-call) resumes from the last finished chunk.
+        const queued = (ckpt.atTurn < targetTurn) ? queueLedgerReplay(ckpt.atTurn, targetTurn) : 0;
+        if (queued === 0) { store.ledgerLiveIdx = targetTurn; _lastCkptTurn = targetTurn; }
         await saveChatStore();
         try { updateInjection(true); renderLedger(); } catch (_) {}
-        toastr.success(`Ledger auto-rewound to turn ${targetTurn} from a checkpoint at turn ${ckpt.atTurn}${replayed ? ` (re-derived ${replayed} turn${replayed === 1 ? '' : 's'})` : ''} — no full rebuild needed.`, 'Summaryception', { timeOut: 6000 });
+        toastr.success(
+            queued
+                ? `Ledger restored from the turn-${ckpt.atTurn} checkpoint (${label}) — re-deriving ${targetTurn - ckpt.atTurn} turn(s) in ${queued} background pass${queued === 1 ? '' : 'es'}. Keep playing; it catches up on its own.`
+                : `Ledger auto-rewound to turn ${targetTurn} from a checkpoint at turn ${ckpt.atTurn} — nothing to re-derive.`,
+            'Summaryception', { timeOut: 6000 });
         return true;
     } catch (e) { try { log('tryAutoRewindLedger failed (non-fatal):', e); } catch (_) {} return false; }
 }
@@ -5853,7 +5900,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { patchLedgerPrompt(); } catch (_) {}
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.40.0 loaded — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot. Flags now record where the error lives (snippet vs source); auto-fix only rewrites snippet-level ones (aligning the snippet to its source, so no drift loop), leaving source-level errors for the copilot to fix at the message. Editing an already-summarized message now auto-re-checks just that snippet (debounced), so a fixed message realigns its snippet on its own. NEW: an in-app Continuity panel (flag list with per-flag Apply/Dismiss, Re-check All / Apply All buttons, enable/auto-fix/nudge toggles, and prompt editors).');
+            console.log(LOG_PREFIX, 'Summaryception v5.41.0 loaded — branch/trim ledger rewinds are now instant: the checkpoint restores immediately and the delta re-derives as bounded background passes (resumable if interrupted) instead of one blocking scribe call with a sticky toast; old checkpoints are thinned geometrically rather than dropped, so deep branches rewind from a nearby snapshot instead of triggering a full rebuild. — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot. Flags now record where the error lives (snippet vs source); auto-fix only rewrites snippet-level ones (aligning the snippet to its source, so no drift loop), leaving source-level errors for the copilot to fix at the message. Editing an already-summarized message now auto-re-checks just that snippet (debounced), so a fixed message realigns its snippet on its own. NEW: an in-app Continuity panel (flag list with per-flag Apply/Dismiss, Re-check All / Apply All buttons, enable/auto-fix/nudge toggles, and prompt editors).');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
