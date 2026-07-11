@@ -28,7 +28,7 @@ function extractTopLevel(name) {
 
 const names = ['_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
-    'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges',
+    'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
     'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering'];
 
 const body = names.map(extractTopLevel).join('\n\n');
@@ -48,7 +48,7 @@ return {
   __setChat:     (v)=>{ __chat = v; },
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
-  subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges,
+  subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
   normalizeContinuityOutput, _continuitySig, mergeContinuityFlags, reconcileSnippetFlags, _findSnippetByTurnRange, _findSnippetsCovering,
 };
 `;
@@ -387,6 +387,23 @@ section('_pickCheckpoint — nearest snapshot at/before target');
     eq(L._pickCheckpoint(cks, -1), null, 'nothing at/before a negative target');
     eq(L._pickCheckpoint([], 10), null, 'empty list -> null');
     eq(L._pickCheckpoint([{ atTurn: 10 }, { atTurn: 2 }, { atTurn: 7 }], 8).atTurn, 7, 'unsorted list handled');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+section('_selectStorageEvictions — bounded checkpoint/backup footprint');
+{
+    const E = (key, bytes, at) => ({ key, bytes, at });
+    eq(L._selectStorageEvictions([E('a',100,1),E('b',100,2)], 500).length, 0, 'under budget -> evict nothing');
+    eq(JSON.stringify(L._selectStorageEvictions([E('old',300,1),E('mid',300,2),E('new',300,3)], 600)), JSON.stringify(['old']), 'oldest evicted first, stops at budget');
+    eq(JSON.stringify(L._selectStorageEvictions([E('old',300,1),E('mid',300,2),E('new',300,3)], 300)), JSON.stringify(['old','mid']), 'evicts as many as needed');
+    eq(JSON.stringify(L._selectStorageEvictions([E('nots',200,0),E('dated',200,5)], 250)), JSON.stringify(['nots']), 'missing timestamp counts as oldest');
+    eq(L._selectStorageEvictions([], 100).length, 0, 'empty -> empty');
+    // never evicts more than necessary: after eviction the survivors fit
+    const mix = [E('a',400,4),E('b',400,1),E('c',400,3),E('d',400,2)];
+    const gone = new Set(L._selectStorageEvictions(mix, 900));
+    const left = mix.filter(e => !gone.has(e.key)).reduce((n,e)=>n+e.bytes,0);
+    ok(left <= 900 && left + 400 > 900, 'evicts exactly enough (survivors fit; one fewer eviction would not)');
+    ok(gone.has('b') && gone.has('d'), 'the two oldest were the ones evicted');
 }
 
 // ─────────────────────────────────────────────────────────────────────

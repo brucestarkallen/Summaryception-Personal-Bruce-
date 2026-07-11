@@ -78,7 +78,7 @@ export async function sendSummarizerRequest(settings, systemPrompt, userPrompt) 
 
     switch (source) {
         case 'profile':
-            return await sendViaProfile(settings.connectionProfileId, systemPrompt, userPrompt);
+            return await sendViaProfile(settings.connectionProfileId, systemPrompt, userPrompt, settings.debugMode);
         case 'ollama':
             return await sendViaOllama(settings.ollamaUrl, settings.ollamaModel, systemPrompt, userPrompt);
         case 'openai':
@@ -160,7 +160,7 @@ async function sendViaDefault(systemPrompt, userPrompt, responseLength) {
  * the second argument causes the entire object to be stuffed into the message
  * content field, resulting in "Invalid input" / validation errors from the API.
  */
-async function sendViaProfile(profileId, systemPrompt, userPrompt) {
+async function sendViaProfile(profileId, systemPrompt, userPrompt, debug) {
     if (!profileId) {
         throw new ConnectionError(
             'No Connection Profile selected. Please select one in Summaryception settings.',
@@ -200,8 +200,8 @@ async function sendViaProfile(profileId, systemPrompt, userPrompt) {
             ignoreInstruct: true,
         });
 
-        // Debug: log what we actually got back
-        console.log('[Summaryception][Connection] Profile sendRequest returned:', typeof raw, raw);
+        // Debug: log what we actually got back (gated — this dumped the ENTIRE model response to console on every single profile call)
+        if (debug) console.log('[Summaryception][Connection] Profile sendRequest returned:', typeof raw, raw);
 
         // Handle various possible return types
         let result;
