@@ -413,6 +413,17 @@ section('_selectStorageEvictions — bounded checkpoint/backup footprint');
     eq(JSON.stringify(L._selectStorageEvictions([E('old',300,1),E('mid',300,2),E('new',300,3)], 600)), JSON.stringify(['old']), 'oldest evicted first, stops at budget');
     eq(JSON.stringify(L._selectStorageEvictions([E('old',300,1),E('mid',300,2),E('new',300,3)], 300)), JSON.stringify(['old','mid']), 'evicts as many as needed');
     eq(JSON.stringify(L._selectStorageEvictions([E('nots',200,0),E('dated',200,5)], 250)), JSON.stringify(['nots']), 'missing timestamp counts as oldest');
+    // per-group protection: an idle chat's newest snapshots survive pressure from active chats
+    const G = (key, bytes, at, group) => ({ key, bytes, at, group });
+    const idle = [G('i1',100,1,'chatA'),G('i2',100,2,'chatA'),G('i3',100,3,'chatA')];
+    const busy = [G('b1',100,10,'chatB'),G('b2',100,11,'chatB'),G('b3',100,12,'chatB'),G('b4',100,13,'chatB')];
+    const evicted = new Set(L._selectStorageEvictions([...idle, ...busy], 400, 2));
+    ok(!evicted.has('i2') && !evicted.has('i3'), 'idle chat keeps its 2 newest snapshots despite being globally oldest');
+    ok(evicted.has('i1'), 'idle chat\'s excess-beyond-floor is still evictable');
+    ok(!evicted.has('b3') && !evicted.has('b4'), 'busy chat keeps its 2 newest too');
+    // floor can force staying over budget — protection wins over budget
+    const tight = L._selectStorageEvictions([...idle, ...busy], 100, 2);
+    ok(!tight.includes('i2') && !tight.includes('i3') && !tight.includes('b3') && !tight.includes('b4'), 'protected entries never evicted even when budget cannot be met');
     eq(L._selectStorageEvictions([], 100).length, 0, 'empty -> empty');
     // never evicts more than necessary: after eviction the survivors fit
     const mix = [E('a',400,4),E('b',400,1),E('c',400,3),E('d',400,2)];

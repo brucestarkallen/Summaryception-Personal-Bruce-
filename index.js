@@ -591,16 +591,34 @@ function _pruneBackups() {
 // Pure: which localStorage entries to evict to get under budget. entries are
 // [{key, bytes, at}]; evicts OLDEST-first (missing timestamps count as oldest)
 // until total <= budgetBytes. Returns the keys to remove.
-function _selectStorageEvictions(entries, budgetBytes) {
+function _selectStorageEvictions(entries, budgetBytes, protectPerGroup) {
     const out = [];
     if (!Array.isArray(entries) || entries.length === 0) return out;
     let total = 0;
     for (const e of entries) total += (e && typeof e.bytes === 'number') ? e.bytes : 0;
     if (total <= budgetBytes) return out;
+    // Protect the newest `protectPerGroup` entries of every group (= chat sig):
+    // pure oldest-first eviction across ALL chats strips any chat not touched
+    // today completely bare, forcing a from-scratch rebuild the moment you return.
+    const exempt = new Set();
+    const per = Math.max(0, protectPerGroup | 0);
+    if (per > 0) {
+        const byGroup = new Map();
+        for (const e of entries) {
+            if (!e || !e.key) continue;
+            const g = e.group || '';
+            if (!byGroup.has(g)) byGroup.set(g, []);
+            byGroup.get(g).push(e);
+        }
+        for (const list of byGroup.values()) {
+            list.sort((a, b) => ((b.at) || 0) - ((a.at) || 0));   // newest first
+            for (let i = 0; i < Math.min(per, list.length); i++) exempt.add(list[i].key);
+        }
+    }
     const sorted = entries.slice().sort((a, b) => ((a && a.at) || 0) - ((b && b.at) || 0));
     for (const e of sorted) {
         if (total <= budgetBytes) break;
-        if (!e || !e.key) continue;
+        if (!e || !e.key || exempt.has(e.key)) continue;
         out.push(e.key);
         total -= (typeof e.bytes === 'number') ? e.bytes : 0;
     }
@@ -623,9 +641,12 @@ function gcLocalStorageBudget() {
             const v = localStorage.getItem(k) || '';
             let at = 0;
             try { const p = JSON.parse(v) || {}; at = p.savedAt || p.at || 0; } catch (_) {}
-            entries.push({ key: k, bytes: k.length + v.length, at });
+            // group = everything up to the last '::' (i.e. prefix + chat signature),
+            // so per-group protection means per-chat protection.
+            const cut = k.lastIndexOf('::');
+            entries.push({ key: k, bytes: k.length + v.length, at, group: cut > 0 ? k.slice(0, cut) : k });
         }
-        const evict = _selectStorageEvictions(entries, _SC_STORAGE_BUDGET);
+        const evict = _selectStorageEvictions(entries, _SC_STORAGE_BUDGET, 4);
         for (const k of evict) { try { localStorage.removeItem(k); } catch (_) {} }
         if (evict.length > 0) log(`Storage GC: evicted ${evict.length} old checkpoint/backup entr${evict.length === 1 ? 'y' : 'ies'} to stay under budget.`);
         return evict.length;
@@ -2114,17 +2135,34 @@ async function tryAutoRewindLedger(targetTurn, label) {
             // chunk. Nothing is deleted before its replacement exists.
             _ledgerQueue = [];
             _ledgerGen++;                  // invalidate any in-flight job — it saw the pre-trim timeline
-            cur.ledgerStaging = {};
-            cur.ledgerLiveIdx = -1;        // tracks STAGING progress until the swap
-            _lastCkptTurn = -1;            // re-arm checkpointing (staging snapshots) from zero
-            const jobs = queueLedgerRebuild(targetTurn);
-            cur.ledgerRebuild = jobs > 0 ? { target: targetTurn, staging: true, attempts: 0 } : null;   // persisted: resumes at reopen
-            if (jobs === 0) cur.ledgerStaging = null;
+            // RESUME, don't restart: if a staged rebuild is already underway, its
+            // completed chunks (through ledgerLiveIdx) are valid for a tail trim —
+            // deleting messages ABOVE the pointer changes nothing below it. Blowing
+            // all progress away on every deletion made active editing restart the
+            // whole history from turn 0, over and over.
+            const _resumable = !!(cur.ledgerRebuild && cur.ledgerRebuild.staging
+                && cur.ledgerStaging && typeof cur.ledgerStaging === 'object'
+                && typeof cur.ledgerLiveIdx === 'number' && cur.ledgerLiveIdx >= 0
+                && cur.ledgerLiveIdx < targetTurn);
+            let jobs = 0;
+            if (_resumable) {
+                jobs = queueLedgerReplay(cur.ledgerLiveIdx, targetTurn, { staging: true });
+                cur.ledgerRebuild = { target: targetTurn, staging: true, attempts: cur.ledgerRebuild.attempts | 0 };
+            } else {
+                cur.ledgerStaging = {};
+                cur.ledgerLiveIdx = -1;        // tracks STAGING progress until the swap
+                _lastCkptTurn = -1;            // re-arm checkpointing (staging snapshots) from zero
+                jobs = queueLedgerRebuild(targetTurn);
+                cur.ledgerRebuild = jobs > 0 ? { target: targetTurn, staging: true, attempts: 0 } : null;   // persisted: resumes at reopen
+                if (jobs === 0) cur.ledgerStaging = null;
+            }
             await saveChatStore();
             try { updateInjection(true); renderLedger(); } catch (_) {}
             toastr.info(
                 jobs > 0
-                    ? `No ledger snapshot exists that far back — rebuilding a fresh one for this ${label} in ${jobs} background pass${jobs === 1 ? '' : 'es'}. Your current ledger entries stay live until the rebuild lands. Keep playing.`
+                    ? (_resumable
+                        ? `Ledger rebuild adjusted for this ${label} — continuing from turn ${cur.ledgerLiveIdx} (${jobs} background pass${jobs === 1 ? '' : 'es'} left). Your current ledger entries stay live until it lands.`
+                        : `No ledger snapshot exists that far back — rebuilding a fresh one for this ${label} in ${jobs} background pass${jobs === 1 ? '' : 'es'}. Your current ledger entries stay live until the rebuild lands. Keep playing.`)
                     : `Nothing to rebuild for this ${label} — the live pass covers the remaining turns.`,
                 'Summaryception', { timeOut: 6500 });
             return true;
@@ -2143,6 +2181,7 @@ async function tryAutoRewindLedger(targetTurn, label) {
         const queued = (ckpt.atTurn < targetTurn) ? queueLedgerReplay(ckpt.atTurn, targetTurn) : 0;
         if (queued === 0) { store.ledgerLiveIdx = targetTurn; _lastCkptTurn = targetTurn; }
         store.ledgerRebuild = queued > 0 ? { target: targetTurn } : null;   // persisted: an app-kill mid-replay resumes at reopen
+        store.ledgerStaging = null;   // a checkpoint restore supersedes any half-finished staged rebuild
         await saveChatStore();
         try { updateInjection(true); renderLedger(); } catch (_) {}
         toastr.success(
@@ -6164,7 +6203,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.46.0 loaded — STAGED LEDGER REBUILDS: when a branch/trim needs a rebuild, the existing ledger now keeps serving injection UNTOUCHED while the clean rebuild accumulates in a separate staging area, and the swap happens atomically only at completion — nothing is deleted before its replacement exists, a failure or app-kill keeps the old ledger, and resume continues from the last finished chunk. A failed chunk now halts the pipeline instead of letting later chunks advance the pointer past the hole (that silent turn-skipping is where drifting Now entries came from), failed rounds are counted on the persisted marker, and after 5 the auto-resume STOPS with a clear warning instead of retry-looping forever. Staging chunks read/write only the staging ledger (checkpoints included), so a contaminated old ledger can never bleed into the rebuilt one. Prior (5.45): DATA-LOSS FIX: the auto-rewind no longer wipes the ledger on chats without summarized history (that pre-live-ledger shortcut destroyed live-built ledgers on reopen whenever a repair fired — e.g. the mobile save race that leaves ledgerLiveIdx one past a shorter chat); the clear now applies ONLY when rewinding to the literal start of a chat, and everything else goes through checkpoint restore / background rebuild like any other chat. Also: rebuilds and replays persist a catch-up marker in chat metadata, so killing the app mid-catch-up RESUMES at reopen from the last finished chunk instead of stranding a half-empty ledger; and a live pass facing a huge pointer gap now routes through bounded chunks instead of one monster prompt. Prior (5.44): no more foreground full-rebuilds: when a trim/branch lands below the oldest surviving checkpoint, the ledger now rebuilds through the SAME invisible, resumable background queue as a normal rewind (assistant-turn batches, snapshots saved along the way so the situation cannot recur for that region) instead of the busy-locked whole-history backfill; and checkpoint lookups now union across the chat\'s recent content signatures (remembered in chat metadata, which survives greeting edits / head deletions and is copied into branches) — editing message 0 no longer orphans every snapshot the chat ever saved. Prior (5.43): hardening release: a ledger GENERATION guard now discards any scribe job still in flight when the ledger is rewound, trimmed, or a message is deleted (the epoch only covered chat switches, so a stale job could merge deltas from deleted turns into a freshly-restored ledger and push the live pointer past the chat end); branch/repair toasts and logs now name exactly WHICH condition triggered them ([summaryOverruns/snippetOverruns/verbatimGhosted/ledgerAhead]) so misfires are diagnosable from a screenshot; a startup storage GC keeps the total checkpoint+backup footprint bounded (quota exhaustion silently broke checkpoint saves — the exact thing that makes branch rewinds cheap); and the profile connection path no longer dumps the full model response to console on every call unless debugMode is on. Prior (5.42): deep-audit release: per-call abort controllers (Abort now stops the RIGHT call even with background passes in flight), the 120s watchdog no longer leaks zombie timers/unhandled rejections, batch summaries skip the redundant ledger scribe when the live pass already covered those turns (one full LLM call saved per batch), live-off installs now checkpoint from batch jobs (branch rewind no longer full-rebuilds for them), ALL unhide paths (Clear Memory, branch repair, orphan heal) use contiguous range calls — one chat save per run instead of one per message, pending edit-rechecks and continuity jobs are cleared on chat switch (no more cross-chat snippet contamination), the backlog dialog can no longer stack copies of itself, passages keep each speaker\'s NAME (group scenes stop being anonymous "Assistant:" lines), and snippet boundaries survive into the gist/injection/promotion prompts instead of collapsing into a run-on. Prior (5.41): branch/trim ledger rewinds are instant: the checkpoint restores immediately and the delta re-derives as bounded background passes (resumable if interrupted) instead of one blocking scribe call with a sticky toast; old checkpoints are thinned geometrically rather than dropped, so deep branches rewind from a nearby snapshot instead of triggering a full rebuild. — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot. Flags now record where the error lives (snippet vs source); auto-fix only rewrites snippet-level ones (aligning the snippet to its source, so no drift loop), leaving source-level errors for the copilot to fix at the message. Editing an already-summarized message now auto-re-checks just that snippet (debounced), so a fixed message realigns its snippet on its own. NEW: an in-app Continuity panel (flag list with per-flag Apply/Dismiss, Re-check All / Apply All buttons, enable/auto-fix/nudge toggles, and prompt editors).');
+            console.log(LOG_PREFIX, 'Summaryception v5.47.0 loaded — REBUILDS RESUME, NEVER RESTART: deleting messages during a staged rebuild now keeps every completed chunk and continues from the pointer (a tail trim invalidates nothing below it) instead of resetting to turn 0 on every deletion; and the startup storage GC now protects the newest 4 snapshots of EVERY chat from eviction — global oldest-first pruning was stripping any chat you hadn\'t touched today completely bare, which is what kept forcing from-scratch rebuilds on return. Prior (5.46): STAGED LEDGER REBUILDS: when a branch/trim needs a rebuild, the existing ledger now keeps serving injection UNTOUCHED while the clean rebuild accumulates in a separate staging area, and the swap happens atomically only at completion — nothing is deleted before its replacement exists, a failure or app-kill keeps the old ledger, and resume continues from the last finished chunk. A failed chunk now halts the pipeline instead of letting later chunks advance the pointer past the hole (that silent turn-skipping is where drifting Now entries came from), failed rounds are counted on the persisted marker, and after 5 the auto-resume STOPS with a clear warning instead of retry-looping forever. Staging chunks read/write only the staging ledger (checkpoints included), so a contaminated old ledger can never bleed into the rebuilt one. Prior (5.45): DATA-LOSS FIX: the auto-rewind no longer wipes the ledger on chats without summarized history (that pre-live-ledger shortcut destroyed live-built ledgers on reopen whenever a repair fired — e.g. the mobile save race that leaves ledgerLiveIdx one past a shorter chat); the clear now applies ONLY when rewinding to the literal start of a chat, and everything else goes through checkpoint restore / background rebuild like any other chat. Also: rebuilds and replays persist a catch-up marker in chat metadata, so killing the app mid-catch-up RESUMES at reopen from the last finished chunk instead of stranding a half-empty ledger; and a live pass facing a huge pointer gap now routes through bounded chunks instead of one monster prompt. Prior (5.44): no more foreground full-rebuilds: when a trim/branch lands below the oldest surviving checkpoint, the ledger now rebuilds through the SAME invisible, resumable background queue as a normal rewind (assistant-turn batches, snapshots saved along the way so the situation cannot recur for that region) instead of the busy-locked whole-history backfill; and checkpoint lookups now union across the chat\'s recent content signatures (remembered in chat metadata, which survives greeting edits / head deletions and is copied into branches) — editing message 0 no longer orphans every snapshot the chat ever saved. Prior (5.43): hardening release: a ledger GENERATION guard now discards any scribe job still in flight when the ledger is rewound, trimmed, or a message is deleted (the epoch only covered chat switches, so a stale job could merge deltas from deleted turns into a freshly-restored ledger and push the live pointer past the chat end); branch/repair toasts and logs now name exactly WHICH condition triggered them ([summaryOverruns/snippetOverruns/verbatimGhosted/ledgerAhead]) so misfires are diagnosable from a screenshot; a startup storage GC keeps the total checkpoint+backup footprint bounded (quota exhaustion silently broke checkpoint saves — the exact thing that makes branch rewinds cheap); and the profile connection path no longer dumps the full model response to console on every call unless debugMode is on. Prior (5.42): deep-audit release: per-call abort controllers (Abort now stops the RIGHT call even with background passes in flight), the 120s watchdog no longer leaks zombie timers/unhandled rejections, batch summaries skip the redundant ledger scribe when the live pass already covered those turns (one full LLM call saved per batch), live-off installs now checkpoint from batch jobs (branch rewind no longer full-rebuilds for them), ALL unhide paths (Clear Memory, branch repair, orphan heal) use contiguous range calls — one chat save per run instead of one per message, pending edit-rechecks and continuity jobs are cleared on chat switch (no more cross-chat snippet contamination), the backlog dialog can no longer stack copies of itself, passages keep each speaker\'s NAME (group scenes stop being anonymous "Assistant:" lines), and snippet boundaries survive into the gist/injection/promotion prompts instead of collapsing into a run-on. Prior (5.41): branch/trim ledger rewinds are instant: the checkpoint restores immediately and the delta re-derives as bounded background passes (resumable if interrupted) instead of one blocking scribe call with a sticky toast; old checkpoints are thinned geometrically rather than dropped, so deep branches rewind from a nearby snapshot instead of triggering a full rebuild. — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot. Flags now record where the error lives (snippet vs source); auto-fix only rewrites snippet-level ones (aligning the snippet to its source, so no drift loop), leaving source-level errors for the copilot to fix at the message. Editing an already-summarized message now auto-re-checks just that snippet (debounced), so a fixed message realigns its snippet on its own. NEW: an in-app Continuity panel (flag list with per-flag Apply/Dismiss, Re-check All / Apply All buttons, enable/auto-fix/nudge toggles, and prompt editors).');
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
