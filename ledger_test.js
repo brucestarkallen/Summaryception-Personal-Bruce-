@@ -759,6 +759,25 @@ section('missing-core detection + establish-order');
     ok(many.includes('(+2 more)') && !many.includes(' I,') && !many.includes('J.'), 'notice caps at 8 names');
 }
 
+// ─── dense checkpoint retention: delete-one cost = only the turns after it ───
+section('every-turn checkpoints — retention shape');
+{
+    // Every ledgered turn 1..40 saved a checkpoint; retention keeps 16 recent dense + sparse anchors.
+    const turns = Array.from({ length: 40 }, (_, i) => i + 1);
+    const keeps = L._selectCheckpointKeeps(turns, 16, 25);
+    for (let t2 = 25; t2 <= 40; t2++) ok(keeps.has(t2), `dense window: turn ${t2} has an exact restore point`);
+    ok(keeps.has(25), 'sparse anchor at 25 retained for deep rewinds');
+    ok(!keeps.has(12) || keeps.size <= 18, 'mid-history non-anchor turns pruned (storage capped)');
+    // The practical claim: deleting message at turn N in the dense window finds a
+    // checkpoint at exactly N-1 — replay = head - N turns only, zero cadence tax.
+    const head = 40;
+    for (const delAt of [40, 38, 30, 26]) {
+        const target = delAt - 1;
+        const nearest = Math.max(...[...keeps].filter(x => x <= target));
+        ok(nearest === target, `delete at ${delAt}: nearest checkpoint is exactly ${target} (replay ${head - delAt} turn(s), was up to ${head - delAt + 4} with cadence 5)`);
+    }
+}
+
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);
 if (fail > 0) { console.log('\nFAILURES:'); fails.forEach(f => console.log('  - ' + f)); process.exit(1); }

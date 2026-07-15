@@ -1994,8 +1994,8 @@ function maybeQueueLiveLedger() {
 // and re-derive the remaining delta as bounded BACKGROUND scribe jobs — no blocking
 // foreground call, no sticky toast, no full rebuild.
 const _CKPT_PREFIX = 'sc_ledgerckpt::';
-const CKPT_EVERY = 5;    // snapshot cadence in turns
-const CKPT_KEEP = 16;    // dense recent snapshots kept per chat (covers ~80 recent turns)
+const CKPT_EVERY = 1;    // snapshot EVERY ledgered turn: retention (dense recent + sparse anchors) caps storage at the same count, and a nearest-neighbor checkpoint means deleting one message replays ONLY the turns after it — never a cadence tax of unrelated turns before it
+const CKPT_KEEP = 16;    // dense recent snapshots kept per chat (with every-turn cadence: the last 16 turns each have an exact restore point)
 const CKPT_SPARSE_EVERY = 25;   // beyond the dense window, keep one snapshot per this many turns — a deep branch rewinds from a nearby old checkpoint instead of forcing a full rebuild
 let _lastCkptTurn = -999;
 
@@ -2114,10 +2114,15 @@ function _pickCheckpoint(list, targetTurn) {
 
 function maybeCheckpointLedger(ledgerOverride) {
     try {
-        const idx = getChatStore().ledgerLiveIdx;
+        const st = getChatStore();
+        const idx = st.ledgerLiveIdx;
         if (typeof idx !== 'number' || idx < 0) return;
-        if (idx < _lastCkptTurn + CKPT_EVERY) return;   // throttle by cadence
-        _lastCkptTurn = idx;
+        // Per-chat cursor (in the chat store, not module state): a module-global
+        // cursor leaked across chats — after a long chat, a shorter chat's turns
+        // never exceeded the stale cursor and checkpointing silently stopped.
+        const last = (typeof st._ckptLast === 'number') ? st._ckptLast : -999;
+        if (idx < last + CKPT_EVERY) return;   // throttle by cadence (and skip same-turn repeats)
+        st._ckptLast = idx;
         saveLedgerCheckpoint(idx, ledgerOverride);
     } catch (_) {}
 }
