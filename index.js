@@ -1976,6 +1976,17 @@ async function auditLedgerEntries(opts = {}) {
         const { chat } = SillyTavern.getContext();
         if (!Array.isArray(chat) || chat.length === 0) return false;
 
+        // Freshness outranks hygiene: if any story is still un-ingested, let the live
+        // pass have the channel and audit in the next quiet moment (the retry handles
+        // it — no user action, no lost audit). Skipped when the live pass is off, or
+        // the pointer could lag forever and the audit would never run.
+        if (s.ledgerLiveUpdate !== false) {
+            try {
+                const _turns = getAssistantTurns(chat);
+                if (_turns.length && _computeLiveLedgerRange(store.summarizedUpTo, store.ledgerLiveIdx, _turns[_turns.length - 1].index)) return 'busy';
+            } catch (_) {}
+        }
+
         // Injected characters first — the ones whose errors are reaching the
         // storyteller this very turn.
         let injected = [];
@@ -2004,6 +2015,11 @@ async function auditLedgerEntries(opts = {}) {
         _auditActive = true;
         const startEpoch = _chatEpoch;
         const startGen = _ledgerGen;
+        // Snapshot each target's revision: a correction is computed against the entry
+        // as it was READ. If anything re-shapes that entry while the audit thinks, the
+        // correction is stale — drop it rather than overwrite newer truth with older.
+        const seenRev = new Map();
+        for (const n of targets) { const k = resolveLedgerKey(ledger, n); seenRev.set(k, (ledger[k] && ledger[k].updatedAt) || 0); }
         if (manual) toastr.info(`Auditing ${targets.length} character entr${targets.length === 1 ? 'y' : 'ies'} against the story — corrections land automatically.`, 'Summaryception', { timeOut: 3500 });
         let deltas = null;
         try {
@@ -2032,9 +2048,16 @@ async function auditLedgerEntries(opts = {}) {
         const inScope = deltas.filter(d => d && typeof d.name === 'string' && scope.has(resolveLedgerKey(ledger, d.name.trim()).toLowerCase()));
         const dropped = deltas.length - inScope.length;
         if (dropped > 0) log(`Ledger audit: ignored ${dropped} correction(s) for characters outside this run.`);
+        const fresh = inScope.filter(d => {
+            const k = resolveLedgerKey(ledger, String(d.name).trim());
+            const rev = (ledger[k] && ledger[k].updatedAt) || 0;
+            return !seenRev.has(k) || seenRev.get(k) === rev;
+        });
+        const stale = inScope.length - fresh.length;
+        if (stale > 0) log(`Ledger audit: dropped ${stale} correction(s) for entries re-shaped mid-audit — they will be re-checked next cycle.`);
 
         const liveIdx = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : undefined;
-        const changed = inScope.length ? mergeLedgerDeltas(inScope, undefined, liveIdx) : 0;
+        const changed = fresh.length ? mergeLedgerDeltas(fresh, undefined, liveIdx) : 0;
 
         // Stamp every audited entry (changed or not) so the round-robin advances and
         // the same characters are not re-checked forever.
@@ -2045,7 +2068,7 @@ async function auditLedgerEntries(opts = {}) {
         if (changed > 0) { updateInjection(true); try { renderLedger(); } catch (_) {} }
         log(`Ledger audit: checked ${targets.join(', ')} — corrected ${changed}.`);
         if (changed > 0) {
-            toastr.success(`Ledger audit corrected ${changed} entr${changed === 1 ? 'y' : 'ies'} (${inScope.map(d => d.name).join(', ')}) — claims the story does not support were removed.`, 'Summaryception', { timeOut: 6000 });
+            toastr.success(`Ledger audit corrected ${changed} entr${changed === 1 ? 'y' : 'ies'} (${fresh.map(d => d.name).join(', ')}) — claims the story does not support were removed.`, 'Summaryception', { timeOut: 6000 });
         } else if (manual) {
             toastr.success(`Audited ${targets.join(', ')} — every claim is supported by the story.`, 'Summaryception', { timeOut: 4000 });
         }
@@ -2201,7 +2224,7 @@ function queueLiveLedgerUpdate(opts = {}) {
         const manual = !!opts.manual;
         const s = getSettings();
         if (!s.ledgerEnabled || s.ledgerLiveUpdate === false) return false;
-        if (isSummarizing || _ledgerActive || _ledgerQueue.length > 0) return 'busy';
+        if (isSummarizing || _ledgerActive || _auditActive || _ledgerQueue.length > 0) return 'busy';
         const { chat } = SillyTavern.getContext();
         if (!Array.isArray(chat) || chat.length === 0) return false;
         const store = getChatStore();
@@ -2694,6 +2717,11 @@ function _noteLiveFailure(job, reason) {
 
 async function processLedgerQueue() {
     if (_ledgerActive) return;
+    // The scribe channel is EXCLUSIVE. callSummarizer snapshots ST's prompt toggles,
+    // disables them, and restores on finish — two concurrent calls interleave those
+    // snapshots and leave the user's toggles permanently wrong (and fight for rate
+    // limit). Jobs stay queued and run the instant the audit releases the channel.
+    if (_auditActive) { setTimeout(() => { processLedgerQueue(); }, 2000); return; }
     _ledgerActive = true;
     try {
         while (_ledgerQueue.length > 0) {

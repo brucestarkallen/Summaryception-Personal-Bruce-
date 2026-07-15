@@ -908,6 +908,16 @@ ok(SRC_FULL.includes('INFERENCE HARDENED INTO FACT'), 'audit prompt: inference-a
 ok(SRC_FULL.includes('LEAVE IT ALONE'), 'audit prompt: unjudgeable claims are left alone');
 ok(SRC_FULL.includes('maybeAuditLedger();'), 'audit: wired into the per-turn cadence');
 
+// ─── audit must never cost speed or safety ───
+section('audit concurrency: exclusive scribe channel, freshness first');
+ok(SRC_FULL.includes("if (_auditActive) { setTimeout(() => { processLedgerQueue(); }, 2000); return; }"), 'scribe queue defers while an audit holds the channel (jobs kept, not dropped)');
+ok(SRC_FULL.includes("if (isSummarizing || _ledgerActive || _auditActive || _ledgerQueue.length > 0) return 'busy';"), 'live pass treats an active audit as busy — no concurrent callSummarizer');
+ok(SRC_FULL.includes("if (_turns.length && _computeLiveLedgerRange(store.summarizedUpTo, store.ledgerLiveIdx, _turns[_turns.length - 1].index)) return 'busy';"), 'audit yields: never runs while story is un-ingested');
+ok(SRC_FULL.includes("if (s.ledgerLiveUpdate !== false) {"), 'yield skipped when the live pass is off (pointer would lag forever)');
+ok(SRC_FULL.includes('const seenRev = new Map();'), 'audit snapshots each entry revision before thinking');
+ok(SRC_FULL.includes('seenRev.get(k) === rev;'), 'stale corrections dropped — newer state never clobbered by an older audit');
+ok(SRC_FULL.includes('mergeLedgerDeltas(fresh, undefined, liveIdx)'), 'only fresh corrections merge');
+
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);
 if (fail > 0) { console.log('\nFAILURES:'); fails.forEach(f => console.log('  - ' + f)); process.exit(1); }
