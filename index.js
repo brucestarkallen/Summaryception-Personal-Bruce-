@@ -1948,7 +1948,7 @@ function queueLiveLedgerUpdate() {
     try {
         const s = getSettings();
         if (!s.ledgerEnabled || s.ledgerLiveUpdate === false) return false;
-        if (isSummarizing || _ledgerActive || _ledgerQueue.length > 0) return false;
+        if (isSummarizing || _ledgerActive || _ledgerQueue.length > 0) return 'busy';
         const { chat } = SillyTavern.getContext();
         if (!Array.isArray(chat) || chat.length === 0) return false;
         const store = getChatStore();
@@ -1976,12 +1976,33 @@ function queueLiveLedgerUpdate() {
 
 // Cadence gate: called once per assistant turn. Resets the counter only when a live
 // pass is actually queued, so a skipped (busy) turn is retried rather than dropped.
+// Busy self-retry: the live pass fires right after maybeSummarizeTurns in the same
+// callback, so on cadence turns the summarizer is ALWAYS running and the pass was
+// skipped with nothing retrying until the user's next action — the ledger lagged a
+// full turn and the freshest scene's characters were missing. A skipped-busy pass
+// now retries itself every few seconds until the coast is clear.
+let _liveRetryTimer = null;
+let _liveRetryLeft = 0;
+function _clearLiveRetry() { if (_liveRetryTimer) { clearTimeout(_liveRetryTimer); _liveRetryTimer = null; } _liveRetryLeft = 0; }
+function _armLiveRetry() {
+    if (_liveRetryTimer) return;                    // one pending retry at a time
+    if (_liveRetryLeft <= 0) _liveRetryLeft = 8;    // fresh burst: up to ~32s of patience
+    _liveRetryTimer = setTimeout(() => {
+        _liveRetryTimer = null;
+        const r = queueLiveLedgerUpdate();
+        if (r === true) { _turnsSinceLive = 0; _liveRetryLeft = 0; return; }
+        if (r === 'busy' && --_liveRetryLeft > 0) _armLiveRetry();
+    }, 4000);
+}
+
 function maybeQueueLiveLedger() {
     const s = getSettings();
     if (!s.ledgerEnabled || s.ledgerLiveUpdate === false) return;
     _turnsSinceLive++;
     if (_turnsSinceLive < Math.max(1, s.ledgerLiveEveryTurns ?? 1)) return;
-    if (queueLiveLedgerUpdate()) _turnsSinceLive = 0;
+    const r = queueLiveLedgerUpdate();
+    if (r === true) { _turnsSinceLive = 0; _clearLiveRetry(); }
+    else if (r === 'busy') _armLiveRetry();
 }
 
 // ─── Ledger checkpoints + smart rewind (branch / bulk-trim) ──────────
@@ -4119,6 +4140,7 @@ function onMessageReceived(messageIndex) {
 function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
+    _clearLiveRetry();
     try { const { chat } = SillyTavern.getContext(); _prevChatLen = Array.isArray(chat) ? chat.length : -1; } catch (_) { _prevChatLen = -1; }
     // Kickstart: a chat with a live ledger but ZERO saved snapshots (backfill-built
     // long ago, or a victim of the pre-v5.51 global-cursor bug that silently
@@ -5502,6 +5524,15 @@ function bindUIEvents() {
         updateInjection(true);
         renderLedger();
         toastr.success('Character ledger cleared for this chat. Old snapshots retired — rebuilt ones start a fresh era.', 'Summaryception', { timeOut: 3500 });
+    });
+
+    $(document).on('click', '#sc_ledger_now', function () {
+        const s = getSettings();
+        if (!s.ledgerEnabled) { toastr.info('Enable the Character Ledger first.', 'Summaryception', { timeOut: 3000 }); return; }
+        const r = queueLiveLedgerUpdate();
+        if (r === true) toastr.info('Reading the latest turn(s) into the ledger…', 'Summaryception', { timeOut: 3000 });
+        else if (r === 'busy') { _armLiveRetry(); toastr.info('Busy right now — the update will run automatically the moment current work finishes.', 'Summaryception', { timeOut: 3500 }); }
+        else toastr.success('Ledger is already current with the latest turn.', 'Summaryception', { timeOut: 2500 });
     });
 
     // ── Backfill / Maintenance ──

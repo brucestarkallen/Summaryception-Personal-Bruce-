@@ -802,6 +802,16 @@ ok(SRC_FULL.includes("mergeLedgerDeltas(deltas, undefined, b.endIdx)"), 'backfil
 ok(SRC_FULL.includes("sn.turnRange[1] === 'number') ? sn.turnRange[1] : undefined"), 'snippet path: merges stamped with scene end turn');
 ok(SRC_FULL.includes('head snapshot: the very next edit/deletion restores instantly'), 'backfill completion: explicit head checkpoint');
 
+// ─── live-pass busy retry + manual update ───
+section('live pass: busy self-retry + Update now (source contracts)');
+ok(SRC_FULL.includes("return 'busy';"), 'live pass: busy is a distinct tri-state, not a silent false');
+ok(SRC_FULL.includes("else if (r === 'busy') _armLiveRetry();"), 'cadence gate: busy skips arm a self-retry');
+ok(SRC_FULL.includes("if (r === 'busy' && --_liveRetryLeft > 0) _armLiveRetry();"), 'retry: re-arms while busy, bounded attempts');
+ok(SRC_FULL.includes("_clearLiveRetry();\n    try { const { chat } = SillyTavern.getContext(); _prevChatLen"), 'retry: cleared on chat change');
+ok(SRC_FULL.includes("#sc_ledger_now"), 'Update-now button wired');
+const H = require('fs').readFileSync(__dirname + '/settings.html', 'utf8');
+ok(H.includes('id="sc_ledger_now"'), 'Update-now button present in settings UI');
+
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);
 if (fail > 0) { console.log('\nFAILURES:'); fails.forEach(f => console.log('  - ' + f)); process.exit(1); }
