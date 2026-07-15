@@ -1997,7 +1997,6 @@ const _CKPT_PREFIX = 'sc_ledgerckpt::';
 const CKPT_EVERY = 1;    // snapshot EVERY ledgered turn: retention (dense recent + sparse anchors) caps storage at the same count, and a nearest-neighbor checkpoint means deleting one message replays ONLY the turns after it — never a cadence tax of unrelated turns before it
 const CKPT_KEEP = 16;    // dense recent snapshots kept per chat (with every-turn cadence: the last 16 turns each have an exact restore point)
 const CKPT_SPARSE_EVERY = 25;   // beyond the dense window, keep one snapshot per this many turns — a deep branch rewinds from a nearby old checkpoint instead of forcing a full rebuild
-let _lastCkptTurn = -999;
 
 function _chatSig() {
     try {
@@ -2207,6 +2206,22 @@ function _ledgerDroppingPast(ledger, maxTurn) {
     return out;
 }
 
+// Pure: synthesize a restore point from entry stamps when no saved snapshot
+// covers the ceiling. Entries carry the turn that last shaped them (_t), so
+// "current ledger minus everything shaped past the ceiling" IS a valid snapshot
+// AT the ceiling. Requires stamping to be active (>=1 stamped entry pre-drop) —
+// an all-legacy ledger has no lineage to trust, so synthesis declines and the
+// caller falls back to a staged rebuild. Unstamped entries in a stamp-active
+// ledger are kept (same policy as serving decontamination: cannot judge them;
+// the replay refreshes any character who appears).
+function _synthesizeCheckpoint(ledger, ceil) {
+    if (!ledger || typeof ledger !== 'object' || typeof ceil !== 'number' || !isFinite(ceil) || ceil < 0) return null;
+    let stamped = 0;
+    for (const v of Object.values(ledger)) if (v && typeof v._t === 'number') stamped++;
+    if (stamped === 0) return null;
+    return { atTurn: Math.floor(ceil), ledger: _ledgerDroppingPast(ledger, Math.floor(ceil)), synthetic: true };
+}
+
 // Pure: what should a content change at `idx` do to the ledger?
 //   'ignore' — not yet ledgered (idx past the live pointer) or feature off: the live
 //              pass will ingest the final text anyway.
@@ -2251,7 +2266,7 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
             return true;
         }
         const _ckptCeil = (typeof maxCkptTurn === 'number' && isFinite(maxCkptTurn)) ? Math.min(targetTurn, maxCkptTurn) : targetTurn;
-        const ckpt = _pickCheckpoint(listLedgerCheckpoints(), _ckptCeil);
+        let ckpt = _pickCheckpoint(listLedgerCheckpoints(), _ckptCeil);
         if (!ckpt) {
             // No snapshot at/below the target. Re-derivation from history is the only
             // remaining source of truth — but it does NOT need to be the heavyweight
@@ -2266,6 +2281,15 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
             // lies past the target — they were earned on the abandoned timeline and
             // would contaminate every injection until the swap. (Unstamped legacy
             // entries stay; the swap replaces everything anyway.)
+            // Better than a full rebuild: if stamping is active, SYNTHESIZE the missing
+            // snapshot from the stamps and take the normal restore path — replaying
+            // only the owed tail. Old facts about dropped characters re-enter from the
+            // layer summaries in the replay context; the missing-core self-heal
+            // re-anchors anyone left coreless.
+            const synth = _synthesizeCheckpoint(cur.ledger, _ckptCeil);
+            if (synth) {
+                ckpt = synth;
+            } else {
             const _dropped = Object.keys(cur.ledger).length;
             cur.ledger = _ledgerDroppingPast(cur.ledger, targetTurn);
             const _droppedN = _dropped - Object.keys(cur.ledger).length;
@@ -2293,7 +2317,7 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
             } else {
                 cur.ledgerStaging = {};
                 cur.ledgerLiveIdx = -1;        // tracks STAGING progress until the swap
-                _lastCkptTurn = -1;            // re-arm checkpointing (staging snapshots) from zero
+                cur._ckptLast = -1;            // re-arm checkpointing (staging snapshots) from zero — per-chat cursor since v5.51
                 jobs = queueLedgerRebuild(targetTurn);
                 cur.ledgerRebuild = jobs > 0 ? { target: targetTurn, staging: true, attempts: 0 } : null;   // persisted: resumes at reopen
                 if (jobs === 0) cur.ledgerStaging = null;
@@ -2308,27 +2332,28 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
                     : `Nothing to rebuild for this ${label} — the live pass covers the remaining turns.`,
                 'Summaryception', { timeOut: 6500 });
             return true;
+            }
         }
         const store = getChatStore();
         _ledgerQueue = [];   // drop pending background jobs — we're rewriting the ledger
         _ledgerGen++;        // and invalidate any job already IN FLIGHT: its deltas were computed against the pre-rewind ledger/timeline
         store.ledger = JSON.parse(JSON.stringify(ckpt.ledger || {}));
         store.ledgerLiveIdx = ckpt.atTurn;
-        _lastCkptTurn = ckpt.atTurn;   // re-arm checkpointing from the restore point
+        store._ckptLast = ckpt.atTurn;   // re-arm checkpointing from the restore point — per-chat cursor
         // The restore itself is instant. The delta re-derivation is NOT a foreground
         // concern — summary/injection repair already finished — so it runs as bounded
         // background jobs instead of one blocking scribe call with a sticky toast.
         // liveIdx stays at the checkpoint until each chunk lands, so an interruption
         // (mobile app backgrounded mid-call) resumes from the last finished chunk.
         const queued = (ckpt.atTurn < targetTurn) ? queueLedgerReplay(ckpt.atTurn, targetTurn) : 0;
-        if (queued === 0) { store.ledgerLiveIdx = targetTurn; _lastCkptTurn = targetTurn; }
+        if (queued === 0) { store.ledgerLiveIdx = targetTurn; store._ckptLast = targetTurn; }
         store.ledgerRebuild = queued > 0 ? { target: targetTurn } : null;   // persisted: an app-kill mid-replay resumes at reopen
         store.ledgerStaging = null;   // a checkpoint restore supersedes any half-finished staged rebuild
         await saveChatStore();
         try { updateInjection(true); renderLedger(); } catch (_) {}
         toastr.success(
             queued
-                ? `Ledger restored from the turn-${ckpt.atTurn} checkpoint (${label}) — re-deriving ${targetTurn - ckpt.atTurn} turn(s) in ${queued} background pass${queued === 1 ? '' : 'es'}. Keep playing; it catches up on its own.`
+                ? `Ledger restored from ${ckpt.synthetic ? `a restore point synthesized from entry stamps (turn ${ckpt.atTurn})` : `the turn-${ckpt.atTurn} checkpoint`} (${label}) — re-deriving ${targetTurn - ckpt.atTurn} turn(s) in ${queued} background pass${queued === 1 ? '' : 'es'}. Keep playing; it catches up on its own.`
                 : `Ledger auto-rewound to turn ${targetTurn} from a checkpoint at turn ${ckpt.atTurn} — nothing to re-derive.`,
             'Summaryception', { timeOut: 6000 });
         return true;
@@ -2535,7 +2560,7 @@ async function backfillLedgerFromHistory(opts) {
         } else {
             await saveChatStore();
             store.ledgerLiveIdx = turns.length ? turns[turns.length - 1].index : (typeof store.ledgerLiveIdx === 'number' ? store.ledgerLiveIdx : -1);
-            _lastCkptTurn = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : _bfCkpt;   // align live checkpoint throttle with what we just built
+            store._ckptLast = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : _bfCkpt;   // align live checkpoint throttle with what we just built — per-chat cursor
             updateInjection(true);
             try { renderLedger(); } catch (_) {}
             const nChars = Object.keys(store.ledger).length;
@@ -4088,8 +4113,21 @@ function onMessageReceived(messageIndex) {
 function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
-    _lastCkptTurn = -999;
     try { const { chat } = SillyTavern.getContext(); _prevChatLen = Array.isArray(chat) ? chat.length : -1; } catch (_) { _prevChatLen = -1; }
+    // Kickstart: a chat with a live ledger but ZERO saved snapshots (backfill-built
+    // long ago, or a victim of the pre-v5.51 global-cursor bug that silently
+    // stopped checkpointing) gets one immediately — so the very next edit or
+    // deletion has a restore point instead of falling to synthesis or a rebuild.
+    try {
+        const st0 = getChatStore();
+        if (st0 && typeof st0.ledgerLiveIdx === 'number' && st0.ledgerLiveIdx >= 0
+            && st0.ledger && Object.keys(st0.ledger).length > 0
+            && listLedgerCheckpoints().length === 0) {
+            saveLedgerCheckpoint(st0.ledgerLiveIdx);
+            st0._ckptLast = st0.ledgerLiveIdx;
+            log(`Kickstart: saved first checkpoint at turn ${st0.ledgerLiveIdx} (chat had none).`);
+        }
+    } catch (_) {}
     // Editor + audit state is PER-CHAT. Never let a memory snapshot, pending
     // edits, or queued audits from the previous chat leak into this one —
     // an Undo here with the old chat's snapshot would corrupt this chat's memory.

@@ -26,7 +26,8 @@ function extractTopLevel(name) {
     return lines.slice(start, end).join('\n');
 }
 
-const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
+const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
+const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
     'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering'];
@@ -46,7 +47,7 @@ return {
   __setSettings: (v)=>{ __settings = v; },
   __setStore:    (v)=>{ __store = v; },
   __setChat:     (v)=>{ __chat = v; },
-  stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice,
+  stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice, _synthesizeCheckpoint,
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
@@ -777,6 +778,19 @@ section('every-turn checkpoints — retention shape');
         ok(nearest === target, `delete at ${delAt}: nearest checkpoint is exactly ${target} (replay ${head - delAt} turn(s), was up to ${head - delAt + 4} with cadence 5)`);
     }
 }
+
+// ─── synthesized restore points (no snapshot that far back) ───
+section('checkpoint synthesis from entry stamps');
+{
+    const led = { A: { core: 'x', _t: 20 }, B: { core: 'y', _t: 45 }, C: { core: 'legacy' } };
+    const s1 = L._synthesizeCheckpoint(led, 30);
+    ok(s1 && s1.synthetic === true && s1.atTurn === 30, 'synth: produces a synthetic snapshot at the ceiling');
+    ok('A' in s1.ledger && !('B' in s1.ledger), 'synth: drops entries shaped past the ceiling, keeps earlier ones');
+    ok('C' in s1.ledger, 'synth: unstamped legacy entry kept in a stamp-active ledger');
+    ok(L._synthesizeCheckpoint({ C: { core: 'legacy' } }, 30) === null, 'synth: declines on an all-legacy ledger (no lineage to trust)');
+    ok(L._synthesizeCheckpoint(led, -1) === null && L._synthesizeCheckpoint(null, 5) === null, 'synth: invalid inputs -> null');
+}
+ok(!SRC_FULL.includes('_lastCkptTurn'), 'global checkpoint cursor fully removed (per-chat store cursor everywhere)');
 
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);
