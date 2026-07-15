@@ -812,6 +812,17 @@ ok(SRC_FULL.includes("#sc_ledger_now"), 'Update-now button wired');
 const H = require('fs').readFileSync(__dirname + '/settings.html', 'utf8');
 ok(H.includes('id="sc_ledger_now"'), 'Update-now button present in settings UI');
 
+// ─── Update-now visibility loop (source contracts) ───
+section('manual pass feedback + failure surfacing');
+ok(SRC_FULL.includes("queueLiveLedgerUpdate({ manual: true })"), 'button: passes manual flag');
+ok(SRC_FULL.includes("staging: _staging, manual });"), 'job: carries the manual flag');
+ok(SRC_FULL.includes("refreshed through turn ${job.liveEnd}"), 'manual success: completion toast with turn');
+ok(SRC_FULL.includes("no character changes to record"), 'manual no-change: honest toast');
+ok(SRC_FULL.includes("the pointer stayed put so nothing is skipped"), 'manual failure: surfaced with reason + retry hint');
+ok(SRC_FULL.includes("_liveFailStreak === 3"), 'auto failures: streak breaker reports after 3 in a row');
+ok(SRC_FULL.includes("if (job.live) _liveFailStreak = 0;"), 'streak resets on any successful live pass');
+ok(SRC_FULL.includes("failures will be reported"), 'manual replay path: catch-up announced');
+
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);
 if (fail > 0) { console.log('\nFAILURES:'); fails.forEach(f => console.log('  - ' + f)); process.exit(1); }

@@ -1944,8 +1944,9 @@ function _computeLiveLedgerRange(summarizedUpTo, ledgerLiveIdx, latestIdx) {
 // Queue a live scribe pass over the recent window. Returns true iff a job was
 // pushed. Skips when a batch/backfill is running or the queue is non-empty, so live
 // jobs never pile up or fight the summarization pass — the next turn retries.
-function queueLiveLedgerUpdate() {
+function queueLiveLedgerUpdate(opts = {}) {
     try {
+        const manual = !!opts.manual;
         const s = getSettings();
         if (!s.ledgerEnabled || s.ledgerLiveUpdate === false) return false;
         if (isSummarizing || _ledgerActive || _ledgerQueue.length > 0) return 'busy';
@@ -1963,12 +1964,14 @@ function queueLiveLedgerUpdate() {
             // The gap is far bigger than a normal turn-to-turn window (interrupted
             // rebuild, long-idle pointer): one giant passage would blow the prompt.
             // Same bounded background chunks a rewind uses; liveIdx advances per chunk.
-            return queueLedgerReplay(range[0] - 1, range[1], { staging: _staging }) > 0;
+            const _n = queueLedgerReplay(range[0] - 1, range[1], { staging: _staging });
+            if (manual && _n > 0) toastr.info(`Catching up ${range[1] - range[0] + 1} turn(s) in ${_n} background pass${_n === 1 ? '' : 'es'} — failures will be reported.`, 'Summaryception', { timeOut: 4000 });
+            return _n > 0;
         }
         const storyTxt = buildPassageFromRange(chat, range[0], range[1]);
         if (!storyTxt.trim()) return false;
         const contextStr = buildLedgerContext(range[0], LEDGER_GIST_CAP);   // bounded recent gist (was the whole story every turn)
-        _ledgerQueue.push({ storyTxt, contextStr, epoch: _chatEpoch, gen: _ledgerGen, live: true, liveEnd: range[1], staging: _staging });
+        _ledgerQueue.push({ storyTxt, contextStr, epoch: _chatEpoch, gen: _ledgerGen, live: true, liveEnd: range[1], staging: _staging, manual });
         processLedgerQueue();   // fire and forget
         return true;
     } catch (e) { try { log('queueLiveLedgerUpdate failed (non-fatal):', e); } catch (_) {} return false; }
@@ -2417,6 +2420,26 @@ function _abortCatchupPipeline(reason) {
     } catch (_) {}
 }
 
+// Failure visibility: live passes are deliberately quiet (background bookkeeping),
+// but SILENT failure created an invisible circle — the pointer stays put (hole-free
+// rule), the user taps Update now again, the same span re-reads, fails again, and
+// nothing on screen ever says why. Manual jobs now report their failure directly;
+// automatic jobs report once after 3 consecutive failures instead of circling
+// forever in the dark.
+let _liveFailStreak = 0;
+function _noteLiveFailure(job, reason) {
+    try {
+        _liveFailStreak++;
+        if (job && job.manual) {
+            toastr.warning(`Ledger update failed (${reason}) — the pointer stayed put so nothing is skipped. Tap 🔄 Update now to retry.`, 'Summaryception', { timeOut: 6000 });
+            return;
+        }
+        if (_liveFailStreak === 3) {
+            toastr.warning(`The character ledger has failed to read the latest turn(s) 3 times in a row (${reason}). It keeps retrying on new turns — if this persists, check the model or connection.`, 'Summaryception', { timeOut: 7000 });
+        }
+    } catch (_) {}
+}
+
 async function processLedgerQueue() {
     if (_ledgerActive) return;
     _ledgerActive = true;
@@ -2445,7 +2468,11 @@ async function processLedgerQueue() {
                 if (!deltas) {
                     // Unparseable scribe output on a pointer-advancing chunk: stop the
                     // pipeline HERE rather than skip the hole and drift.
-                    if (job.live && typeof job.liveEnd === 'number') { _abortCatchupPipeline('unparseable scribe output'); continue; }
+                    if (job.live && typeof job.liveEnd === 'number') {
+                        _noteLiveFailure(job, 'unparseable scribe output');
+                        _abortCatchupPipeline('unparseable scribe output');
+                        continue;
+                    }
                     log('Ledger (background): no parseable output — skipped.');
                     continue;
                 }
@@ -2467,17 +2494,21 @@ async function processLedgerQueue() {
                     }
                     maybeCheckpointLedger(job.staging ? _tgt : undefined);
                 }
+                if (job.live) _liveFailStreak = 0;
                 if (changed > 0) {
                     await saveChatStore();
                     updateInjection();
                     try { renderLedger(); } catch (_) { /* panel may be closed */ }
                     log(`Ledger (background): updated ${changed} character entr${changed === 1 ? 'y' : 'ies'}.`);
+                    if (job.manual) toastr.success(`Ledger updated — ${changed} character entr${changed === 1 ? 'y' : 'ies'} refreshed through turn ${job.liveEnd}.`, 'Summaryception', { timeOut: 3500 });
                 } else {
                     log('Ledger (background): no changes to apply.');
                     if (job.live) { try { await saveChatStore(); } catch (_) {} }
+                    if (job.manual) toastr.info(`Ledger read through turn ${job.liveEnd} — no character changes to record.`, 'Summaryception', { timeOut: 3000 });
                 }
             } catch (e) {
                 log('Ledger (background) failed for one batch — ledger unchanged:', e);
+                if (job && job.live) _noteLiveFailure(job, (e && e.message) ? e.message : 'request failed');
                 // Pointer-advancing chunk threw (network/abort): same rule — never
                 // let later chunks hop the hole.
                 if (job.live && typeof job.liveEnd === 'number') _abortCatchupPipeline('request failed');
@@ -5529,9 +5560,9 @@ function bindUIEvents() {
     $(document).on('click', '#sc_ledger_now', function () {
         const s = getSettings();
         if (!s.ledgerEnabled) { toastr.info('Enable the Character Ledger first.', 'Summaryception', { timeOut: 3000 }); return; }
-        const r = queueLiveLedgerUpdate();
-        if (r === true) toastr.info('Reading the latest turn(s) into the ledger…', 'Summaryception', { timeOut: 3000 });
-        else if (r === 'busy') { _armLiveRetry(); toastr.info('Busy right now — the update will run automatically the moment current work finishes.', 'Summaryception', { timeOut: 3500 }); }
+        const r = queueLiveLedgerUpdate({ manual: true });
+        if (r === true) toastr.info('Reading the latest turn(s) into the ledger — you\'ll get a toast when it lands (or if it fails).', 'Summaryception', { timeOut: 3000 });
+        else if (r === 'busy') { _armLiveRetry(); toastr.info('Still working on the previous pass — the update runs the moment it finishes.', 'Summaryception', { timeOut: 3500 }); }
         else toastr.success('Ledger is already current with the latest turn.', 'Summaryception', { timeOut: 2500 });
     });
 
