@@ -910,8 +910,8 @@ ok(SRC_FULL.includes('maybeAuditLedger();'), 'audit: wired into the per-turn cad
 
 // ─── audit must never cost speed or safety ───
 section('audit concurrency: exclusive scribe channel, freshness first');
-ok(SRC_FULL.includes("if (_auditActive) { setTimeout(() => { processLedgerQueue(); }, 2000); return; }"), 'scribe queue defers while an audit holds the channel (jobs kept, not dropped)');
-ok(SRC_FULL.includes("if (isSummarizing || _ledgerActive || _auditActive || _ledgerQueue.length > 0) return 'busy';"), 'live pass treats an active audit as busy — no concurrent callSummarizer');
+ok(SRC_FULL.includes("if (_llmChannelBusy()) { setTimeout(() => { processLedgerQueue(); }, 2000); return; }"), 'scribe queue defers while ANY pass holds the channel (jobs kept, not dropped)');
+ok(/queueLiveLedgerUpdate[\s\S]{0,400}_llmChannelBusy\(\) \|\| _ledgerQueue\.length > 0\) return 'busy';/.test(SRC_FULL), 'live pass yields to ANY pass holding the LLM channel');
 ok(SRC_FULL.includes("if (_turns.length && _computeLiveLedgerRange(store.summarizedUpTo, store.ledgerLiveIdx, _turns[_turns.length - 1].index)) return 'busy';"), 'audit yields: never runs while story is un-ingested');
 ok(SRC_FULL.includes("if (s.ledgerLiveUpdate !== false) {"), 'yield skipped when the live pass is off (pointer would lag forever)');
 ok(SRC_FULL.includes('const seenRev = new Map();'), 'audit snapshots each entry revision before thinking');
@@ -988,6 +988,34 @@ section('ambiguous name tokens — the sibling false-positive');
     ok(JSON.stringify(L._pickEvidenceIndices(chat, 'Jovan Argent', 6, amb)) === '[0]', "evidence: only Jovan's own scenes");
     ok(L._pickEvidenceIndices(chat, 'Claire Argent', 6).length === 2, 'without the ambiguity set the old over-match is reproducible (regression witness)');
 }
+
+// ─── THE gate that was missing: this file must parse as an ES MODULE ───
+// SillyTavern loads index.js as an ES module. `node --check index.js` parses it as
+// CommonJS and silently ACCEPTS duplicate top-level `let` declarations — which is how
+// a redeclared _auditActive shipped in v5.58.0 and left the extension unloadable
+// through v5.60.0. The suite now proves the real parse on every run.
+section('module integrity');
+{
+    const { execFileSync } = require('child_process');
+    const os = require('os');
+    const path = require('path');
+    const tmp = path.join(os.tmpdir(), 'sc_esm_gate_' + process.pid + '.mjs');
+    let esmOk = true, esmErr = '';
+    try {
+        require('fs').writeFileSync(tmp, SRC_FULL);
+        execFileSync(process.execPath, ['--check', tmp], { stdio: 'pipe' });
+    } catch (e) {
+        esmOk = false;
+        esmErr = String((e && e.stderr) || (e && e.message) || '').split('\n').map(x => x.trim()).filter(Boolean).find(x => /Error/.test(x)) || 'parse failed';
+    } finally { try { require('fs').unlinkSync(tmp); } catch (_) {} }
+    ok(esmOk, 'index.js parses as an ES MODULE (the way SillyTavern loads it)' + (esmOk ? '' : ' — ' + esmErr));
+}
+ok(/function _llmChannelBusy\(\)[\s\S]{0,400}isSummarizing \|\| _ledgerActive \|\| _auditActive \|\| _ledgerAuditActive \|\| _continuityActive \|\| _editRecheckActive/.test(SRC_FULL), 'one channel predicate covers every LLM pass');
+ok(!/let _auditActive[\s\S]*let _auditActive/.test(SRC_FULL), 'the sister auditor and the ledger auditor no longer share a flag name');
+ok(SRC_FULL.includes('let _ledgerAuditActive = false;'), 'ledger audit owns a distinct flag');
+ok(/processContinuityQueue\(\) \{\s*\n\s*if \(_continuityActive\) return;\s*\n\s*if \(_llmChannelBusy\(\)\)/.test(SRC_FULL), 'continuity queue joins the exclusive channel');
+ok(/processAuditQueue\(\) \{\s*\n\s*if \(_auditActive\) return;\s*\n\s*if \(_llmChannelBusy\(\)\)/.test(SRC_FULL), 'sister auditor joins the exclusive channel');
+ok(SRC_FULL.includes("if (_chatEpoch !== _epoch) { log('edit-recheck: chat switched — abandoning the remaining snippet(s).'); break; }"), 'edit re-check stops spending LLM calls on a chat that is gone');
 
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);

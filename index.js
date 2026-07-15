@@ -1765,6 +1765,7 @@ function queueAuditDetail(storyTxt, snippetText, contextStr) {
 
 async function processAuditQueue() {
     if (_auditActive) return;
+    if (_llmChannelBusy()) { setTimeout(() => { processAuditQueue(); }, 2000); return; }   // channel held by another pass; jobs stay queued
     _auditActive = true;
     try {
         while (_auditQueue.length > 0) {
@@ -1816,6 +1817,19 @@ let _ledgerGen = 0;      // bumped on rewind/trim/deletion; a scribe job that st
 let _prevChatLen = -1;   // last-known chat length; used to detect deletions precisely
 let _ledgerQueue = [];
 let _ledgerActive = false;
+
+// THE LLM channel is EXCLUSIVE and shared by every background pass: summarizer,
+// ledger scribe, sister/detail auditor, ledger auditor, continuity checker, and the
+// edit re-check. callSummarizer snapshots SillyTavern's prompt toggles, disables
+// them, and restores on finish — two concurrent calls interleave those snapshots and
+// leave the user's toggles permanently wrong, on top of fighting the same rate limit.
+// Each pass used to check an ad-hoc SUBSET of the others' flags: O(n^2) to maintain,
+// and it failed twice (the ledger audit vs the live pass; the continuity re-check vs
+// both). One predicate, one truth — a new pass adds its flag here and every existing
+// pass instantly respects it.
+function _llmChannelBusy() {
+    return isSummarizing || _ledgerActive || _auditActive || _ledgerAuditActive || _continuityActive || _editRecheckActive;
+}
 
 // Compact, human-readable dump of the current ledger for the scribe's context,
 // most-recently-updated first, bounded by a char budget. Uses formatLedgerEntry
@@ -1960,7 +1974,12 @@ async function callLedgerAuditor(evidenceTxt, contextStr, entriesStr) {
     return extractJsonArray(raw);   // [{name, core?, state?, arc?, threads?}] or null
 }
 
-let _auditActive = false;
+// NOT `_auditActive` — that name belongs to the sister/detail auditor (declared far
+// above). v5.58.0 redeclared it here: a duplicate top-level `let`, i.e. a hard
+// SyntaxError under ESM, which is how SillyTavern loads this file. The extension
+// did not load at all from 5.58.0 to 5.60.0. The gate missed it because
+// `node --check index.js` parses as CommonJS; ESM requires a .mjs copy.
+let _ledgerAuditActive = false;
 
 // Returns true (ran), 'busy' (deferred), or false (nothing to do / disabled).
 async function auditLedgerEntries(opts = {}) {
@@ -1969,7 +1988,7 @@ async function auditLedgerEntries(opts = {}) {
         const s = getSettings();
         if (!s.ledgerEnabled) return false;
         if (!manual && s.ledgerAuditEnabled === false) return false;
-        if (isSummarizing || _ledgerActive || _auditActive || _ledgerQueue.length > 0) return 'busy';
+        if (_llmChannelBusy() || _ledgerQueue.length > 0) return 'busy';
         const store = getChatStore();
         const ledger = store.ledger;
         if (!ledger || typeof ledger !== 'object' || Object.keys(ledger).length === 0) return false;
@@ -2014,7 +2033,7 @@ async function auditLedgerEntries(opts = {}) {
         const entriesStr = serializeLedgerForScribe(subLedger, s.ledgerContextMaxChars);
         const contextStr = buildLedgerContext(chat.length, LEDGER_GIST_CAP);
 
-        _auditActive = true;
+        _ledgerAuditActive = true;
         const startEpoch = _chatEpoch;
         const startGen = _ledgerGen;
         // Snapshot each target's revision: a correction is computed against the entry
@@ -2027,7 +2046,7 @@ async function auditLedgerEntries(opts = {}) {
         try {
             deltas = await callLedgerAuditor(evidence, contextStr, entriesStr);
         } finally {
-            _auditActive = false;
+            _ledgerAuditActive = false;
         }
 
         // Same guards as every other flow: a result computed for a timeline that no
@@ -2076,7 +2095,7 @@ async function auditLedgerEntries(opts = {}) {
         }
         return true;
     } catch (e) {
-        _auditActive = false;
+        _ledgerAuditActive = false;
         log('Ledger audit failed (non-fatal):', e);
         if (opts.manual) toastr.warning(`Audit failed (${(e && e.message) ? e.message : e}) — the ledger was left untouched.`, 'Summaryception', { timeOut: 5000 });
         return false;
@@ -2226,7 +2245,7 @@ function queueLiveLedgerUpdate(opts = {}) {
         const manual = !!opts.manual;
         const s = getSettings();
         if (!s.ledgerEnabled || s.ledgerLiveUpdate === false) return false;
-        if (isSummarizing || _ledgerActive || _auditActive || _ledgerQueue.length > 0) return 'busy';
+        if (_llmChannelBusy() || _ledgerQueue.length > 0) return 'busy';
         const { chat } = SillyTavern.getContext();
         if (!Array.isArray(chat) || chat.length === 0) return false;
         const store = getChatStore();
@@ -2723,7 +2742,7 @@ async function processLedgerQueue() {
     // disables them, and restores on finish — two concurrent calls interleave those
     // snapshots and leave the user's toggles permanently wrong (and fight for rate
     // limit). Jobs stay queued and run the instant the audit releases the channel.
-    if (_auditActive) { setTimeout(() => { processLedgerQueue(); }, 2000); return; }
+    if (_llmChannelBusy()) { setTimeout(() => { processLedgerQueue(); }, 2000); return; }
     _ledgerActive = true;
     try {
         while (_ledgerQueue.length > 0) {
@@ -2842,7 +2861,7 @@ async function backfillLedgerFromHistory(opts) {
     const s = getSettings();
     if (!s.ledgerEnabled) { if (!auto) toastr.warning('Enable the Character Ledger first.', 'Summaryception'); return; }
     if (isSummarizing) { if (!auto) toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
-    if (_ledgerActive || _auditActive) { if (!auto) toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
+    if (_llmChannelBusy()) { if (!auto) toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
 
     const store = getChatStore();
     if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
@@ -2926,7 +2945,7 @@ async function runLedgerForSnippet(layerIdx, snippetIdx) {
     const s = getSettings();
     if (!s.ledgerEnabled) { toastr.warning('Enable the Character Ledger first.', 'Summaryception'); return; }
     if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
-    if (_ledgerActive || _auditActive) { toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
+    if (_llmChannelBusy()) { toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
     const store = getChatStore();
     const layer = store.layers[layerIdx];
     if (!layer || !layer[snippetIdx] || !layer[snippetIdx].turnRange) { toastr.error('This snippet has no source turns to read.', 'Summaryception'); return; }
@@ -2958,7 +2977,7 @@ async function backfillAuditsForLayer0() {
     const s = getSettings();
     if (!s.sisterEnabled) { toastr.warning('Enable the Detail Auditor first.', 'Summaryception'); return; }
     if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
-    if (_ledgerActive || _auditActive) { toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
+    if (_llmChannelBusy()) { toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
     const store = getChatStore();
     const l0 = (store.layers && store.layers[0]) ? store.layers[0] : [];
     const targets = [];   // capture snippet OBJECTS, not indices, so a mid-run deletion can't shift us onto the wrong snippet
@@ -3072,6 +3091,7 @@ function queueContinuityCheck(storyTxt, snippetText) {
 
 async function processContinuityQueue() {
     if (_continuityActive) return;
+    if (_llmChannelBusy()) { setTimeout(() => { processContinuityQueue(); }, 2000); return; }   // channel held by another pass; jobs stay queued
     _continuityActive = true;
     try {
         while (_continuityQueue.length > 0) {
@@ -3120,7 +3140,7 @@ async function backfillContinuityForLayer0() {
     const s = getSettings();
     if (!s.continuityEnabled) { toastr.warning('Enable the Continuity Auditor first.', 'Summaryception'); return; }
     if (isSummarizing) { toastr.warning('Busy — try again in a moment.', 'Summaryception'); return; }
-    if (_continuityActive || _ledgerActive || _auditActive) { toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
+    if (_llmChannelBusy()) { toastr.warning('A background pass is finishing — try again in a few seconds.', 'Summaryception'); return; }
     const store = getChatStore();
     const targets = [];   // snippet OBJECTS, so a mid-run deletion can't shift us onto the wrong one
     for (const layer of (store.layers || [])) {
@@ -3344,15 +3364,22 @@ async function flushEditedRecheck() {
     if (_editRecheckActive) return;
     const s = getSettings();
     if (!s.continuityEnabled) { _pendingEditedIdx.clear(); return; }
-    if (isSummarizing || _continuityActive) { clearTimeout(_editRecheckTimer); _editRecheckTimer = setTimeout(flushEditedRecheck, 1500); return; }   // wait for other passes
+    if (_llmChannelBusy()) { clearTimeout(_editRecheckTimer); _editRecheckTimer = setTimeout(flushEditedRecheck, 1500); return; }   // wait for whichever pass holds the channel
     _editRecheckActive = true;
+    const _epoch = _chatEpoch;
     try {
         const store = getChatStore();
         const idxs = Array.from(_pendingEditedIdx); _pendingEditedIdx.clear();
         const seen = new Set(), affected = [];
         for (const idx of idxs) for (const sn of _findSnippetsCovering(store, idx)) { if (!seen.has(sn)) { seen.add(sn); affected.push(sn); } }
         affected.sort((a, b) => a.turnRange[0] - b.turnRange[0]);   // oldest -> newest
-        for (const sn of affected) { try { await recheckSnippet(sn); } catch (e) { log('edit-recheck: one snippet failed:', e); } }
+        for (const sn of affected) {
+            // Each recheck is an LLM call. recheckSnippet's identity check stops a
+            // result from LANDING in the wrong chat, but only after the call is spent —
+            // stop issuing them the moment the chat is gone.
+            if (_chatEpoch !== _epoch) { log('edit-recheck: chat switched — abandoning the remaining snippet(s).'); break; }
+            try { await recheckSnippet(sn); } catch (e) { log('edit-recheck: one snippet failed:', e); }
+        }
         if (affected.length) log(`Continuity: re-checked ${affected.length} snippet(s) after message edit(s).`);
     } finally { _editRecheckActive = false; }
 }
