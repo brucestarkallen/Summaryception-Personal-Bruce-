@@ -1141,6 +1141,12 @@ section('per-character history view');
 }
 ok(SRC_FULL.includes("$(document).on('click', '.sc-ledger-hist'"), 'history toggle is wired to the card button');
 
+ok(/_llmChannelBusy\(\)[\s\S]{0,300}_autoRecallBusy/.test(SRC_FULL), 'verbatim recall is enrolled in the exclusive channel (it calls callSummarizer too)');
+ok(!/let _recallRemaining=0; let _lastRecallText=''; let _autoRecallBusy=false;/.test(SRC_FULL), 'the recall flag no longer sits below the predicate that reads it (TDZ)');
+ok(SRC_FULL.indexOf('let _autoRecallBusy = false;') > 0 && SRC_FULL.indexOf('let _autoRecallBusy = false;') < SRC_FULL.indexOf('function _llmChannelBusy'), 'recall flag is DECLARED BEFORE the predicate that reads it — no temporal dead zone');
+ok(SRC_FULL.includes("if (_llmChannelBusy()) {\n        if (opts.silent) { log('auto-recall: channel busy — skipping this turn.'); return; }"), 'auto-recall skips a busy channel; manual recall explains itself');
+ok(SRC_FULL.includes("if(s.recallAuto && s.enabled && !_llmChannelBusy()){"), 'the auto-recall trigger checks the channel, not just its own flag');
+
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);
 if (fail > 0) { console.log('\nFAILURES:'); fails.forEach(f => console.log('  - ' + f)); process.exit(1); }

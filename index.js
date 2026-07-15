@@ -1817,6 +1817,10 @@ let _ledgerGen = 0;      // bumped on rewind/trim/deletion; a scribe job that st
 let _prevChatLen = -1;   // last-known chat length; used to detect deletions precisely
 let _ledgerQueue = [];
 let _ledgerActive = false;
+// Recall's flag lives up here with the rest of the channel's flags: _llmChannelBusy
+// reads it, and a `let` declared further down the file would be in the temporal dead
+// zone for any early caller.
+let _autoRecallBusy = false;
 
 // THE LLM channel is EXCLUSIVE and shared by every background pass: summarizer,
 // ledger scribe, sister/detail auditor, ledger auditor, continuity checker, and the
@@ -1828,7 +1832,7 @@ let _ledgerActive = false;
 // both). One predicate, one truth — a new pass adds its flag here and every existing
 // pass instantly respects it.
 function _llmChannelBusy() {
-    return isSummarizing || _ledgerActive || _auditActive || _ledgerAuditActive || _continuityActive || _editRecheckActive;
+    return isSummarizing || _ledgerActive || _auditActive || _ledgerAuditActive || _continuityActive || _editRecheckActive || _autoRecallBusy;
 }
 
 // Compact, human-readable dump of the current ledger for the scribe's context,
@@ -5917,7 +5921,7 @@ function buildPinnedBlock() {
 }
 
 // ─── Verbatim Recall ─────────────────────────────────────────────────
-let _recallRemaining=0; let _lastRecallText=''; let _autoRecallBusy=false;
+let _recallRemaining=0; let _lastRecallText='';
 
 function _mergeRanges(ranges, chatLen){
     const cl=ranges.map(([a,b])=>[Math.max(0,a),Math.min(chatLen-1,b)]).filter(([a,b])=>b>=a);
@@ -5935,6 +5939,17 @@ function clearRecall(){
 
 async function runRecall(query, opts = {}){
     query=(query||'').trim(); if(!query){ if(!opts.silent) toastr.warning('Give the recall a query.','Summaryception'); return; }
+    // Recall's selection step is a real callSummarizer call — the SEVENTH pass on the
+    // channel, and the last one that was still gating on a private flag. Auto-recall
+    // fires on GENERATION_ENDED, the same instant the summarizer and ledger scribe
+    // fire, so with recallAuto on it would run a concurrent call and interleave
+    // SillyTavern's prompt-toggle snapshot/restore. Auto simply skips (it re-runs
+    // next turn); a manual /sc-recall says why.
+    if (_llmChannelBusy()) {
+        if (opts.silent) { log('auto-recall: channel busy — skipping this turn.'); return; }
+        toastr.info('A background pass is finishing — try the recall again in a few seconds.','Summaryception',{timeOut:3500});
+        return;
+    }
     const s=getSettings(); const { chat }=SillyTavern.getContext();
     const dump=buildMemoryDump();
     if(!dump.snippets.length){ if(!opts.silent) toastr.info('No memory snippets to recall from yet.','Summaryception'); return; }
@@ -5974,7 +5989,7 @@ function onGenerationEnded(){
     // Auto-recall: background, never blocks. Uses YOUR latest message as the query
     // and stages the recalled scene for your NEXT reply (one-turn continuity window).
     const s=getSettings();
-    if(s.recallAuto && s.enabled && !_autoRecallBusy){
+    if(s.recallAuto && s.enabled && !_llmChannelBusy()){
         const { chat }=SillyTavern.getContext(); let q='';
         for(let i=(chat?.length||0)-1;i>=0;i--){ const m=chat[i]; if(m?.is_user && m.mes?.trim()){ q=m.mes.trim().slice(0,400); break; } }
         if(q.length>10){ _autoRecallBusy=true; runRecall(q,{silent:true}).catch(e=>log('auto-recall failed:',e)).finally(()=>{ _autoRecallBusy=false; }); }
