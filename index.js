@@ -3845,6 +3845,44 @@ function toggleLedgerPin(name) {
 // warm/cold slots up to `cap`. Deduped so nothing is listed twice. `offscreen` already
 // excludes the on-screen full-card cast, so a pinned on-screen character is simply
 // absent here (they are a full card elsewhere) — no conflict, no redundancy.
+// THE selection function — the one answer to "who does the storyteller receive
+// this turn, and how". Used by BOTH the injection builder and the Character
+// Ledger panel, so the panel is a truthful preview of the injection by
+// construction, never a drifting copy.
+//   shown  — full entries injected (on screen, recency-ordered, capped)
+//   roster — identity-line injected this turn (pins first, then rotation)
+//   out    — in the ledger, NOT injected this turn
+function computeLedgerCast(ledger, s, recentLower, pins, rosterTick) {
+    const names = Object.keys(ledger || {});
+    const res = { shown: [], roster: [], out: [] };
+    if (!names.length) return res;
+    const active = [];
+    for (const name of names) {
+        const entry = ledger[name];
+        if (!entry || typeof entry !== 'object') continue;
+        if (recentLower && characterAliases(name).some(a => wordPresentInText(recentLower, a))) {
+            active.push({ name, entry, u: entry.updatedAt || 0 });
+        }
+    }
+    active.sort((a, b) => b.u - a.u);   // most-recently-updated first
+    const maxActive = Math.max(1, s.ledgerMaxActive ?? 6);
+    res.shown = active.slice(0, maxActive);
+    const shownNames = new Set(res.shown.map(a => a.name));
+    if (s.ledgerInjectRoster !== false) {
+        const rosterCap = Math.max(0, s.ledgerRosterMax ?? 12);
+        const offscreen = names
+            .filter(n => !shownNames.has(n))
+            .map(n => ({ name: n, entry: ledger[n], u: (ledger[n] && ledger[n].updatedAt) || 0 }))
+            .filter(o => o.entry && typeof o.entry === 'object')
+            .sort((a, b) => b.u - a.u);
+        const rotate = s.ledgerRosterRotate !== false;
+        res.roster = _composeRoster(offscreen.map(o => o.name), pins, rosterCap, rosterTick, rotate);
+    }
+    const injected = new Set([...shownNames, ...res.roster]);
+    res.out = names.filter(n => !injected.has(n));
+    return res;
+}
+
 function _composeRoster(offscreen, pinnedNames, cap, tick, rotate) {
     if (!Array.isArray(offscreen)) return [];
     const pinnedSet = new Set((pinnedNames || []).map(n => String(n).toLowerCase()));
@@ -3881,18 +3919,9 @@ function buildCharacterBlock() {
     } catch (_) { return ''; }
     if (!recentLower.trim()) return '';
 
-    const active = [];
-    for (const name of names) {
-        const entry = ledger[name];
-        if (!entry || typeof entry !== 'object') continue;
-        if (characterAliases(name).some(a => wordPresentInText(recentLower, a))) {
-            active.push({ name, entry, u: entry.updatedAt || 0 });
-        }
-    }
-    active.sort((a, b) => b.u - a.u);   // most-recently-updated first
-    const maxActive = Math.max(1, s.ledgerMaxActive ?? 6);
+    const cast = computeLedgerCast(ledger, s, recentLower, getLedgerPins(), _rosterTick);
     const capChars = Math.max(80, s.ledgerMaxCharsPerChar ?? 600);
-    const shown = active.slice(0, maxActive);
+    const shown = cast.shown;
     const blocks = shown
         .map(({ name, entry }) => formatLedgerEntry(name, entry, capChars))
         .filter(Boolean);
@@ -3905,16 +3934,8 @@ function buildCharacterBlock() {
     // is what keeps the long-absent professor or classmate a real, returnable person.
     let rosterLine = '';
     if (s.ledgerInjectRoster !== false) {
-        const shownNames = new Set(shown.map(a => a.name));
-        const rosterCap = Math.max(0, s.ledgerRosterMax ?? 12);
-        const offscreen = names
-            .filter(n => !shownNames.has(n))
-            .map(n => ({ name: n, entry: ledger[n], u: (ledger[n] && ledger[n].updatedAt) || 0 }))
-            .filter(o => o.entry && typeof o.entry === 'object')
-            .sort((a, b) => b.u - a.u);
-        const rotate = s.ledgerRosterRotate !== false;
-        const picked = _composeRoster(offscreen.map(o => o.name), getLedgerPins(), rosterCap, _rosterTick, rotate);
-        const entryByName = new Map(offscreen.map(o => [o.name, o.entry]));
+        const picked = cast.roster;
+        const entryByName = new Map(picked.map(n => [n, ledger[n]]));
         const items = picked.map((name) => {
             const entry = entryByName.get(name);
             let core = (entry && typeof entry.core === 'string') ? entry.core.trim().replace(/\s+/g, ' ') : '';
@@ -4607,20 +4628,26 @@ function renderLedger() {
             return;
         }
 
-        // Active-cast detection for the "on screen" badge — same logic as injection.
+        // THE SAME selection the injection uses — not a copy. The panel's contract:
+        // describe exactly what the storyteller receives THIS turn, per character.
+        const s = getSettings();
         let recentLower = '';
         try {
-            const s = getSettings();
             const { chat } = SillyTavern.getContext();
             const windowSize = Math.max(1, s.ledgerActiveWindow ?? 12);
             recentLower = (chat || []).slice(-windowSize)
                 .map(m => (m && typeof m.mes === 'string') ? m.mes : '').join('\n').toLowerCase();
         } catch (_) { /* no chat loaded */ }
-
+        const cast = computeLedgerCast(ledger, s, recentLower, getLedgerPins(), _rosterTick);
+        const statusOf = new Map();
+        cast.shown.forEach(x => statusOf.set(x.name, 'full'));
+        cast.roster.forEach(n => { if (!statusOf.has(n)) statusOf.set(n, 'roster'); });
+        const rank = { full: 0, roster: 1 };
         const entries = names
-            .map(name => ({ name, entry: ledger[name], u: (ledger[name] && ledger[name].updatedAt) || 0 }))
-            .sort((a, b) => b.u - a.u);
+            .map(name => ({ name, entry: ledger[name], u: (ledger[name] && ledger[name].updatedAt) || 0, st: statusOf.get(name) || 'out' }))
+            .sort((a, b) => ((rank[a.st] ?? 2) - (rank[b.st] ?? 2)) || (b.u - a.u));
         _ledgerOrder = entries.map(e => e.name);
+        const _nInj = cast.shown.length + cast.roster.length;
 
         const field = (label, val) => {
             if (val === undefined || val === null || !String(val).trim()) return '';
@@ -4628,10 +4655,14 @@ function renderLedger() {
         };
 
         const _pinnedSet = new Set(getLedgerPins().map(p => String(p).toLowerCase()));
-        let html = '';
-        entries.forEach(({ name, entry }, i) => {
-            const isActive = recentLower && characterAliases(name).some(a => wordPresentInText(recentLower, a));
-            const badge = isActive ? '<span class="sc-ledger-badge">on screen</span>' : '';
+        let html = `<div class="sc-ledger-injsum">💉 Injected this turn: <b>${_nInj}</b> of ${names.length} — ${cast.shown.length} full entr${cast.shown.length === 1 ? 'y' : 'ies'} (on screen) + ${cast.roster.length} roster line${cast.roster.length === 1 ? '' : 's'}.</div>`;
+        entries.forEach(({ name, entry, st }, i) => {
+            // Badge = this turn's injection truth, straight from the shared selector.
+            const badge = st === 'full'
+                ? '<span class="sc-ledger-badge">💉 injected — full entry (on screen)</span>'
+                : st === 'roster'
+                    ? '<span class="sc-ledger-badge sc-ledger-rosterbadge">🔁 injected — roster line</span>'
+                    : '<span class="sc-ledger-badge sc-ledger-outbadge">⏸ not injected this turn</span>';
             const pinned = _pinnedSet.has(name.toLowerCase());
             const pinBadge = pinned ? '<span class="sc-ledger-badge sc-ledger-pinbadge">pinned</span>' : '';
             let threadsHtml = '';

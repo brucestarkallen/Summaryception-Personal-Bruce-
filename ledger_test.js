@@ -27,7 +27,7 @@ function extractTopLevel(name) {
 }
 
 const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
-const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
+const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
     'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering'];
@@ -47,7 +47,7 @@ return {
   __setSettings: (v)=>{ __settings = v; },
   __setStore:    (v)=>{ __store = v; },
   __setChat:     (v)=>{ __chat = v; },
-  stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice, _synthesizeCheckpoint,
+  stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice, _synthesizeCheckpoint, computeLedgerCast,
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
@@ -830,6 +830,31 @@ ok(SRC_FULL.includes("That read was discarded — the chat changed (edit/delete/
 ok(SRC_FULL.includes("if (job.live) _armLiveRetry();"), 'discard: live retry armed — pointer catches up with no tap');
 ok(SRC_FULL.includes("if (D > _li) _genStale = false;"), 'single delete above the live pointer: no gen bump, completed passes survive');
 ok(SRC_FULL.includes("if (_genStale) _ledgerGen++;"), 'gen bump is conditional, not unconditional');
+
+// ─── computeLedgerCast: the single injection-selection truth ───
+section('computeLedgerCast — panel mirrors injection by construction');
+{
+    const mkE = (u) => ({ core: 'x', updatedAt: u });
+    const led = { Jovan: mkE(50), Claire: mkE(40), Stella: mkE(30), Silas: mkE(20), Renn: mkE(10), Emilia: mkE(5) };
+    const s = { ledgerMaxActive: 2, ledgerInjectRoster: true, ledgerRosterMax: 2, ledgerRosterRotate: false };
+    const recent = 'jovan glanced at claire while stella watched'.toLowerCase();
+    const cast = L.computeLedgerCast(led, s, recent, [], 0);
+    ok(cast.shown.length === 2 && cast.shown[0].name === 'Jovan' && cast.shown[1].name === 'Claire', 'on-screen full entries: recency order, capped');
+    ok(cast.roster.length === 2, 'roster: capped slice of the off-screen');
+    ok(cast.roster.includes('Stella'), 'on-screen overflow (Stella, beyond maxActive) falls to the roster line');
+    ok(cast.out.length === 6 - 2 - 2, 'out = everyone not injected this turn');
+    ok(!cast.out.includes('Jovan') && !cast.out.includes('Claire'), 'injected never in out');
+    const pinned = L.computeLedgerCast(led, s, recent, ['Emilia'], 0);
+    ok(pinned.roster.includes('Emilia'), 'pins ride the roster ahead of rotation');
+    const noRoster = L.computeLedgerCast(led, { ...s, ledgerInjectRoster: false }, recent, [], 0);
+    ok(noRoster.roster.length === 0 && noRoster.out.length === 4, 'roster off: only on-screen injected');
+    const empty = L.computeLedgerCast({}, s, recent, [], 0);
+    ok(empty.shown.length === 0 && empty.roster.length === 0 && empty.out.length === 0, 'empty ledger -> empty cast');
+}
+
+ok(SRC_FULL.includes('computeLedgerCast(ledger, s, recentLower, getLedgerPins(), _rosterTick)') && SRC_FULL.split('computeLedgerCast(ledger, s, recentLower, getLedgerPins(), _rosterTick)').length === 3, 'panel and injection call the SAME selector with the same inputs');
+ok(SRC_FULL.includes('Injected this turn:'), 'panel header states the injection count');
+ok(SRC_FULL.includes('not injected this turn'), 'non-injected entries say so explicitly');
 
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);
