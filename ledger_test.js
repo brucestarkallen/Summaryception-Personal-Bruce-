@@ -27,7 +27,7 @@ function extractTopLevel(name) {
 }
 
 const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
-const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
+const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
     'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering'];
@@ -47,7 +47,7 @@ return {
   __setSettings: (v)=>{ __settings = v; },
   __setStore:    (v)=>{ __store = v; },
   __setChat:     (v)=>{ __chat = v; },
-  stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice, _synthesizeCheckpoint, computeLedgerCast,
+  stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice, _synthesizeCheckpoint, computeLedgerCast, _ledgerAuditTargets, _pickEvidenceIndices, buildLedgerAuditEvidence,
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
@@ -807,7 +807,7 @@ section('live pass: busy self-retry + Update now (source contracts)');
 ok(SRC_FULL.includes("return 'busy';"), 'live pass: busy is a distinct tri-state, not a silent false');
 ok(SRC_FULL.includes("else if (r === 'busy') _armLiveRetry();"), 'cadence gate: busy skips arm a self-retry');
 ok(SRC_FULL.includes("if (r === 'busy' && --_liveRetryLeft > 0) _armLiveRetry();"), 'retry: re-arms while busy, bounded attempts');
-ok(SRC_FULL.includes("_clearLiveRetry();\n    try { const { chat } = SillyTavern.getContext(); _prevChatLen"), 'retry: cleared on chat change');
+ok(/_clearLiveRetry\(\);\s*\n\s*_clearAuditRetry\(\);/.test(SRC_FULL), 'retry: live + audit retries both cleared on chat change');
 ok(SRC_FULL.includes("#sc_ledger_now"), 'Update-now button wired');
 const H = require('fs').readFileSync(__dirname + '/settings.html', 'utf8');
 ok(H.includes('id="sc_ledger_now"'), 'Update-now button present in settings UI');
@@ -852,9 +852,61 @@ section('computeLedgerCast — panel mirrors injection by construction');
     ok(empty.shown.length === 0 && empty.roster.length === 0 && empty.out.length === 0, 'empty ledger -> empty cast');
 }
 
-ok(SRC_FULL.includes('computeLedgerCast(ledger, s, recentLower, getLedgerPins(), _rosterTick)') && SRC_FULL.split('computeLedgerCast(ledger, s, recentLower, getLedgerPins(), _rosterTick)').length === 3, 'panel and injection call the SAME selector with the same inputs');
+ok(SRC_FULL.split('computeLedgerCast(ledger, s, recentLower, getLedgerPins(), _rosterTick)').length >= 3, 'panel + injection (+ audit) all call the SAME selector with identical inputs — no duplicated selection logic');
 ok(SRC_FULL.includes('Injected this turn:'), 'panel header states the injection count');
 ok(SRC_FULL.includes('not injected this turn'), 'non-injected entries say so explicitly');
+
+// ─── ledger self-audit ───
+section('ledger self-audit — targets, evidence, scope');
+{
+    const mk = (a) => (a === undefined ? { core: 'x' } : { core: 'x', _a: a });
+    const led = { Jovan: mk(30), Claire: mk(), Stella: mk(10), Silas: mk(25), Renn: mk(5) };
+    const t1 = L._ledgerAuditTargets(led, ['Jovan'], 3);
+    ok(t1[0] === 'Jovan', 'targets: injected characters audited first (their errors are live)');
+    ok(t1[1] === 'Claire', 'targets: never-audited entry next (_a absent = -1)');
+    ok(t1[2] === 'Renn', 'targets: then least-recently-audited');
+    ok(L._ledgerAuditTargets(led, [], 2).length === 2, 'targets: capped per run');
+    ok(L._ledgerAuditTargets({}, [], 4).length === 0, 'targets: empty ledger -> none');
+    const t2 = L._ledgerAuditTargets(led, ['Jovan'], 3);
+    ok(JSON.stringify(t1) === JSON.stringify(t2), 'targets: deterministic for identical input');
+}
+{
+    L.__setSettings({ inputStripTags: ['plot_momentum'], inputStripHeaders: [] });
+    const chat = [
+        { is_user: true, mes: 'I greet Claire at the gate.' },
+        { is_user: false, name: 'Narrator', mes: 'Silas counts coins, alone.' },
+        { is_user: false, name: 'Narrator', mes: 'Claire studies the notice.\n<plot_momentum>PLANNED: Board summons Claire</plot_momentum>' },
+        { is_user: false, name: 'Narrator', mes: 'Rain on the quad.' },
+    ];
+    const ci = L._pickEvidenceIndices(chat, 'Claire', 6);
+    ok(JSON.stringify(ci) === '[0,2]', 'evidence: finds every message featuring the character');
+    ok(JSON.stringify(L._pickEvidenceIndices(chat, 'Claire', 1)) === '[2]', 'evidence: keeps only the most recent K appearances');
+    ok(L._pickEvidenceIndices(chat, 'Emilia', 6).length === 0, 'evidence: absent character -> no appearances');
+
+    const ev = L.buildLedgerAuditEvidence(chat, ['Claire', 'Silas'], 6, 9000);
+    ok(ev.includes('#0 Player: I greet Claire') && ev.includes('#1 Narrator: Silas counts coins'), 'evidence: unions the audited characters\' appearances');
+    ok(ev.indexOf('#0') < ev.indexOf('#1') && ev.indexOf('#1') < ev.indexOf('#2'), 'evidence: chronological order');
+    ok(!ev.includes('PLANNED: Board summons'), 'evidence: planner meta stripped — plans are not events the audit can confirm');
+    ok(!ev.includes('Rain on the quad'), 'evidence: messages without the audited cast excluded');
+
+    // Budget pressure (the cap floors at 500, so exercise it with real-sized messages).
+    const big = [
+        { is_user: false, name: 'N', mes: 'Claire waited. ' + 'a'.repeat(400) },
+        { is_user: false, name: 'N', mes: 'Claire moved. ' + 'b'.repeat(400) },
+    ];
+    const tight = L.buildLedgerAuditEvidence(big, ['Claire'], 6, 500);
+    ok(tight.includes('b'.repeat(400)) && !tight.includes('a'.repeat(400)), 'evidence: under budget pressure the NEWEST evidence wins');
+    ok(L.buildLedgerAuditEvidence(big, ['Claire'], 6, 99999).includes('a'.repeat(400)), 'evidence: with budget, older appearances included too');
+}
+ok(SRC_FULL.includes('const inScope = deltas.filter'), 'audit: corrections outside the audited set are ignored (scope guard)');
+ok(SRC_FULL.includes("ledger[key]._a = stampAt"), 'audit: every audited entry stamped so the round-robin advances');
+ok(SRC_FULL.includes("if (_ledgerGen !== startGen)") && SRC_FULL.includes("if (_chatEpoch !== startEpoch) { log('Ledger audit"), 'audit: epoch + generation guards before landing');
+ok(SRC_FULL.includes('absence is not contradiction'), 'audit prompt: never strips long-standing traits the window merely omits');
+ok(SRC_FULL.includes('KNOWLEDGE THE CHARACTER NEVER RECEIVED'), 'audit prompt: epistemic-leak check');
+ok(SRC_FULL.includes('PLANNED, NOT PLAYED'), 'audit prompt: planned-but-unplayed check');
+ok(SRC_FULL.includes('INFERENCE HARDENED INTO FACT'), 'audit prompt: inference-as-certainty check');
+ok(SRC_FULL.includes('LEAVE IT ALONE'), 'audit prompt: unjudgeable claims are left alone');
+ok(SRC_FULL.includes('maybeAuditLedger();'), 'audit: wired into the per-turn cadence');
 
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);

@@ -106,6 +106,58 @@ const defaultSettings = Object.freeze({
     ledgerRosterMax: 12,           // cap on how many off-screen characters the roster lists at once (most-recently-updated first)
     ledgerRosterRotate: true,      // when the off-screen cast exceeds the cap: keep the most-recent anchored and ROTATE the rest through the remaining slots one step per turn, so a small cap still refreshes everyone over time
     ledgerAutoRewind: true,        // on branch/bulk-trim, auto-rewind the ledger from a periodic checkpoint and re-derive only the small delta, instead of rebuilding from the whole history
+
+    // ── Ledger self-audit ──
+    // Re-DERIVING a misread reproduces it: the scribe reads the same passage the same
+    // way. VERIFYING is different cognition — "does the source support this claim?"
+    // catches the inventions generation produced. This is how the ledger corrects its
+    // own drift without any other extension.
+    ledgerAuditEnabled: true,
+    ledgerAuditEveryTurns: 12,      // auto-audit cadence in assistant turns (0 = manual only)
+    ledgerAuditMaxPerRun: 4,        // characters checked per run — injected first, then least-recently-audited (round-robin)
+    ledgerAuditEvidenceMsgs: 6,     // most recent messages featuring each audited character, used as evidence
+    ledgerAuditEvidenceChars: 9000, // evidence budget per run (newest evidence wins)
+    ledgerAuditSystemPrompt:
+        `You are a continuity AUDITOR for the character ledger of an ongoing work of collaborative fiction. You do not write fiction and you never invent. Your one job: catch claims the ledger records that the STORY ITSELF never supports — the drift that creeps in when a character-scribe infers too much, credits a character with knowledge they never received, or records something that was planned but never played on screen.
+
+You receive ENTRIES UNDER AUDIT (the ledger's current record for a few characters), EVIDENCE (verbatim story text where those characters appear), and PRIOR CONTEXT (compressed established story).
+
+Judge each claim against the evidence, field by field:
+- state and threads describe the character's CURRENT situation and open loose ends, so they must be traceable to the evidence. If a claim describes a specific event, situation, or piece of knowledge the evidence does not show happening, it is UNSUPPORTED — correct the field to what the evidence does support, dropping the unsupported part.
+- core is the character's STABLE nature, built across the whole story. Correct it ONLY if the evidence directly CONTRADICTS it. Never remove a trait merely because this evidence window does not happen to show it — absence is not contradiction.
+- arc is relationship HISTORY. Same rule as core: correct only on direct contradiction, never on absence.
+
+The specific failures you exist to catch:
+- KNOWLEDGE THE CHARACTER NEVER RECEIVED — the entry says they are aware of something the story never showed them witnessing, being told, or plausibly inferring. This is the most damaging error: it makes characters act on information they cannot have.
+- PLANNED, NOT PLAYED — the entry describes an event, notice, meeting, or confrontation that no evidence shows happening on screen. Story plans and author notes are not events.
+- INFERENCE HARDENED INTO FACT — the entry states as certain what the evidence only suggests (a mood read from behavior, a motive guessed at). Correct it to a read ("seems", "reads as"), not a certainty.
+- INVENTED DETAIL — names, places, objects, or history the evidence does not contain.
+
+RULES:
+- If the evidence does not let you JUDGE a claim, LEAVE IT ALONE. You are looking only for claims you can positively show the story does not support. Not seeing something is not the same as disproving it.
+- Correct, do not rewrite. Preserve the entry's wording and every supported detail; change only what fails the audit. Never improve prose, never reorganize, never add.
+- When you correct a field, output the FULL corrected field — it replaces the old one.
+- For threads, output the FULL corrected list: keep every supported thread, drop only the unsupported ones.
+
+OUTPUT — a single JSON array and NOTHING else (no code fence, no prose before or after). One element per character needing a correction, containing ONLY the fields you are correcting:
+{"name":"<exact name>","state":"<corrected>","threads":["<...>"]}
+If every entry under audit is fully supported by the evidence, output exactly: []`,
+    ledgerAuditUserPrompt:
+        `<player_name>{{player_name}}</player_name>
+
+<entries_under_audit>
+{{ledger}}
+</entries_under_audit>
+
+<prior_context>
+{{context_str}}
+</prior_context>
+
+<evidence>
+{{story_txt}}
+</evidence>
+
+Audit the entries under audit against the evidence now. Output ONLY the JSON array.`,
     ledgerInjectTemplate: '\n\n<characters>\nWho these people are and where they stand right now — keep them consistent and in character; do not contradict:\n{{characters}}\n</characters>\n',
     ledgerSystemPrompt:
         `You are the character-continuity mind for an ongoing work of collaborative fiction — part novelist, part psychologist. You maintain a living ledger of the people in the story so a separate storyteller AI, often working many turns later from compressed memory, can keep every character the SAME PERSON — consistent in voice, values, and behavior — while letting them change the way real people do: gradually, believably, and only for reasons the story earned. The failures you exist to prevent are (1) a character acting out of nowhere against who they are (a guarded cynic suddenly gushing; a gentle soul suddenly cruel), and (2) a real, felt emotion vanishing the instant the scene is compressed.
@@ -1831,6 +1883,206 @@ async function callLedgerScribe(storyTxt, contextStr, ledgerStr) {
         quiet: true,   // ledger failures are logged, never shown as summarizer errors
     });
     return extractJsonArray(raw);   // [{name, core?, state?, arc?, threads?}] or null
+}
+
+// ─── Ledger self-audit ────────────────────────────────────────────────
+// Summaryception owns the ledger, so Summaryception must be able to catch its own
+// misreads. Re-deriving cannot: the scribe reads the same passage the same way and
+// reproduces the error. Verification is a different question — "does the source
+// support this claim?" — and it is the only thing that catches drift the scribe
+// itself generated: epistemic leaks, planned-but-unplayed beats, inference hardened
+// into fact, invented detail.
+
+// Pure: who gets audited this run. Injected characters first (they are shaping the
+// story RIGHT NOW, so their errors are live), then least-recently-audited, so the
+// whole cast cycles through over time. `_a` = turn at which an entry was last audited.
+function _ledgerAuditTargets(ledger, injectedNames, maxPerRun) {
+    const names = Object.keys(ledger || {});
+    if (names.length === 0) return [];
+    const inj = new Set(injectedNames || []);
+    return names
+        .map(n => ({
+            n,
+            inj: inj.has(n) ? 0 : 1,
+            a: (ledger[n] && typeof ledger[n]._a === 'number') ? ledger[n]._a : -1,
+        }))
+        .sort((x, y) => (x.inj - y.inj) || (x.a - y.a) || (x.n < y.n ? -1 : 1))
+        .slice(0, Math.max(1, maxPerRun | 0))
+        .map(x => x.n);
+}
+
+// Pure: indices of the most recent messages featuring this character — their actual
+// screen time, which is what their state/threads must be traceable to.
+function _pickEvidenceIndices(chat, name, maxMsgs) {
+    const out = [];
+    if (!Array.isArray(chat) || !name) return out;
+    const aliases = characterAliases(name);
+    for (let i = 0; i < chat.length; i++) {
+        const m = chat[i];
+        if (!m || typeof m.mes !== 'string') continue;
+        const low = m.mes.toLowerCase();
+        if (aliases.some(a => wordPresentInText(low, a))) out.push(i);
+    }
+    return out.slice(-Math.max(1, maxMsgs | 0));
+}
+
+// Pure: the evidence packet — union of the audited characters' recent appearances,
+// meta-stripped (planner blocks are not events), newest-first under the budget, then
+// restored to chronological order so the auditor reads the story as it happened.
+function buildLedgerAuditEvidence(chat, names, maxMsgsPerChar, capChars) {
+    const idxs = new Set();
+    for (const n of (names || [])) for (const i of _pickEvidenceIndices(chat, n, maxMsgsPerChar)) idxs.add(i);
+    const desc = [...idxs].sort((a, b) => b - a);
+    const cap = Math.max(500, capChars | 0);
+    const kept = [];
+    let used = 0;
+    for (const i of desc) {
+        const m = chat[i];
+        const body = stripMetaBlocks(String((m && m.mes) || '').trim());
+        if (!body) continue;
+        const who = (m && m.is_user) ? 'Player' : ((m && m.name && String(m.name).trim()) || 'Assistant');
+        const piece = '#' + i + ' ' + who + ': ' + body;
+        if (used + piece.length > cap) continue;   // newest evidence wins the budget
+        kept.push([i, piece]);
+        used += piece.length + 2;
+    }
+    return kept.sort((a, b) => a[0] - b[0]).map(x => x[1]).join('\n\n');
+}
+
+async function callLedgerAuditor(evidenceTxt, contextStr, entriesStr) {
+    const s = getSettings();
+    const raw = await callSummarizer(evidenceTxt, contextStr, {
+        systemPrompt: s.ledgerAuditSystemPrompt,
+        userPrompt: s.ledgerAuditUserPrompt,
+        ledger: entriesStr,
+        quiet: true,   // audits are background bookkeeping; failures surface via the audit's own reporting
+    });
+    return extractJsonArray(raw);   // [{name, core?, state?, arc?, threads?}] or null
+}
+
+let _auditActive = false;
+
+// Returns true (ran), 'busy' (deferred), or false (nothing to do / disabled).
+async function auditLedgerEntries(opts = {}) {
+    const manual = !!opts.manual;
+    try {
+        const s = getSettings();
+        if (!s.ledgerEnabled) return false;
+        if (!manual && s.ledgerAuditEnabled === false) return false;
+        if (isSummarizing || _ledgerActive || _auditActive || _ledgerQueue.length > 0) return 'busy';
+        const store = getChatStore();
+        const ledger = store.ledger;
+        if (!ledger || typeof ledger !== 'object' || Object.keys(ledger).length === 0) return false;
+        const { chat } = SillyTavern.getContext();
+        if (!Array.isArray(chat) || chat.length === 0) return false;
+
+        // Injected characters first — the ones whose errors are reaching the
+        // storyteller this very turn.
+        let injected = [];
+        try {
+            const windowSize = Math.max(1, s.ledgerActiveWindow ?? 12);
+            const recentLower = chat.slice(-windowSize)
+                .map(m => (m && typeof m.mes === 'string') ? m.mes : '').join('\n').toLowerCase();
+            const cast = computeLedgerCast(ledger, s, recentLower, getLedgerPins(), _rosterTick);
+            injected = cast.shown.map(x => x.name);
+        } catch (_) { injected = []; }
+
+        const targets = _ledgerAuditTargets(ledger, injected, s.ledgerAuditMaxPerRun ?? 4);
+        if (targets.length === 0) return false;
+
+        const evidence = buildLedgerAuditEvidence(chat, targets, s.ledgerAuditEvidenceMsgs ?? 6, s.ledgerAuditEvidenceChars ?? 9000);
+        if (!evidence.trim()) {
+            if (manual) toastr.info('No on-screen evidence found for those characters yet — nothing to audit against.', 'Summaryception', { timeOut: 4000 });
+            return false;
+        }
+
+        const subLedger = {};
+        for (const n of targets) subLedger[n] = ledger[n];
+        const entriesStr = serializeLedgerForScribe(subLedger, s.ledgerContextMaxChars);
+        const contextStr = buildLedgerContext(chat.length, LEDGER_GIST_CAP);
+
+        _auditActive = true;
+        const startEpoch = _chatEpoch;
+        const startGen = _ledgerGen;
+        if (manual) toastr.info(`Auditing ${targets.length} character entr${targets.length === 1 ? 'y' : 'ies'} against the story — corrections land automatically.`, 'Summaryception', { timeOut: 3500 });
+        let deltas = null;
+        try {
+            deltas = await callLedgerAuditor(evidence, contextStr, entriesStr);
+        } finally {
+            _auditActive = false;
+        }
+
+        // Same guards as every other flow: a result computed for a timeline that no
+        // longer exists must never land.
+        if (_chatEpoch !== startEpoch) { log('Ledger audit: chat switched mid-audit — result discarded.'); return false; }
+        if (_ledgerGen !== startGen) {
+            log('Ledger audit: timeline moved mid-audit — result discarded; will re-run on the next cadence.');
+            if (manual) toastr.info('That audit was discarded — the chat changed (edit/delete/swipe) while it ran. Tap 🔍 Audit ledger to re-run.', 'Summaryception', { timeOut: 4500 });
+            return false;
+        }
+        if (!deltas) {
+            log('Ledger audit: no parseable output.');
+            if (manual) toastr.warning('Audit produced no readable result — the ledger was left untouched. Tap 🔍 Audit ledger to retry.', 'Summaryception', { timeOut: 5000 });
+            return false;
+        }
+
+        // Guard: the auditor may only CORRECT entries it was given. A delta naming a
+        // character outside this run is out of scope by construction.
+        const scope = new Set(targets.map(n => String(n).toLowerCase()));
+        const inScope = deltas.filter(d => d && typeof d.name === 'string' && scope.has(resolveLedgerKey(ledger, d.name.trim()).toLowerCase()));
+        const dropped = deltas.length - inScope.length;
+        if (dropped > 0) log(`Ledger audit: ignored ${dropped} correction(s) for characters outside this run.`);
+
+        const liveIdx = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : undefined;
+        const changed = inScope.length ? mergeLedgerDeltas(inScope, undefined, liveIdx) : 0;
+
+        // Stamp every audited entry (changed or not) so the round-robin advances and
+        // the same characters are not re-checked forever.
+        const stampAt = (typeof liveIdx === 'number') ? liveIdx : 0;
+        for (const n of targets) { const key = resolveLedgerKey(ledger, n); if (ledger[key]) ledger[key]._a = stampAt; }
+
+        await saveChatStore();
+        if (changed > 0) { updateInjection(true); try { renderLedger(); } catch (_) {} }
+        log(`Ledger audit: checked ${targets.join(', ')} — corrected ${changed}.`);
+        if (changed > 0) {
+            toastr.success(`Ledger audit corrected ${changed} entr${changed === 1 ? 'y' : 'ies'} (${inScope.map(d => d.name).join(', ')}) — claims the story does not support were removed.`, 'Summaryception', { timeOut: 6000 });
+        } else if (manual) {
+            toastr.success(`Audited ${targets.join(', ')} — every claim is supported by the story.`, 'Summaryception', { timeOut: 4000 });
+        }
+        return true;
+    } catch (e) {
+        _auditActive = false;
+        log('Ledger audit failed (non-fatal):', e);
+        if (opts.manual) toastr.warning(`Audit failed (${(e && e.message) ? e.message : e}) — the ledger was left untouched.`, 'Summaryception', { timeOut: 5000 });
+        return false;
+    }
+}
+
+// Cadence gate + busy deferral, mirroring the live pass: an audit skipped because
+// the summarizer was mid-flight retries itself instead of waiting for a user action.
+let _turnsSinceAudit = 0;
+let _auditRetryTimer = null;
+let _auditRetryLeft = 0;
+function _clearAuditRetry() { if (_auditRetryTimer) { clearTimeout(_auditRetryTimer); _auditRetryTimer = null; } _auditRetryLeft = 0; }
+function _armAuditRetry() {
+    if (_auditRetryTimer) return;
+    if (_auditRetryLeft <= 0) _auditRetryLeft = 10;
+    _auditRetryTimer = setTimeout(async () => {
+        _auditRetryTimer = null;
+        const r = await auditLedgerEntries({});
+        if (r === 'busy' && --_auditRetryLeft > 0) { _armAuditRetry(); return; }
+        _turnsSinceAudit = 0;
+        _auditRetryLeft = 0;
+    }, 6000);
+}
+function maybeAuditLedger() {
+    const s = getSettings();
+    if (!s.ledgerEnabled || s.ledgerAuditEnabled === false) return;
+    const every = Math.max(0, s.ledgerAuditEveryTurns | 0);
+    if (every <= 0) return;   // manual only
+    _turnsSinceAudit++;
+    if (_turnsSinceAudit < every) return;
+    _armAuditRetry();   // deliberately delayed: let the live pass have the turn first
 }
 
 // Case-insensitive key resolution so "mara" and "Mara" don't split into two
@@ -4195,6 +4447,7 @@ function onMessageReceived(messageIndex) {
             setTimeout(async () => {
                 await maybeSummarizeTurns();
                 maybeQueueLiveLedger();   // live ledger: keep recent character states current, independent of summarization cadence
+                maybeAuditLedger();       // ledger self-audit: periodically verify entries against the story and correct drift the scribe generated
                 _rosterTick++;            // advance roster rotation one step per turn
                 updateInjection();
                 updateUI();
@@ -4209,6 +4462,8 @@ function onChatChanged() {
     log('Chat changed.');
     catchupDismissed = false;
     _clearLiveRetry();
+    _clearAuditRetry();
+    _turnsSinceAudit = 0;
     try { const { chat } = SillyTavern.getContext(); _prevChatLen = Array.isArray(chat) ? chat.length : -1; } catch (_) { _prevChatLen = -1; }
     // Kickstart: a chat with a live ledger but ZERO saved snapshots (backfill-built
     // long ago, or a victim of the pre-v5.51 global-cursor bug that silently
@@ -5611,6 +5866,17 @@ function bindUIEvents() {
         if (r === true) toastr.info('Reading the latest turn(s) into the ledger — you\'ll get a toast when it lands (or if it fails).', 'Summaryception', { timeOut: 3000 });
         else if (r === 'busy') { _armLiveRetry(); toastr.info('Still working on the previous pass — the update runs the moment it finishes.', 'Summaryception', { timeOut: 3500 }); }
         else toastr.success('Ledger is already current with the latest turn.', 'Summaryception', { timeOut: 2500 });
+    });
+
+    $(document).on('click', '#sc_ledger_audit', async function () {
+        const s = getSettings();
+        if (!s.ledgerEnabled) { toastr.info('Enable the Character Ledger first.', 'Summaryception', { timeOut: 3000 }); return; }
+        const $b = $(this);
+        $b.prop('disabled', true);
+        try {
+            const r = await auditLedgerEntries({ manual: true });
+            if (r === 'busy') { _armAuditRetry(); toastr.info('Busy right now — the audit runs automatically the moment current work finishes.', 'Summaryception', { timeOut: 3500 }); }
+        } finally { $b.prop('disabled', false); }
     });
 
     // ── Backfill / Maintenance ──
