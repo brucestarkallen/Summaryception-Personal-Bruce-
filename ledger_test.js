@@ -27,7 +27,7 @@ function extractTopLevel(name) {
 }
 
 const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
-const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
+const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
     'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering'];
@@ -47,7 +47,7 @@ return {
   __setSettings: (v)=>{ __settings = v; },
   __setStore:    (v)=>{ __store = v; },
   __setChat:     (v)=>{ __chat = v; },
-  stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice, _synthesizeCheckpoint, computeLedgerCast, _ledgerAuditTargets, _pickEvidenceIndices, buildLedgerAuditEvidence,
+  stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice, _synthesizeCheckpoint, computeLedgerCast, _ledgerAuditTargets, _pickEvidenceIndices, buildLedgerAuditEvidence, _ambiguousTokens,
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
@@ -933,6 +933,60 @@ for (const k of ['ledgerEditRewindDepth', 'ledgerAuditEnabled', 'ledgerAuditEver
     const line = L.formatLedgerEntry('Claire', { core: 'guarded', state: 'waiting', arc: 'a', threads: ['t'], _t: 41, _a: 38, updatedAt: 123 }, 600);
     ok(!line.includes('_t') && !line.includes('_a') && !line.includes('41') && !line.includes('updatedAt'), 'injection text carries no internal stamps (_t/_a/updatedAt)');
     ok(line.startsWith('Claire — Nature: guarded'), 'injection text is the character, nothing else');
+}
+
+// ─── shared surnames: siblings must not mark each other on screen ───
+section('ambiguous name tokens — the sibling false-positive');
+{
+    const cast = ['Jovan Argent', 'Claire Argent', 'Stella Marchetti', 'Silas'];
+    const amb = L._ambiguousTokens(cast);
+    ok(amb.has('argent'), 'shared surname detected as ambiguous');
+    ok(!amb.has('jovan') && !amb.has('claire'), 'distinct given names stay usable');
+    ok(!amb.has('marchetti'), 'unshared surname stays usable');
+    ok(L._ambiguousTokens(['Stella', 'Silas']).size === 0, 'single-token names contribute no ambiguity');
+    ok(L._ambiguousTokens([]).size === 0 && L._ambiguousTokens(null).size === 0, 'empty/null cast -> no ambiguity');
+
+    const cl = L.characterAliases('Claire Argent', amb);
+    ok(cl.includes('Claire Argent') && cl.includes('Claire'), 'full name and given name remain aliases');
+    ok(!cl.includes('Argent'), 'ambiguous surname dropped as a standalone alias');
+    ok(L.characterAliases('Claire Argent').includes('Argent'), 'without an ambiguity set, behaviour is unchanged (backward compatible)');
+    ok(L.characterAliases('Stella Marchetti', amb).includes('Marchetti'), 'unshared surname still matches');
+    ok(JSON.stringify(L.characterAliases('Silas', amb)) === '["Silas"]', 'single-token name unaffected');
+}
+{
+    const led = {
+        'Jovan Argent':  { core: 'a', updatedAt: 3 },
+        'Claire Argent': { core: 'b', updatedAt: 2 },
+        'Stella Marchetti': { core: 'c', updatedAt: 1 },
+    };
+    const s = { ledgerMaxActive: 6, ledgerInjectRoster: true, ledgerRosterMax: 12, ledgerRosterRotate: false };
+    const only = L.computeLedgerCast(led, s, 'jovan argent stepped onto the platform.', [], 0).shown.map(x => x.name);
+    ok(only.includes('Jovan Argent'), 'the sibling who IS on screen is injected');
+    ok(!only.includes('Claire Argent'), 'THE BUG: the absent sibling is no longer marked on screen by a shared surname');
+
+    const byGiven = L.computeLedgerCast(led, s, 'claire studied the notice board.', [], 0).shown.map(x => x.name);
+    ok(byGiven.includes('Claire Argent') && !byGiven.includes('Jovan Argent'), 'each sibling still detected by their own given name');
+
+    const byFull = L.computeLedgerCast(led, s, 'claire argent said nothing.', [], 0).shown.map(x => x.name);
+    ok(byFull.includes('Claire Argent'), 'full name still detects');
+
+    const bySurname = L.computeLedgerCast(led, s, 'marchetti raised a hand.', [], 0).shown.map(x => x.name);
+    ok(bySurname.includes('Stella Marchetti'), 'an UNSHARED surname still detects — the fix is surgical, not blanket');
+
+    const both = L.computeLedgerCast(led, s, 'jovan and claire argued in the hall.', [], 0).shown.map(x => x.name);
+    ok(both.includes('Jovan Argent') && both.includes('Claire Argent'), 'both siblings detected when both are named');
+}
+{
+    // Audit evidence must not treat a sibling's scenes as this character's evidence,
+    // or the auditor would "verify" Claire against text she never appeared in.
+    const chat = [
+        { is_user: false, name: 'N', mes: 'Jovan Argent stepped onto the platform.' },
+        { is_user: false, name: 'N', mes: 'Claire waited by the arch.' },
+    ];
+    const amb = L._ambiguousTokens(['Jovan Argent', 'Claire Argent']);
+    ok(JSON.stringify(L._pickEvidenceIndices(chat, 'Claire Argent', 6, amb)) === '[1]', "evidence: only Claire's own scenes");
+    ok(JSON.stringify(L._pickEvidenceIndices(chat, 'Jovan Argent', 6, amb)) === '[0]', "evidence: only Jovan's own scenes");
+    ok(L._pickEvidenceIndices(chat, 'Claire Argent', 6).length === 2, 'without the ambiguity set the old over-match is reproducible (regression witness)');
 }
 
 console.log('\n────────────────────────────────────────');

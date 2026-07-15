@@ -1913,10 +1913,10 @@ function _ledgerAuditTargets(ledger, injectedNames, maxPerRun) {
 
 // Pure: indices of the most recent messages featuring this character — their actual
 // screen time, which is what their state/threads must be traceable to.
-function _pickEvidenceIndices(chat, name, maxMsgs) {
+function _pickEvidenceIndices(chat, name, maxMsgs, ambiguous) {
     const out = [];
     if (!Array.isArray(chat) || !name) return out;
-    const aliases = characterAliases(name);
+    const aliases = characterAliases(name, ambiguous);
     for (let i = 0; i < chat.length; i++) {
         const m = chat[i];
         if (!m || typeof m.mes !== 'string') continue;
@@ -1929,9 +1929,9 @@ function _pickEvidenceIndices(chat, name, maxMsgs) {
 // Pure: the evidence packet — union of the audited characters' recent appearances,
 // meta-stripped (planner blocks are not events), newest-first under the budget, then
 // restored to chronological order so the auditor reads the story as it happened.
-function buildLedgerAuditEvidence(chat, names, maxMsgsPerChar, capChars) {
+function buildLedgerAuditEvidence(chat, names, maxMsgsPerChar, capChars, ambiguous) {
     const idxs = new Set();
-    for (const n of (names || [])) for (const i of _pickEvidenceIndices(chat, n, maxMsgsPerChar)) idxs.add(i);
+    for (const n of (names || [])) for (const i of _pickEvidenceIndices(chat, n, maxMsgsPerChar, ambiguous)) idxs.add(i);
     const desc = [...idxs].sort((a, b) => b - a);
     const cap = Math.max(500, capChars | 0);
     const kept = [];
@@ -2001,7 +2001,9 @@ async function auditLedgerEntries(opts = {}) {
         const targets = _ledgerAuditTargets(ledger, injected, s.ledgerAuditMaxPerRun ?? 4);
         if (targets.length === 0) return false;
 
-        const evidence = buildLedgerAuditEvidence(chat, targets, s.ledgerAuditEvidenceMsgs ?? 6, s.ledgerAuditEvidenceChars ?? 9000);
+        // Ambiguity is a property of the whole cast, not of this run's subset: Claire
+        // is ambiguous with Jovan even when Jovan is not being audited.
+        const evidence = buildLedgerAuditEvidence(chat, targets, s.ledgerAuditEvidenceMsgs ?? 6, s.ledgerAuditEvidenceChars ?? 9000, _ambiguousTokens(Object.keys(ledger)));
         if (!evidence.trim()) {
             if (manual) toastr.info('No on-screen evidence found for those characters yet — nothing to audit against.', 'Summaryception', { timeOut: 4000 });
             return false;
@@ -4020,7 +4022,32 @@ function _escapeRegex(str) { return String(str).replace(_ESC_RE, '\\$&'); }
 // for "Stella Vermillion". Recall matters more than precision here: a missed
 // on-screen character loses its behavioral anchor (the whole point of the
 // ledger), whereas an occasional off-screen inject is merely a little wasteful.
-function characterAliases(name) {
+// Pure: name tokens that CANNOT identify one character because two or more share
+// them. Siblings are the everyday case: with "Jovan Argent" and "Claire Argent" in
+// the cast, the bare token "Argent" identifies nobody — yet it was an alias for
+// BOTH, so "Jovan Argent stepped onto the platform" marked Claire on screen too:
+// her full entry injected (wasted tokens) and, far worse, the storyteller told a
+// character is present who is not — an invitation to write her into a scene she
+// never entered. A human reader could not resolve a bare "Argent" either; neither
+// should we. Such tokens are dropped as standalone aliases, so those characters are
+// matched only by their full name or their unambiguous given name.
+function _ambiguousTokens(names) {
+    const count = new Map();
+    for (const n of (names || [])) {
+        const parts = String(n || '').trim().split(/\s+/).filter(Boolean);
+        if (parts.length < 2) continue;                 // single-token names contribute no short form
+        const toks = new Set();
+        for (const t of [parts[0], parts[parts.length - 1]]) {
+            if (t && t.length > 2) toks.add(t.toLowerCase());
+        }
+        for (const t of toks) count.set(t, (count.get(t) || 0) + 1);
+    }
+    const amb = new Set();
+    for (const [t, c] of count) if (c > 1) amb.add(t);
+    return amb;
+}
+
+function characterAliases(name, ambiguous) {
     const full = String(name || '').trim();
     if (!full) return [];
     const aliases = [full];
@@ -4030,6 +4057,7 @@ function characterAliases(name) {
         const add = (tok) => {
             if (!tok || tok.length <= 2) return;
             if (tok.toLowerCase() === fullLower) return;
+            if (ambiguous && ambiguous.has(tok.toLowerCase())) return;   // shared with another character — identifies nobody
             if (aliases.some(a => a.toLowerCase() === tok.toLowerCase())) return;
             aliases.push(tok);
         };
@@ -4138,11 +4166,12 @@ function computeLedgerCast(ledger, s, recentLower, pins, rosterTick) {
     const names = Object.keys(ledger || {});
     const res = { shown: [], roster: [], out: [] };
     if (!names.length) return res;
+    const ambiguous = _ambiguousTokens(names);
     const active = [];
     for (const name of names) {
         const entry = ledger[name];
         if (!entry || typeof entry !== 'object') continue;
-        if (recentLower && characterAliases(name).some(a => wordPresentInText(recentLower, a))) {
+        if (recentLower && characterAliases(name, ambiguous).some(a => wordPresentInText(recentLower, a))) {
             active.push({ name, entry, u: entry.updatedAt || 0 });
         }
     }
