@@ -5279,8 +5279,20 @@ function renderLedger() {
             const { chat: _c } = SillyTavern.getContext();
             const _turns = getAssistantTurns(_c || []);
             const _latest = _turns.length ? _turns[_turns.length - 1].index : -1;
-            const _li = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : -1;
-            const _behind = (_latest >= 0 && _li < _latest) ? (_latest - _li) : 0;
+            // Ask the SAME function that decides what to read, instead of reinventing
+            // the rule. Two bugs lived in the reinvention: it ignored summarizedUpTo
+            // (turns at or below it were already read by the summarization pass's own
+            // scribe, so once summarizing ran ahead of the live pointer the panel
+            // screamed about turns that were long since read), and it reported
+            // `latest - pointer`, a MESSAGE-INDEX difference — roughly double the turn
+            // count with alternating user/assistant messages. Both at once produced
+            // "22 turn(s) not read yet" on a ledger that was perfectly current.
+            const _range = _computeLiveLedgerRange(store.summarizedUpTo, store.ledgerLiveIdx, _latest);
+            const _behind = _range ? _turns.filter(t => t.index >= _range[0]).length : 0;
+            const _li = Math.max(
+                (typeof store.summarizedUpTo === 'number') ? store.summarizedUpTo : -1,
+                (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : -1,
+            );
             const _working = _ledgerActive || _ledgerAuditActive || _ledgerQueue.length > 0 || !!_liveRetryTimer;
             freshHtml = _working
                 ? `<div class="sc-ledger-fresh sc-fresh-work">⏳ Reading the story into the ledger${_behind ? ` — ${_behind} turn(s) behind` : ''}… it lands on its own; nothing to tap.</div>`
