@@ -30,7 +30,7 @@ const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
 const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', 'reindexAfterDeletion', '_computeLiveLedgerRange', '_NOTES_SOFT_CAP', '_NOTES_KEEP_TAIL', 'foldLedgerNotes', 'ledgerHistoryFor', '_histOpen', '_historyHtml', 'escapeHtml', 'notesCover', 'ensureLedgerNotes', 'appendLedgerNotes', 'rewindLedgerFromNotes', 'compactLedgerNotes', 'stripLeadingLabel', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_characterWeight', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
-    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits'];
+    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -55,7 +55,7 @@ return {
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
   normalizeContinuityOutput, _continuitySig, mergeContinuityFlags, reconcileSnippetFlags, _findSnippetByTurnRange, _findSnippetsCovering,
-  _baseNotesFromPage, adoptExternalLedgerEdits,
+  _baseNotesFromPage, adoptExternalLedgerEdits, _notesFromDeltas, _swapStagedLedgerIn,
 };
 `;
 const L = new Function(sandbox)();
@@ -816,7 +816,7 @@ section('ledger eras + rebuild stamping (source contracts)');
 ok(SRC_FULL.includes("era: (store.ledgerEra | 0)"), 'save: snapshots stamped with the chat store era');
 ok(SRC_FULL.includes("((v.era | 0) !== (store.ledgerEra | 0))) continue;"), 'list: snapshots from other eras invisible to this chat');
 ok(SRC_FULL.includes("store.ledgerEra = (store.ledgerEra | 0) + 1;"), 'clear: bumps the era (old snapshots retired, branches keep theirs)');
-ok(SRC_FULL.includes("store.ledgerStaging = null;\n        _ledgerQueue = [];\n        _ledgerGen++;") , 'clear: invalidates in-flight jobs and staged rebuilds');
+ok(SRC_FULL.includes("store.ledgerStaging = null;\n        store.ledgerStagingNotes = null;\n        _ledgerQueue = [];\n        _ledgerGen++;") , 'clear: invalidates in-flight jobs and staged rebuilds — staging journal included');
 ok(SRC_FULL.includes("mergeLedgerDeltas(deltas, undefined, b.endIdx)"), 'backfill: merges stamped with chunk end turn');
 ok(SRC_FULL.includes("sn.turnRange[1] === 'number') ? sn.turnRange[1] : undefined"), 'snippet path: merges stamped with scene end turn');
 ok(SRC_FULL.includes('head snapshot: the very next edit/deletion restores instantly'), 'backfill completion: explicit head checkpoint');
@@ -937,6 +937,46 @@ ok(SRC_FULL.includes('INFERENCE HARDENED INTO FACT'), 'audit prompt: inference-a
 ok(SRC_FULL.includes('LEAVE IT ALONE'), 'audit prompt: unjudgeable claims are left alone');
 ok(SRC_FULL.includes('maybeAuditLedger();'), 'audit: wired into the per-turn cadence');
 
+section('audit corrections land at the entry\'s own turn — _t is never falsified');
+{
+    // The old behavior stamped every correction at liveIdx ("now"). _t is what the
+    // roster reads as "last seen (turn N)" and what _ledgerDroppingPast /
+    // _synthesizeCheckpoint judge by — so auditing an off-screen character told the
+    // storyteller they were "last seen" NOW, and a branch below the audit turn
+    // dropped their entire entry despite legitimate older history. Corrections now
+    // merge per-entry at the entry's existing _t (evidence is drawn solely from the
+    // character's own past appearances, so old _t is the temporally honest stamp).
+    const store = {
+        ledgerLiveIdx: 200, ledgerNotesFrom: 0,
+        ledger: { 'Stella': { core: 'sharp, guarded', state: 'left for the capital with unproven intent', arc: 'wary of Jovan', _t: 90, updatedAt: 4 } },
+        ledgerNotes: [ { t: 90, name: 'Stella', at: 4, core: 'sharp, guarded', state: 'left for the capital with unproven intent', arc: 'wary of Jovan' } ],
+    };
+    L.__setStore(store);
+    // Simulate exactly what auditLedgerEntries now does with a correction.
+    const d = { name: 'Stella', state: 'left for the capital' };
+    const k = L.resolveLedgerKey(store.ledger, d.name);
+    const at = (store.ledger[k] && typeof store.ledger[k]._t === 'number') ? store.ledger[k]._t : 200;
+    const changed = L.mergeLedgerDeltas([d], undefined, at);
+    eq(changed, 1, 'the correction lands');
+    eq(store.ledger['Stella']._t, 90, "the entry's last-shaped turn is preserved — the audit is not a story event");
+    ok(store.ledger['Stella'].state === 'left for the capital', 'the corrected content is live');
+    ok(store.ledgerNotes.some(n => n.t === 90 && n.state === 'left for the capital'), 'the correction is journaled AT the entry\'s own turn');
+    const kept = L._ledgerDroppingPast(store.ledger, 150);
+    ok(kept['Stella'] !== undefined, 'a branch below the audit turn KEEPS the entry (old behavior dropped it entirely)');
+    const rewound = L.foldLedgerNotes(store.ledgerNotes, 150);
+    ok(rewound['Stella'] && rewound['Stella'].state === 'left for the capital', 'a fold-rewind below the audit turn keeps the correction (it re-describes turn-90 truth)');
+    // Witness: the old single-batch merge at liveIdx fails all three.
+    const w = { ledgerLiveIdx: 200, ledgerNotesFrom: 0,
+        ledger: { 'Stella': { core: 'sharp, guarded', state: 'left for the capital with unproven intent', _t: 90, updatedAt: 4 } },
+        ledgerNotes: [ { t: 90, name: 'Stella', at: 4, core: 'sharp, guarded', state: 'left for the capital with unproven intent' } ] };
+    L.__setStore(w);
+    L.mergeLedgerDeltas([{ name: 'Stella', state: 'left for the capital' }], undefined, 200);
+    eq(w.ledger['Stella']._t, 200, 'witness: the old stamp claimed an absent character was shaped NOW');
+    ok(L._ledgerDroppingPast(w.ledger, 150)['Stella'] === undefined, 'witness: and a branch to 150 dropped her whole entry');
+}
+ok(/const at = \(ledger\[k\] && typeof ledger\[k\]\._t === 'number'\) \? ledger\[k\]\._t : liveIdx;/.test(SRC_FULL), 'audit: corrections merged per-entry at the entry\'s own _t');
+ok(!SRC_FULL.includes('mergeLedgerDeltas(fresh, undefined, liveIdx)'), 'audit: the batch merge that stamped every correction at "now" is gone');
+
 // ─── audit must never cost speed or safety ───
 section('audit concurrency: exclusive scribe channel, freshness first');
 ok(SRC_FULL.includes("if (_llmChannelBusy()) { setTimeout(() => { processLedgerQueue(); }, 2000); return; }"), 'scribe queue defers while ANY pass holds the channel (jobs kept, not dropped)');
@@ -945,7 +985,7 @@ ok(SRC_FULL.includes("if (_turns.length && _computeLiveLedgerRange(store.summari
 ok(SRC_FULL.includes("if (s.ledgerLiveUpdate !== false) {"), 'yield skipped when the live pass is off (pointer would lag forever)');
 ok(SRC_FULL.includes('const seenRev = new Map();'), 'audit snapshots each entry revision before thinking');
 ok(SRC_FULL.includes('seenRev.get(k) === rev;'), 'stale corrections dropped — newer state never clobbered by an older audit');
-ok(SRC_FULL.includes('mergeLedgerDeltas(fresh, undefined, liveIdx)'), 'only fresh corrections merge');
+ok(SRC_FULL.includes('for (const d of fresh) {'), 'only fresh corrections merge (per-entry, at each entry\'s own turn)');
 
 // ─── deep audit: event coverage + per-chat lifecycle ───
 section('deep audit — event wiring, timer lifecycle, reset coverage');
@@ -1335,43 +1375,104 @@ section('_characterWeight — the ledger knows who matters');
 }
 
 // ─── THE INVARIANT: the page is never staler than its own history ───
-section('page == fold(notes) — the rebuild swap must not clobber live work');
+section('THE SWAP — staged page installs WITH its journal (production-shaped state only)');
 {
-    // Reported: a card read "at the official's mark in the training yard" while its
-    // own history view held turn 133/134 "at the dais, Emilia's right shoulder".
-    // The staged rebuild had finished and assigned its result straight over the page,
-    // wiping every live update made while it ran. The notes survived, so the history
-    // was right and the page was 14 turns behind.
+    // v5.73's test fed the fix a hand-fabricated `ledgerRebuild.upTo` — a field
+    // production NEVER writes (the only fields are target/staging/attempts) — and
+    // hand-simulated the swap. In production the anchor was always -1, so every
+    // old note out-folded the rebuild and the "fix" restored the stale content it
+    // existed to replace. These tests drive the REAL _swapStagedLedgerIn with the
+    // exact state production produces. First: the journaled path.
+    const store = {
+        ledgerLiveIdx: 134, ledgerNotesFrom: 0,
+        ledger: { 'Alaric Sterling': { core: 'formal, institutional', state: 'STALE pre-rebuild state', _t: 100, updatedAt: 1 } },
+        ledgerNotes: [
+            { t: 100, name: 'Alaric Sterling', at: 1, core: 'formal, institutional', state: 'STALE pre-rebuild state' },
+        ],
+        ledgerStaging: { 'Alaric Sterling': { core: 'formal, institutional', state: "at the dais, Emilia's right shoulder", _t: 134, updatedAt: 3 } },
+        ledgerStagingNotes: [
+            { t: 100, name: 'Alaric Sterling', at: 2, core: 'formal, institutional', state: 'at the training yard' },
+            { t: 134, name: 'Alaric Sterling', at: 3, state: "at the dais, Emilia's right shoulder" },
+        ],
+        ledgerRebuild: { target: 134, staging: true },   // the ONLY fields production writes
+    };
+    L.__setStore(store);
+    ok(L._swapStagedLedgerIn(store) === true, 'swap reports success on a non-empty staged page');
+    ok(store.ledger['Alaric Sterling'].state === "at the dais, Emilia's right shoulder", 'the rebuilt truth is live');
+    eq(store.ledgerNotesFrom, 0, 'a journaled rebuild covers from turn 0 — every rewind is an exact fold');
+    ok(store.ledgerStaging === null && store.ledgerStagingNotes === null, 'staging page and journal are consumed by the swap');
+    const folded = L.foldLedgerNotes(store.ledgerNotes, Infinity);
+    ok(JSON.stringify(folded) === JSON.stringify(store.ledger), 'THE INVARIANT: page == fold(notes) immediately after the swap');
+    // The kill shot for the old bug: the first fold AFTER the swap. Deleting one
+    // message refolds the page from the journal — under the old swap that painted
+    // the pre-rebuild ledger straight back. Now the fold IS the rebuilt truth.
+    L.reindexAfterDeletion(store, 120);
+    ok(store.ledger['Alaric Sterling'].state === "at the dais, Emilia's right shoulder", 'KILL SHOT: a post-swap deletion refold keeps the REBUILT state (old swap resurrected the stale one)');
+    // And a branch rewind below the swap point folds the rebuilt timeline, not the abandoned one.
+    ok(L.rewindLedgerFromNotes(110) === true, 'rewind below the swap is an exact fold (journal covers from 0)');
+    ok(store.ledger['Alaric Sterling'].state === 'at the training yard', 'the rewind lands on the REBUILT turn-100 read, not the pre-rebuild note at the same turn');
+}
+{
+    // Witness that the OLD swap fails exactly this scenario: page := staging with
+    // the journal untouched, then one deletion refold.
     const store = {
         ledgerLiveIdx: 134, ledgerNotesFrom: 0,
         ledger: {},
-        ledgerNotes: [
-            { t: 100, name: 'Alaric Sterling', at: 1, core: 'formal, institutional', state: "at the official's mark in the training yard" },
-            { t: 133, name: 'Alaric Sterling', at: 2, state: 'at the dais, knuckles white' },
-            { t: 134, name: 'Alaric Sterling', at: 3, state: "at the dais, Emilia's right shoulder" },
-        ],
-        ledgerStaging: { 'Alaric Sterling': { core: 'formal, institutional', state: "at the official's mark in the training yard", updatedAt: 1 } },
-        ledgerRebuild: { staging: true, upTo: 120 },
+        ledgerNotes: [ { t: 100, name: 'Alaric Sterling', at: 1, state: 'STALE pre-rebuild state' } ],
+        ledgerStaging: { 'Alaric Sterling': { state: 'REBUILT state', _t: 134, updatedAt: 3 } },
     };
-    // Simulate the swap exactly as the code now performs it.
-    const _at = store.ledgerRebuild.upTo;
-    const _newer = store.ledgerNotes.filter(n => n.t > _at);
-    const _base = Object.entries(store.ledgerStaging).map(([nm, e]) => ({ t: _at, name: nm, at: e.updatedAt, base: true, core: e.core, state: e.state }));
-    store.ledgerNotes = _base.concat(_newer);
-    store.ledgerNotesFrom = Math.max(0, _at);
-    store.ledger = L.foldLedgerNotes(store.ledgerNotes, Infinity);
-
-    ok(store.ledger['Alaric Sterling'].state === "at the dais, Emilia's right shoulder", 'THE FIX: live work done DURING the rebuild survives the swap');
-    ok(store.ledger['Alaric Sterling'].core === 'formal, institutional', "and the rebuild's clean history is kept");
-    const folded = L.foldLedgerNotes(store.ledgerNotes, Infinity);
-    ok(JSON.stringify(folded) === JSON.stringify(store.ledger), 'THE INVARIANT: the page equals the fold of its own notes — it can never be staler than its history');
-    ok(store.ledgerNotes.every(n => n.t <= 134), 'no note claims a turn that never happened');
-    // Witness: the old swap simply assigned staging over the page.
-    const clobbered = { 'Alaric Sterling': { state: "at the official's mark in the training yard" } };
-    ok(clobbered['Alaric Sterling'].state !== store.ledger['Alaric Sterling'].state, 'witness: the old blind assignment produced exactly the reported staleness');
+    L.__setStore(store);
+    store.ledger = store.ledgerStaging;   // the old blind assignment
+    store.ledgerStaging = null;
+    // Adoption journals the rebuilt page at tNow — so the first REWIND below tNow
+    // filters that note out and the fold resurrects the pre-rebuild ledger.
+    L.rewindLedgerFromNotes(110);
+    ok(store.ledger['Alaric Sterling'].state === 'STALE pre-rebuild state', 'witness: under the old blind assignment, the first rewind resurrects the pre-rebuild ledger — the rebuild self-undoes');
 }
-ok(SRC_FULL.includes('st.ledger = foldLedgerNotes(st.ledgerNotes, Infinity);'), 'the swap folds instead of assigning');
-ok(!/if \(st\.ledgerRebuild\.staging && st\.ledgerStaging && Object\.keys\(st\.ledgerStaging\)\.length > 0\) st\.ledger = st\.ledgerStaging;/.test(SRC_FULL), 'the blind assignment that clobbered live work is gone');
+{
+    // Fallback path: a rebuild resumed from before the staging journal existed
+    // (ledgerStagingNotes absent). Per-entry base notes at each entry's own _t —
+    // "last seen" survives the swap; folds are exact from the swap point only.
+    const store = {
+        ledgerLiveIdx: 134, ledgerNotesFrom: 0,
+        ledger: {},
+        ledgerNotes: [ { t: 100, name: 'Stella', at: 1, state: 'STALE' } ],
+        ledgerStaging: {
+            'Stella':  { core: 'sharp, guarded', state: 'in the library annex', _t: 90,  updatedAt: 5 },
+            'Honami':  { core: 'gentle mediator', state: 'walking the east yard', _t: 134, updatedAt: 6 },
+        },
+        ledgerRebuild: { target: 134, staging: true },
+    };
+    L.__setStore(store);
+    ok(L._swapStagedLedgerIn(store) === true, 'fallback swap succeeds without a staging journal');
+    eq(store.ledger['Stella']._t, 90, "fallback preserves each entry's own last-shaped turn through the fold (roster \"last seen\" stays true)");
+    eq(store.ledger['Honami']._t, 134, 'and the current character keeps hers');
+    eq(store.ledgerNotesFrom, 134, 'fallback journal is stamps, not history — exact folds start at the swap point');
+    ok(L.rewindLedgerFromNotes(110) === false, 'a rewind below the swap point correctly declines the fold (checkpoints own that region) instead of fabricating history');
+    ok(JSON.stringify(L.foldLedgerNotes(store.ledgerNotes, Infinity)) === JSON.stringify(store.ledger), 'invariant holds on the fallback path too');
+}
+{
+    // v5.74's guarantee THROUGH the swap: a copilot edit made to the LIVE page
+    // while the rebuild ran is adopted and survives, journaled on top.
+    const store = {
+        ledgerLiveIdx: 134, ledgerNotesFrom: 0,
+        ledger: { 'Silas': { core: 'quiet observer', state: 'copilot-corrected: at the gates', _t: 100, updatedAt: 9 } },
+        ledgerNotes: [ { t: 100, name: 'Silas', at: 1, core: 'quiet observer', state: 'in the library' } ],
+        ledgerStaging: { 'Silas': { core: 'quiet observer', state: 'in the library', _t: 100, updatedAt: 2 } },
+        ledgerStagingNotes: [ { t: 100, name: 'Silas', at: 2, core: 'quiet observer', state: 'in the library' } ],
+        ledgerRebuild: { target: 134, staging: true },
+    };
+    L.__setStore(store);
+    L._swapStagedLedgerIn(store);
+    ok(store.ledger['Silas'].state === 'copilot-corrected: at the gates', 'an external live-page edit made during the rebuild survives the swap');
+    ok(store.ledgerNotes.some(n => n.ext && n.state === 'copilot-corrected: at the gates' && n.t <= 134), 'and is journaled (clamped to the swap pointer) so later folds keep it');
+}
+ok(!/ledgerRebuild\.(upTo|endIdx|cursor)/.test(SRC_FULL), 'the dead-field rebase is gone — nothing reads ledgerRebuild.upTo/.endIdx/.cursor (fields nothing ever wrote)');
+ok(!SRC_FULL.includes('_st.ledger = _st.ledgerStaging;'), 'the in-session blind assignment is gone — the swap goes through _swapStagedLedgerIn');
+ok((SRC_FULL.match(/_swapStagedLedgerIn\(/g) || []).length >= 3, 'both swap sites (in-session + reload race) call the one real swap function');
+ok(SRC_FULL.includes('ledgerStagingNotes.push'), 'staging chunks journal their reads as they land');
+ok(/staging branch|Re-base the old journal/.test(SRC_FULL) && SRC_FULL.includes('cur.ledgerNotes = _baseNotesFromPage(cur.ledger, targetTurn);'), 'rebuild start: the old journal is RE-BASED to the serving page, not trimmed — swap-time adoption sees only genuine external edits');
+ok(!SRC_FULL.includes('cur.ledgerNotes = cur.ledgerNotes.filter(n => n && typeof n.t === \'number\' && n.t <= targetTurn);'), 'the bare trim that made the whole stale ledger look like external work is gone');
 ok(!SRC_FULL.includes('a staged rebuild writes its own notes on swap'), 'the comment that claimed a thing the code never did is gone');
 
 
@@ -1489,8 +1590,8 @@ section('_baseNotesFromPage — restarting the journal from a page is exact');
 section('journal hygiene — fallback rewinds cannot leave ghost notes');
 ok(SRC_FULL.includes('_st0.ledgerNotes = [];'), 'turn-0 clear: the journal clears WITH the page (ghosts re-materialized the abandoned ledger)');
 ok(SRC_FULL.includes('store.ledgerNotes = _baseNotesFromPage(store.ledger, ckpt.atTurn);'), 'checkpoint restore: the journal is rebased on the restored page');
-ok(SRC_FULL.includes('if (Array.isArray(cur.ledgerNotes)) cur.ledgerNotes = cur.ledgerNotes.filter(n => n && typeof n.t === \'number\' && n.t <= targetTurn);'), 'staged rebuild entry: ghost notes past the target are trimmed before any mid-rebuild fold can paint them back');
-ok(SRC_FULL.includes('adoptExternalLedgerEdits(st, _at);'), 'rebuild swap: external page edits are adopted before the final fold');
+ok(SRC_FULL.includes('cur.ledgerNotes = _baseNotesFromPage(cur.ledger, targetTurn);') && SRC_FULL.includes('cur.ledgerNotesFrom = targetTurn;'), 'staged rebuild entry: the journal is re-based to the serving page — a mid-rebuild fold reproduces the page by construction, and ghost notes cannot exist to paint back');
+ok(/_swapStagedLedgerIn[\s\S]{0,900}adoptExternalLedgerEdits\(st\);/.test(SRC_FULL), 'rebuild swap: external page edits are adopted before the final fold');
 ok(SRC_FULL.includes('try { adoptExternalLedgerEdits(store); } catch (e)'), 'scribe merge: durable early adoption before new deltas land');
 ok((SRC_FULL.match(/adoptExternalLedgerEdits\(store\);/g) || []).length >= 3, 'rewind, message-deletion refold, and merge all reconcile first');
 ok(SRC_FULL.includes("store.ledgerNotes.push({ t: _t, name: key, at: Date.now(), a: stampAt });"), 'the audit stamp rides the journal (page-only stamps forced endless re-audits)');

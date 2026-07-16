@@ -18,7 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
-const SC_VERSION = '5.74.0';   // real version — keep in sync with manifest.json on every release
+const SC_VERSION = '5.75.0';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -2083,7 +2083,21 @@ async function auditLedgerEntries(opts = {}) {
         if (stale > 0) log(`Ledger audit: dropped ${stale} correction(s) for entries re-shaped mid-audit — they will be re-checked next cycle.`);
 
         const liveIdx = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : undefined;
-        const changed = fresh.length ? mergeLedgerDeltas(fresh, undefined, liveIdx) : 0;
+        // A correction re-describes the story the entry already covered — its evidence
+        // is drawn solely from the character's own past appearances — so it lands at
+        // the entry's existing _t, NOT at "now". Stamping corrections at liveIdx (the
+        // old behavior) falsified _t for every audited character: the roster told the
+        // storyteller an absent character was "last seen (turn NOW)", and a branch
+        // below the audit turn dropped the whole entry (_ledgerDroppingPast /
+        // _synthesizeCheckpoint judge by _t) despite their legitimate older history.
+        // The audit STAMP below already rides at the entry's own _t; corrections now
+        // follow the same rule. Per-delta merge because each entry keeps its own turn.
+        let changed = 0;
+        for (const d of fresh) {
+            const k = resolveLedgerKey(ledger, String(d.name).trim());
+            const at = (ledger[k] && typeof ledger[k]._t === 'number') ? ledger[k]._t : liveIdx;
+            changed += mergeLedgerDeltas([d], undefined, at);
+        }
 
         // Stamp every audited entry (changed or not) so the round-robin advances and
         // the same characters are not re-checked forever.
@@ -2303,13 +2317,14 @@ function compactLedgerNotes(store) {
     } catch (e) { log('compactLedgerNotes failed (non-fatal):', e); }
 }
 
-// Record what the scribe actually said this turn. Only fields it sent are stored —
-// that is the whole point: the note is small because it is only the change.
-function appendLedgerNotes(deltas, atTurn) {
-    if (!Array.isArray(deltas) || typeof atTurn !== 'number' || !isFinite(atTurn)) return 0;
-    const store = getChatStore();
-    ensureLedgerNotes(store);
-    let n = 0;
+// Pure: shape scribe deltas into journal notes at atTurn. Only fields the scribe
+// actually sent are recorded — that is the whole point: the note is small because
+// it is only the change. Shared by the live journal (appendLedgerNotes) and the
+// staging journal (a staged rebuild journals its own reads per chunk), so there is
+// exactly one place that decides what a note looks like.
+function _notesFromDeltas(deltas, atTurn) {
+    const out = [];
+    if (!Array.isArray(deltas) || typeof atTurn !== 'number' || !isFinite(atTurn)) return out;
     for (const d of deltas) {
         if (!d || typeof d.name !== 'string' || !d.name.trim()) continue;
         const note = { t: Math.floor(atTurn), name: d.name.trim(), at: Date.now() };
@@ -2321,10 +2336,20 @@ function appendLedgerNotes(deltas, atTurn) {
             note.threads = d.threads.filter(t => typeof t === 'string' && t.trim()).map(t => stripLeadingLabel(t)).filter(Boolean);
             has = true;
         }
-        if (has) { store.ledgerNotes.push(note); n++; }
+        if (has) out.push(note);
     }
-    if (n) compactLedgerNotes(store);
-    return n;
+    return out;
+}
+
+// Record what the scribe actually said this turn into the LIVE journal.
+function appendLedgerNotes(deltas, atTurn) {
+    const notes = _notesFromDeltas(deltas, atTurn);
+    if (notes.length === 0) return 0;
+    const store = getChatStore();
+    ensureLedgerNotes(store);
+    for (const n of notes) store.ledgerNotes.push(n);
+    compactLedgerNotes(store);
+    return notes.length;
 }
 
 // One shape for "the journal restarts as a snapshot of this page": base notes at
@@ -2406,6 +2431,66 @@ function adoptExternalLedgerEdits(store, tFloor) {
     return adopted;
 }
 
+// THE swap — "the staged rebuild becomes the live ledger", page AND journal
+// together. Installing the page alone (v5.73–v5.74) broke the one invariant the
+// whole system rests on, page == fold(notes): the old journal still described the
+// pre-rebuild timeline, so the very next fold — one message deletion, one branch
+// rewind — painted the stale ledger straight back over the clean rebuild. That is
+// why rebuilding "kept coming back stale": every rebuild silently undid itself at
+// the first fold after it.
+// The staged rebuild journals its own reads per chunk (ledgerStagingNotes); the
+// swap installs that journal with the page, so folds after the swap reproduce the
+// REBUILT truth at any turn (from = 0 — a staged rebuild reads from turn 0).
+// External edits made to the LIVE page while the rebuild ran (the copilot fixing a
+// card) are adopted off the pre-swap page first and re-landed on top of the staged
+// journal at the swap pointer — v5.74's guarantee, external edits are journal
+// truth, holds THROUGH a swap too. Everything else in the old journal describes
+// content the rebuild replaced and dies with it, exactly like a checkpoint restore.
+// A rebuild resumed from before the staging journal existed has no chunk notes;
+// the fallback rebases as per-entry base notes at each entry's own _t (folds stay
+// exact from the swap point; older rewinds use the dense staging checkpoints).
+// Returns true iff a staged page was installed. Quiet: toasts belong to callers.
+function _swapStagedLedgerIn(st) {
+    if (!st || !st.ledgerStaging || typeof st.ledgerStaging !== 'object' || Object.keys(st.ledgerStaging).length === 0) return false;
+    const upTo = (typeof st.ledgerLiveIdx === 'number' && st.ledgerLiveIdx >= 0) ? Math.floor(st.ledgerLiveIdx) : 0;
+    // Unjournaled external work on the live page IS its diff against its own fold.
+    // Adopt with the existing machinery, then carry exactly those new notes across.
+    // ONLY when the old journal covers the swap horizon: the diff isolates external
+    // edits only if fold(oldNotes) reproduces the served baseline. On an uncovered
+    // journal (legacy chat, stranded pointer, retired era) the fold is empty-or-partial,
+    // so the "diff" is the ENTIRE pre-rebuild page — adopting it would journal the very
+    // timeline the rebuild just discarded, and any later rewind could resurrect it.
+    let extNotes = [];
+    if (Array.isArray(st.ledgerNotes)) {
+        const _pre = st.ledgerNotes.length;
+        try { adoptExternalLedgerEdits(st); } catch (e) { log('swap: external-edit adoption failed (non-fatal):', e); }
+        extNotes = st.ledgerNotes.slice(_pre).map(n => Object.assign({}, n, { t: Math.min((typeof n.t === 'number' && isFinite(n.t)) ? n.t : upTo, upTo) }));
+    }
+    if (Array.isArray(st.ledgerStagingNotes) && st.ledgerStagingNotes.length > 0) {
+        st.ledgerNotes = st.ledgerStagingNotes.concat(extNotes);
+        st.ledgerNotesFrom = 0;
+    } else {
+        const base = [];
+        for (const [nm, e] of Object.entries(st.ledgerStaging)) {
+            if (!e || typeof e !== 'object') continue;
+            const t0 = (typeof e._t === 'number' && isFinite(e._t)) ? Math.min(Math.max(0, Math.floor(e._t)), upTo) : upTo;
+            const note = { t: t0, name: nm, at: e.updatedAt || Date.now(), base: true };
+            if (typeof e.core === 'string') note.core = e.core;
+            if (typeof e.state === 'string') note.state = e.state;
+            if (typeof e.arc === 'string') note.arc = e.arc;
+            if (Array.isArray(e.threads)) note.threads = e.threads.slice();
+            if (typeof e._a === 'number') note.a = e._a;
+            base.push(note);
+        }
+        st.ledgerNotes = base.concat(extNotes);
+        st.ledgerNotesFrom = upTo;   // per-entry stamps, not per-turn history — exact folds start at the swap point; older rewinds fall back to checkpoints
+    }
+    st.ledger = foldLedgerNotes(st.ledgerNotes, Infinity);
+    st.ledgerStaging = null;
+    st.ledgerStagingNotes = null;
+    return true;
+}
+
 // Rewind by READING FEWER NOTES. No snapshot, no model call, no pruning, exact.
 function rewindLedgerFromNotes(targetTurn) {
     const store = getChatStore();
@@ -2419,6 +2504,7 @@ function rewindLedgerFromNotes(targetTurn) {
     store.ledger = foldLedgerNotes(store.ledgerNotes, targetTurn);
     if (typeof store.ledgerLiveIdx === 'number' && store.ledgerLiveIdx > targetTurn) store.ledgerLiveIdx = targetTurn;
     store.ledgerStaging = null;
+    store.ledgerStagingNotes = null;
     store.ledgerRebuild = null;
     log(`Ledger rewound by folding notes to turn ${targetTurn}: dropped ${before - store.ledgerNotes.length} note(s), no model call.`);
     return true;
@@ -2857,6 +2943,8 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
             _st0.ledgerNotes = [];
             _st0.ledgerNotesFrom = 0;
             _st0.ledgerLiveIdx = -1;
+            _st0.ledgerStaging = null;
+            _st0.ledgerStagingNotes = null;
             _st0.ledgerRebuild = null;
             await saveChatStore();
             if (_chatEpoch !== epoch) return true;
@@ -2911,10 +2999,22 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
             // chunk. Nothing is deleted before its replacement exists.
             _ledgerQueue = [];
             _ledgerGen++;                  // invalidate any in-flight job — it saw the pre-trim timeline
-            // Notes past the target describe turns that no longer exist — trim them
-            // now, or a mid-rebuild fold (one message deletion) paints the abandoned
-            // timeline onto the live serving page while the rebuild runs.
-            if (Array.isArray(cur.ledgerNotes)) cur.ledgerNotes = cur.ledgerNotes.filter(n => n && typeof n.t === 'number' && n.t <= targetTurn);
+            // Re-base the old journal to the SERVING page (which just got
+            // decontaminated above). A bare trim here broke page == fold(notes) for
+            // the whole rebuild window: at swap time the adoption diff then read the
+            // entire stale serving ledger as "external work" and imported it into
+            // the fresh journal — where a rewind inside the rebuild's own coverage
+            // resurrected it. Re-based, fold(notes) equals the serving page exactly,
+            // so (a) a mid-rebuild fold reproduces the page instead of painting the
+            // abandoned timeline over it, and (b) the ONLY swap-time divergence is
+            // a genuine external edit made while the rebuild ran — which is the one
+            // thing the swap must carry across. Journal any pre-existing external
+            // work first; it belongs to the timeline the rebuild replaces.
+            if (Array.isArray(cur.ledgerNotes)) {
+                try { adoptExternalLedgerEdits(cur); } catch (_) {}
+                cur.ledgerNotes = _baseNotesFromPage(cur.ledger, targetTurn);
+                cur.ledgerNotesFrom = targetTurn;
+            }
             // RESUME, don't restart: if a staged rebuild is already underway, its
             // completed chunks (through ledgerLiveIdx) are valid for a tail trim —
             // deleting messages ABOVE the pointer changes nothing below it. Blowing
@@ -2926,10 +3026,16 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
                 && cur.ledgerLiveIdx < targetTurn);
             let jobs = 0;
             if (_resumable) {
+                // A rebuild that started before the staging journal existed has no
+                // notes for its finished chunks: journaling only the resumed tail
+                // would masquerade as full coverage. Absent journal -> the swap's
+                // per-entry-base fallback; present journal keeps accumulating.
+                if (cur.ledgerStagingNotes !== undefined && !Array.isArray(cur.ledgerStagingNotes)) cur.ledgerStagingNotes = undefined;
                 jobs = queueLedgerReplay(cur.ledgerLiveIdx, targetTurn, { staging: true });
                 cur.ledgerRebuild = { target: targetTurn, staging: true, attempts: cur.ledgerRebuild.attempts | 0 };
             } else {
                 cur.ledgerStaging = {};
+                cur.ledgerStagingNotes = [];   // the rebuild journals its own reads — the swap installs page AND journal
                 cur.ledgerLiveIdx = -1;        // tracks STAGING progress until the swap
                 cur._ckptLast = -1;            // re-arm checkpointing (staging snapshots) from zero — per-chat cursor since v5.51
                 jobs = queueLedgerRebuild(targetTurn);
@@ -2970,6 +3076,7 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
         if (queued === 0) { store.ledgerLiveIdx = targetTurn; store._ckptLast = targetTurn; }
         store.ledgerRebuild = queued > 0 ? { target: targetTurn } : null;   // persisted: an app-kill mid-replay resumes at reopen
         store.ledgerStaging = null;   // a checkpoint restore supersedes any half-finished staged rebuild
+        store.ledgerStagingNotes = null;
         await saveChatStore();
         try { updateInjection(true); renderLedger(); } catch (_) {}
         toastr.success(
@@ -3083,18 +3190,28 @@ async function processLedgerQueue() {
                 }
                 const _tgt = job.staging ? (getChatStore().ledgerStaging || (getChatStore().ledgerStaging = {})) : undefined;
                 const changed = mergeLedgerDeltas(deltas, _tgt, (typeof job.liveEnd === 'number' ? job.liveEnd : undefined));
+                // A staged rebuild journals its own reads: the swap installs page AND
+                // journal together, or the first fold after it undoes the rebuild.
+                if (job.staging && changed > 0 && typeof job.liveEnd === 'number') {
+                    const _stJ = getChatStore();
+                    if (Array.isArray(_stJ.ledgerStagingNotes)) {
+                        for (const n of _notesFromDeltas(deltas, job.liveEnd)) _stJ.ledgerStagingNotes.push(n);
+                    }
+                }
                 if (job.live && typeof job.liveEnd === 'number') {
                     const _st = getChatStore();
                     if (typeof _st.ledgerLiveIdx !== 'number' || job.liveEnd > _st.ledgerLiveIdx) _st.ledgerLiveIdx = job.liveEnd;
                     if (_st.ledgerRebuild && typeof _st.ledgerRebuild.target === 'number' && _st.ledgerLiveIdx >= _st.ledgerRebuild.target) {
                         // Catch-up complete. If it was a STAGING rebuild, swap the clean
                         // result in atomically — the old ledger served injection until
-                        // this exact moment, so there was never an empty window.
-                        if (job.staging && _st.ledgerStaging && Object.keys(_st.ledgerStaging).length > 0) {
-                            _st.ledger = _st.ledgerStaging;
+                        // this exact moment, so there was never an empty window. The
+                        // swap carries the staged JOURNAL in with the page (and any
+                        // copilot edits made to the live page while it ran).
+                        if (job.staging && _swapStagedLedgerIn(_st)) {
                             toastr.success('Ledger rebuild complete — the fresh, branch-accurate ledger is now live.', 'Summaryception', { timeOut: 5000 });
                         }
                         _st.ledgerStaging = null;
+                        _st.ledgerStagingNotes = null;
                         _st.ledgerRebuild = null;
                     }
                     maybeCheckpointLedger(job.staging ? _tgt : undefined);
@@ -4862,6 +4979,13 @@ function reindexAfterDeletion(store, D) {
             .filter(n => !(n && typeof n.t === 'number' && n.t === D && !n.base))
             .map(n => (n && typeof n.t === 'number' && n.t >= D) ? Object.assign({}, n, { t: n.t - 1 }) : n);
         if (typeof store.ledgerNotesFrom === 'number' && store.ledgerNotesFrom > D) store.ledgerNotesFrom -= 1;
+        // The staging journal is turn-indexed exactly like the live one; a mid-rebuild
+        // deletion must shift it too, or the swap installs notes one turn off the chat.
+        if (Array.isArray(store.ledgerStagingNotes)) {
+            store.ledgerStagingNotes = store.ledgerStagingNotes
+                .filter(n => !(n && typeof n.t === 'number' && n.t === D && !n.base))
+                .map(n => (n && typeof n.t === 'number' && n.t >= D) ? Object.assign({}, n, { t: n.t - 1 }) : n);
+        }
         if (notesCover(store, (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : 0)) {
             store.ledger = foldLedgerNotes(store.ledgerNotes, Infinity);   // exact, instant, zero model calls
         }
@@ -5077,47 +5201,20 @@ function onChatChanged() {
                     if (li < tgt) {
                         const n = queueLedgerReplay(li, tgt, { staging: !!st.ledgerRebuild.staging });
                         if (n > 0) toastr.info(`Resuming ledger catch-up — ${n} background pass${n === 1 ? '' : 'es'} remaining.`, 'Summaryception', { timeOut: 4000 });
-                        else { st.ledgerRebuild = null; st.ledgerStaging = null; }
+                        else { st.ledgerRebuild = null; st.ledgerStaging = null; st.ledgerStagingNotes = null; }
                     } else {
                         // Pointer already reached the target (completion raced the reload):
-                        // finish the swap if a staged result is waiting.
-                        if (st.ledgerRebuild.staging && st.ledgerStaging && Object.keys(st.ledgerStaging).length > 0) {
-                            // The staged page is a clean rebuild of HISTORY — but live passes
-                            // kept running while it worked, advancing both the page and the
-                            // journal to the newest turn. Assigning staging straight over the
-                            // page CLOBBERED all of that: the page snapped back to wherever the
-                            // rebuild ended while the notes still held the truth, so a card
-                            // could read fourteen turns staler than its own history view. That
-                            // is why rebuilding the ledger made things WORSE, and why it kept
-                            // coming back stale no matter how many times it was rebuilt.
-                            // Re-base the journal on the rebuild, then fold back everything the
-                            // rebuild did not cover. Newest value per field still wins, so the
-                            // clean history is kept AND nothing recent is lost.
-                            const _upTo = [st.ledgerRebuild.upTo, st.ledgerRebuild.endIdx, st.ledgerRebuild.cursor]
-                                .find(v => typeof v === 'number' && isFinite(v));
-                            const _at = (typeof _upTo === 'number') ? _upTo : -1;
-                            const _newer = (Array.isArray(st.ledgerNotes) ? st.ledgerNotes : [])
-                                .filter(n => n && typeof n.t === 'number' && n.t > _at);
-                            const _base = [];
-                            for (const [nm, e] of Object.entries(st.ledgerStaging)) {
-                                if (!e || typeof e !== 'object') continue;
-                                const note = { t: _at, name: nm, at: e.updatedAt || Date.now(), base: true };
-                                if (typeof e.core === 'string') note.core = e.core;
-                                if (typeof e.state === 'string') note.state = e.state;
-                                if (typeof e.arc === 'string') note.arc = e.arc;
-                                if (Array.isArray(e.threads)) note.threads = e.threads.slice();
-                                if (typeof e._a === 'number') note.a = e._a;
-                                _base.push(note);
-                            }
-                            st.ledgerNotes = _base.concat(_newer);
-                            st.ledgerNotesFrom = Math.max(0, _at);
-                            // The live page may also hold EXTERNAL edits (copilot memedits)
-                            // that no note records — adopt them off the pre-fold page now,
-                            // floored at the rebuild edge so they survive the fold below.
-                            adoptExternalLedgerEdits(st, _at);
-                            st.ledger = foldLedgerNotes(st.ledgerNotes, Infinity);
-                        }
+                        // finish the swap if a staged result is waiting. Same one swap as the
+                        // in-session path — page and staged journal installed together, live-
+                        // page external edits carried across. (The previous rebase here read
+                        // three fields off the rebuild marker — upTo, endIdx, cursor —
+                        // which NOTHING ever writes; the only real field is `target`. So its anchor was always -1, its base
+                        // notes sat below every real note, and the fold restored the exact
+                        // stale content the rebuild replaced. The "fix" shipped green because
+                        // the test fed it a hand-fabricated `upTo` production never produces.)
+                        if (st.ledgerRebuild.staging) _swapStagedLedgerIn(st);
                         st.ledgerStaging = null;
+                        st.ledgerStagingNotes = null;
                         st.ledgerRebuild = null;
                     }
                 }
@@ -6526,6 +6623,7 @@ function bindUIEvents() {
         store._ckptLast = -1;
         store.ledgerRebuild = null;
         store.ledgerStaging = null;
+        store.ledgerStagingNotes = null;
         _ledgerQueue = [];
         _ledgerGen++;
         await saveChatStore();
@@ -7540,7 +7638,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — external ledger edits (copilot memedits, undo restores) are now journal truth: adopted as notes before every fold, so they survive message deletions, rewinds, and rebuild swaps; character deletion is a tombstone note (folds can no longer resurrect); fallback rewinds sweep ghost notes; audit stamps ride the journal. Full history: git log.`);
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — the staged-rebuild swap now installs the page WITH its journal (the rebuild journals its own reads; one real swap function serves both completion paths), so a rebuild no longer self-undoes at the first fold or rewind after it; the old journal is re-based to the serving page at rebuild start so only genuine external edits are carried across; audit corrections land at each entry's own turn, so the roster's "last seen" and branch decontamination are never falsified by an audit. Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

@@ -292,6 +292,56 @@ try {
     ok(Object.keys(folded).length >= 0, 'the page was refolded from what remains');
     ok(store().ledgerLiveIdx <= target, 'the pointer followed the branch');
 
+    console.log('== 11. STAGED REBUILD: the swap installs page AND journal — and survives the next fold ==');
+    {
+        // Force the exact production shape that takes the staging branch: a ledger
+        // with content, notes that do NOT cover the target (legacy region), no
+        // usable checkpoint, no entry stamps for synthesis. This is the pre-notes /
+        // pre-stamp chat every long-running user actually has.
+        globalThis.__latency = 100;
+        chat.length = 0;
+        chat.push(
+            mkMsg('Player', 'I step off the train at Marcroft.', true),
+            mkMsg('Narrator', 'Claire Argent waited by the arch, grey eyes on the platform.'),
+            mkMsg('Player', 'I meet her eyes.', true),
+            mkMsg('Narrator', 'Jovan Argent stepped onto the platform. Claire Argent did not move.'),
+            mkMsg('Player', 'I speak first.', true),
+            mkMsg('Narrator', 'Claire Argent answered before Jovan Argent finished.'),
+        );
+        const st = store();
+        st.ledger = { 'Claire Argent': { core: 'STALE core from the abandoned timeline', state: 'STALE state', updatedAt: 1 } };   // no _t — synthesis must decline
+        st.ledgerNotes = [{ t: 99, name: 'Claire Argent', at: 1, base: true, core: 'STALE core from the abandoned timeline', state: 'STALE state' }];
+        st.ledgerNotesFrom = 99;        // notes authoritative only from far past the chat — cover() says no
+        st.ledgerLiveIdx = 99;          // pointer stranded past the chat end (bulk-trim shape)
+        st.ledgerEra = (st.ledgerEra | 0) + 1;   // retire every checkpoint scene 1–10 saved
+        st._ckptLast = -1;
+        st.summarizedUpTo = -1;
+        // The router computes delta from the last KNOWN length: teach it the pre-trim
+        // length (GENERATION_STARTED refreshes the tracker), then bulk-splice — the
+        // exact shape of a real branch: delta > 1 → tryAutoRewindLedger('trim').
+        chat.push(mkMsg('Player', 'One more word.', true), mkMsg('Narrator', 'Claire Argent turned away.'));
+        await fire('GENERATION_STARTED');
+        const callsBefore2 = calls.length;
+        chat.length = 6;                          // bulk trim: 8 → 6
+        await fire('MESSAGE_DELETED', 6);
+        await sleep(4000);
+        const led2 = store().ledger || {};
+        ok(calls.length > callsBefore2, 'precondition: the rebuild actually ran scribe passes (not a fold, not a checkpoint)');
+        ok(led2['Claire Argent'] && !String(led2['Claire Argent'].core).includes('STALE'), 'the rebuilt page is live — the stale timeline is gone');
+        ok(store().ledgerRebuild == null && store().ledgerStaging == null && store().ledgerStagingNotes == null, 'staging state fully consumed at the swap');
+        const notes2 = store().ledgerNotes || [];
+        ok(notes2.length > 0 && notes2.every((n) => !String(n.core || '').includes('STALE') && !String(n.state || '').includes('STALE')), 'THE FIX: the journal was swapped WITH the page — no note from the abandoned timeline survives');
+        ok(store().ledgerNotesFrom === 0, 'the staged journal covers from turn 0 — every later rewind is an exact fold');
+        // THE KILL SHOT, end to end: the first fold after the swap. Under the old
+        // swap this painted the pre-rebuild ledger straight back over the page.
+        const lenNow = chat.length;
+        chat.splice(chat.length - 1, 1);
+        await fire('MESSAGE_DELETED', lenNow - 1);
+        await sleep(1200);
+        const led3 = store().ledger || {};
+        ok(led3['Claire Argent'] && !String(led3['Claire Argent'].core).includes('STALE'), 'KILL SHOT: the fold after the swap keeps the REBUILT truth — the rebuild no longer self-undoes');
+    }
+
     console.log('== 6. a REAL chat switch: new metadata AND new messages ==');
     const oldNames = Object.keys(store().ledger || {});
     ctx.chatMetadata = {};
