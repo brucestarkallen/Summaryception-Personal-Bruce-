@@ -4258,6 +4258,29 @@ function _escapeRegex(str) { return String(str).replace(_ESC_RE, '\\$&'); }
 // for "Stella Vermillion". Recall matters more than precision here: a missed
 // on-screen character loses its behavioral anchor (the whole point of the
 // ledger), whereas an occasional off-screen inject is merely a little wasteful.
+// Pure: how much the STORY has invested in this person. Not a guess and not a
+// preference — every term is something the story itself produced:
+//   arc     — relationship history with the protagonist. The single strongest
+//             signal: the scribe only writes an arc once a relationship has actually
+//             moved, and only lengthens it as more happens between them.
+//   threads — unresolved business. Someone the story owes something to, or who owes
+//             something, is load-bearing; a spear-carrier has none.
+//   core    — how fully they are drawn. A richly established nature took many scenes.
+//   pin     — the user overriding everything, which stays possible but is no longer
+//             required for the system to know a sister outranks a classmate.
+function _characterWeight(entry, pinned) {
+    let w = 0;
+    if (!entry || typeof entry !== 'object') return w;
+    if (pinned) w += 1000;                                                  // an explicit override always wins
+    const arc = (typeof entry.arc === 'string') ? entry.arc.trim() : '';
+    if (arc) w += 40 + Math.min(60, Math.floor(arc.length / 12));           // has a relationship at all, deepened by its depth
+    const threads = Array.isArray(entry.threads) ? entry.threads.filter(t => typeof t === 'string' && t.trim()) : [];
+    w += Math.min(60, threads.length * 20);                                 // unresolved business with the story
+    const core = (typeof entry.core === 'string') ? entry.core.trim() : '';
+    w += Math.min(30, Math.floor(core.length / 30));                        // how fully they are drawn
+    return w;
+}
+
 // Pure: name tokens that CANNOT identify one character because two or more share
 // them. Siblings are the everyday case: with "Jovan Argent" and "Claire Argent" in
 // the cast, the bare token "Argent" identifies nobody — yet it was an alias for
@@ -4403,7 +4426,7 @@ function computeLedgerCast(ledger, s, recentLower, pins, rosterTick, recentMsgs)
     const res = { shown: [], compact: [], roster: [], out: [] };
     if (!names.length) return res;
     const ambiguous = _ambiguousTokens(names);
-    const active = [];
+    let active = [];
     for (const name of names) {
         const entry = ledger[name];
         if (!entry || typeof entry !== 'object') continue;
@@ -4431,13 +4454,21 @@ function computeLedgerCast(ledger, s, recentLower, pins, rosterTick, recentMsgs)
     // last appearance inverts it: present -> injected -> written -> updated.
     active.sort((a, b) => (b.seen - a.seen) || (b.u - a.u));
     const maxActive = Math.max(1, s.ledgerMaxActive ?? 6);
-    // Pins are the user's own answer to "who matters in THIS story". Nothing else in
-    // the system knows that a sister or a headmaster outranks a classmate who
-    // happened to speak last, so a pinned character who is on screen takes a full
-    // slot ahead of the recency race.
+    // WHO MATTERS is not something the user should have to hand-annotate — asking for
+    // pins was pushing the system's job onto them. The ledger already holds the
+    // answer and was ignoring it: importance is what the STORY has invested in a
+    // person. A sister the protagonist has 30 turns of relationship history with,
+    // three unresolved threads, and a fully drawn nature is not the same as a
+    // classmate who spoke once, and the data says so plainly. Recency alone said they
+    // were equal, so the sister lost her slot to whoever twitched last.
     const pinLower = new Set((pins || []).map(p => String(p).toLowerCase()));
-    active.sort((a, b) => (pinLower.has(b.name.toLowerCase()) ? 1 : 0) - (pinLower.has(a.name.toLowerCase()) ? 1 : 0));
-    res.shown = active.slice(0, maxActive);
+    for (const a of active) a.w = _characterWeight(a.entry, pinLower.has(a.name.toLowerCase()));
+    // Presence is still the gate — you must be in the scene to hold a full slot — but
+    // among the people who ARE here, the story's own investment decides, and only then
+    // recency. A pin is now just the heaviest possible vote, not the only one.
+    res.shown = active.slice().sort((a, b) => (b.w - a.w) || (b.seen - a.seen) || (b.u - a.u)).slice(0, maxActive);
+    const _fullSet = new Set(res.shown.map(x => x.name));
+    active = active.filter(x => !_fullSet.has(x.name));
     // THE ANTI-BIAS TIER. Six full entries and a bare name for everyone else made the
     // ledger cause the very forgetting it exists to prevent: the storyteller wrote the
     // six it was handed and the rest of the room evaporated — a best friend, a sister,
@@ -4445,7 +4476,7 @@ function computeLedgerCast(ledger, s, recentLower, pins, rosterTick, recentMsgs)
     // cap now gets a COMPACT entry (who they are + what they are doing) instead of a
     // name. The cap still bounds the expensive full entries; it no longer decides who
     // exists.
-    res.compact = active.slice(maxActive);
+    res.compact = active;   // on screen but past the cap — compact, never a bare name
     const shownNames = new Set(res.shown.concat(res.compact).map(a => a.name));
     if (s.ledgerInjectRoster !== false) {
         const rosterCap = Math.max(0, s.ledgerRosterMax ?? 12);

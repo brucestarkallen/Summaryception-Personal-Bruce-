@@ -27,7 +27,7 @@ function extractTopLevel(name) {
 }
 
 const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
-const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', 'reindexAfterDeletion', '_computeLiveLedgerRange', '_NOTES_SOFT_CAP', '_NOTES_KEEP_TAIL', 'foldLedgerNotes', 'ledgerHistoryFor', '_histOpen', '_historyHtml', 'escapeHtml', 'notesCover', 'ensureLedgerNotes', 'appendLedgerNotes', 'rewindLedgerFromNotes', 'compactLedgerNotes', 'stripLeadingLabel', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
+const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', 'reindexAfterDeletion', '_computeLiveLedgerRange', '_NOTES_SOFT_CAP', '_NOTES_KEEP_TAIL', 'foldLedgerNotes', 'ledgerHistoryFor', '_histOpen', '_historyHtml', 'escapeHtml', 'notesCover', 'ensureLedgerNotes', 'appendLedgerNotes', 'rewindLedgerFromNotes', 'compactLedgerNotes', 'stripLeadingLabel', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_characterWeight', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
     'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering'];
@@ -50,7 +50,7 @@ return {
   __setSettings: (v)=>{ __settings = v; },
   __setStore:    (v)=>{ __store = v; },
   __setChat:     (v)=>{ __chat = v; },
-  stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice, _synthesizeCheckpoint, computeLedgerCast, reindexAfterDeletion, _computeLiveLedgerRange, foldLedgerNotes, ledgerHistoryFor, _historyHtml, _histOpen, notesCover, ensureLedgerNotes, appendLedgerNotes, rewindLedgerFromNotes, compactLedgerNotes, _ledgerAuditTargets, _pickEvidenceIndices, buildLedgerAuditEvidence, _ambiguousTokens,
+  stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice, _synthesizeCheckpoint, computeLedgerCast, reindexAfterDeletion, _computeLiveLedgerRange, foldLedgerNotes, ledgerHistoryFor, _historyHtml, _histOpen, notesCover, ensureLedgerNotes, appendLedgerNotes, rewindLedgerFromNotes, compactLedgerNotes, _ledgerAuditTargets, _pickEvidenceIndices, buildLedgerAuditEvidence, _ambiguousTokens, _characterWeight,
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
@@ -1296,7 +1296,42 @@ section('anti-bias: the cap bounds cost, not existence');
     ok(pinned.shown.map(x => x.name).includes('Claire'), 'a pinned character on screen takes a FULL slot ahead of the recency race');
 }
 ok(SRC_FULL.includes("ALSO PRESENT in this scene"), 'the compact tier reaches the storyteller with its own framing');
-ok(SRC_FULL.includes('res.compact = active.slice(maxActive);'), 'overflow becomes compact, never nothing');
+ok(SRC_FULL.includes('res.compact = active;   // on screen but past the cap'), 'overflow becomes compact, never nothing');
+ok(SRC_FULL.includes('function _characterWeight(entry, pinned)'), 'importance is DERIVED from the story, not hand-annotated');
+ok(/res\.shown = active\.slice\(\)\.sort\(\(a, b\) => \(b\.w - a\.w\)/.test(SRC_FULL), 'full slots go by the story\'s investment first, then presence, then recency');
+
+// ─── importance is derived from the story, never annotated by hand ───
+section('_characterWeight — the ledger knows who matters');
+{
+    const sister = { core: 'guarded, precise; grips her wrist when tense; never raises her voice; addresses him by name only', arc: 'protective older sister who has tracked his capability from the periphery for two years; tabled a debrief with "how much are you hiding?"', threads: ['shape the statement', 'tell him about Ivar', 'the tabled debrief'] };
+    const classmate = { core: 'loud', state: 'in the hall' };
+    ok(L._characterWeight(sister) > L._characterWeight(classmate), 'a sister with history and open threads outweighs a classmate who spoke once');
+    ok(L._characterWeight({}) === 0 && L._characterWeight(null) === 0, 'an empty entry weighs nothing');
+    const arcOnly = { arc: 'they fought once' };
+    const threadOnly = { threads: ['a debt'] };
+    ok(L._characterWeight(arcOnly) > 0 && L._characterWeight(threadOnly) > 0, 'arc alone and threads alone both count');
+    ok(L._characterWeight(arcOnly) > L._characterWeight(threadOnly), 'a relationship outranks a single loose end');
+    const deep = { arc: 'x'.repeat(600) };
+    ok(L._characterWeight(deep) <= 100 + 30, 'depth is capped — a long arc cannot drown everything else');
+    ok(L._characterWeight(classmate, true) > L._characterWeight(sister), 'an explicit pin still overrides — it is now the heaviest vote, not the only one');
+}
+{
+    // The reported failure, end to end: the sister loses her slot to whoever twitched last.
+    const mk = (u) => ({ core: 'x', state: 's', updatedAt: u });
+    const led = {
+        Claire: { core: 'guarded, precise; never raises her voice', arc: 'protective older sister, two years of watching him', threads: ['the statement', 'Ivar'], updatedAt: 1 },
+        Headmaster: { core: 'weighs institutions before people', arc: 'holds Jovan\'s file and has not acted on it', threads: ['the pending review'], updatedAt: 2 },
+        C1: mk(90), C2: mk(89), C3: mk(88), C4: mk(87), C5: mk(86), C6: mk(85),
+    };
+    const s = { ledgerMaxActive: 6, ledgerInjectRoster: true, ledgerRosterMax: 12, ledgerRosterRotate: false };
+    const msgs = ['c1 c2 c3 c4 c5 c6 claire headmaster all crowded the east yard.'];
+    const cast = L.computeLedgerCast(led, s, msgs[0], [], 0, msgs);
+    const full = cast.shown.map(x => x.name);
+    ok(full.includes('Claire'), 'THE FIX: the sister holds a FULL slot with zero pins, on the story\'s own evidence');
+    ok(full.includes('Headmaster'), 'so does the headmaster — arc and an open thread outrank six fresher nobodies');
+    ok(cast.compact.length === 2, 'the displaced extras drop to compact — still present, never erased');
+    ok(cast.out.length === 0, 'and nobody in the room is dropped');
+}
 
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);
