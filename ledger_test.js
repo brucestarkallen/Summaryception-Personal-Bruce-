@@ -30,7 +30,7 @@ const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
 const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', 'reindexAfterDeletion', '_computeLiveLedgerRange', '_NOTES_SOFT_CAP', '_NOTES_KEEP_TAIL', 'foldLedgerNotes', 'ledgerHistoryFor', '_histOpen', '_historyHtml', 'escapeHtml', 'notesCover', 'ensureLedgerNotes', 'appendLedgerNotes', 'rewindLedgerFromNotes', 'compactLedgerNotes', 'stripLeadingLabel', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_characterWeight', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
-    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive', '_syncNotepadUi'];
+    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive', '_syncNotepadUi', '_lastAssistantAt'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -67,7 +67,7 @@ return {
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
   normalizeContinuityOutput, _continuitySig, mergeContinuityFlags, reconcileSnippetFlags, _findSnippetByTurnRange, _findSnippetsCovering,
   _baseNotesFromPage, adoptExternalLedgerEdits, _notesFromDeltas, _swapStagedLedgerIn,
-  _pinNeedle, _findPinSource, _pinAlive, _syncNotepadUi,
+  _pinNeedle, _findPinSource, _pinAlive, _syncNotepadUi, _lastAssistantAt,
 };
 `;
 const L = new Function(sandbox)();
@@ -864,7 +864,7 @@ section('stale-result discards heal themselves');
 ok(SRC_FULL.includes("re-deriving automatically.');"), 'gen-mismatch discard: logged as self-healing');
 ok(SRC_FULL.includes("That read was discarded — the chat changed (edit/delete/swipe) while it ran"), 'manual discard: user told why');
 ok(SRC_FULL.includes("if (job.live) _armLiveRetry();"), 'discard: live retry armed — pointer catches up with no tap');
-ok(SRC_FULL.includes("if (D > _li) _genStale = false;"), 'single delete above the live pointer: no gen bump, completed passes survive');
+ok(SRC_FULL.includes("if (D > _liPre) _genStale = false;"), 'single delete above the live pointer: no gen bump, completed passes survive (judged against the PRE-deletion pointer)');
 ok(SRC_FULL.includes("if (_genStale) _ledgerGen++;"), 'gen bump is conditional, not unconditional');
 
 // ─── computeLedgerCast: the single injection-selection truth ───
@@ -1510,7 +1510,7 @@ ok(!/ledgerRebuild\.(upTo|endIdx|cursor)/.test(SRC_FULL), 'the dead-field rebase
 ok(!SRC_FULL.includes('_st.ledger = _st.ledgerStaging;'), 'the in-session blind assignment is gone — the swap goes through _swapStagedLedgerIn');
 ok((SRC_FULL.match(/_swapStagedLedgerIn\(/g) || []).length >= 3, 'both swap sites (in-session + reload race) call the one real swap function');
 ok(SRC_FULL.includes('ledgerStagingNotes.push'), 'staging chunks journal their reads as they land');
-ok(/staging branch|Re-base the old journal/.test(SRC_FULL) && SRC_FULL.includes('cur.ledgerNotes = _baseNotesFromPage(cur.ledger, targetTurn);'), 'rebuild start: the old journal is RE-BASED to the serving page, not trimmed — swap-time adoption sees only genuine external edits');
+ok(/staging branch|Re-base the old journal/.test(SRC_FULL) && SRC_FULL.includes('cur.ledgerNotes = _baseNotesFromPage(cur.ledger, effTarget);'), 'rebuild start: the old journal is RE-BASED to the serving page, not trimmed — swap-time adoption sees only genuine external edits');
 ok(!SRC_FULL.includes('cur.ledgerNotes = cur.ledgerNotes.filter(n => n && typeof n.t === \'number\' && n.t <= targetTurn);'), 'the bare trim that made the whole stale ledger look like external work is gone');
 ok(!SRC_FULL.includes('a staged rebuild writes its own notes on swap'), 'the comment that claimed a thing the code never did is gone');
 
@@ -1629,7 +1629,7 @@ section('_baseNotesFromPage — restarting the journal from a page is exact');
 section('journal hygiene — fallback rewinds cannot leave ghost notes');
 ok(SRC_FULL.includes('_st0.ledgerNotes = [];'), 'turn-0 clear: the journal clears WITH the page (ghosts re-materialized the abandoned ledger)');
 ok(SRC_FULL.includes('store.ledgerNotes = _baseNotesFromPage(store.ledger, ckpt.atTurn);'), 'checkpoint restore: the journal is rebased on the restored page');
-ok(SRC_FULL.includes('cur.ledgerNotes = _baseNotesFromPage(cur.ledger, targetTurn);') && SRC_FULL.includes('cur.ledgerNotesFrom = targetTurn;'), 'staged rebuild entry: the journal is re-based to the serving page — a mid-rebuild fold reproduces the page by construction, and ghost notes cannot exist to paint back');
+ok(SRC_FULL.includes('cur.ledgerNotes = _baseNotesFromPage(cur.ledger, effTarget);') && SRC_FULL.includes('cur.ledgerNotesFrom = effTarget;'), 'staged rebuild entry: the journal is re-based to the serving page — a mid-rebuild fold reproduces the page by construction, and ghost notes cannot exist to paint back');
 ok(SRC_FULL.includes("if (Array.isArray(st.ledgerNotes) && notesCover(st, upTo)) {"), 'rebuild swap: external page edits are adopted before the final fold — but ONLY when the old journal covers the swap horizon (an uncovered diff is the whole doomed page, not an edit)');
 ok(SRC_FULL.includes('try { adoptExternalLedgerEdits(store); } catch (e)'), 'scribe merge: durable early adoption before new deltas land');
 ok((SRC_FULL.match(/adoptExternalLedgerEdits\(store\);/g) || []).length >= 3, 'rewind, message-deletion refold, and merge all reconcile first');
@@ -1721,6 +1721,39 @@ section('resolved receipts — trimmed with the timeline they belong to');
     ok(/turnRange: Array\.isArray\(flag\.turnRange\) \? flag\.turnRange\.slice\(\) : undefined/.test(SRC_FULL), 'Apply stamps the receipt with the flag turn range');
     ok(SRC_FULL.includes('r && (!Array.isArray(r.turnRange) || r.turnRange[1] < chatLength));'), 'branch repair trims receipts about turns the branch abandoned');
     ok(SRC_FULL.includes('store.continuityResolved.filter(r => r && (!Array.isArray(r.turnRange) || r.turnRange[1] <= max));'), 'bulk-delete clamp trims receipts past the new end');
+}
+
+section('deleting the newest read turn — the guard compares D to the timeline D belongs to');
+{
+    // The reported bug: delete AI turn 51 (pointer 51) on a legacy chat -> nothing;
+    // then editing user turn 50 shows the checkpoint-49 rewind the deletion owed.
+    // Cause: the guard read the pointer AFTER reindexAfterDeletion decremented it,
+    // then compared the PRE-deletion index D against it — false for D == liveIdx
+    // and only there: the most common deletion in roleplay skipped the rewind.
+    ok(/_liPre = \(typeof store\.ledgerLiveIdx === 'number'\) \? store\.ledgerLiveIdx : -1;\s*\n\s*reindexAfterDeletion\(store, D\);/.test(SRC_FULL), 'the pre-deletion pointer is captured BEFORE reindexAfterDeletion decrements it');
+    ok(SRC_FULL.includes('if (D > _liPre) _genStale = false;'), 'in-flight invalidation judges D against the pre-deletion pointer');
+    ok(SRC_FULL.includes('if (!notesCover(store, _liNow) && D >= 0 && D <= _liPre) {'), 'the legacy rewind judges coverage NOW but readness THEN — D == liveIdx now rewinds');
+    ok(!/const _li = \(typeof store\.ledgerLiveIdx === 'number'\) \? store\.ledgerLiveIdx : -1;\s*\n\s*if \(D > _li\)/.test(SRC_FULL), 'the post-decrement read that created the one-turn blind spot is gone');
+
+    // And the second half: a rebuild's finish line must be a turn a scribe pass can
+    // reach. targetTurn = a trailing USER message made liveEnd >= target unreachable.
+    ok(typeof L._lastAssistantAt === 'function', '_lastAssistantAt is top-level and extracted');
+    const chat = [
+        { is_user: true,  mes: 'I speak.' },
+        { is_user: false, mes: 'She answers.' },
+        { is_user: true,  mes: 'I press on.' },
+        { is_user: false, is_system: true, mes: 'sys' },
+    ];
+    eq(L._lastAssistantAt(chat, 3), 1, 'a trailing user/system tail clamps to the last real assistant turn');
+    eq(L._lastAssistantAt(chat, 1), 1, 'an assistant target is its own clamp');
+    eq(L._lastAssistantAt(chat, 0), -1, 'before the first reply there is nothing to read');
+    eq(L._lastAssistantAt([], 5), -1, 'empty chat');
+    const ghost = [{ is_user: false, is_system: true, extra: { sc_ghosted: true }, mes: 'ghosted reply' }];
+    eq(L._lastAssistantAt(ghost, 0), 0, 'our own ghosted replies still count as read turns');
+    ok(SRC_FULL.includes('const effTarget = _lastAssistantAt((SillyTavern.getContext() || {}).chat, targetTurn);'), 'the staged rebuild clamps its target once, at entry');
+    ok(SRC_FULL.includes('jobs = queueLedgerRebuild(effTarget);') && SRC_FULL.includes('jobs = queueLedgerReplay(cur.ledgerLiveIdx, effTarget, { staging: true });'), 'both queue paths aim at the clamped target');
+    ok(SRC_FULL.includes('cur.ledgerNotesFrom = effTarget;'), 'the rebase anchors at the clamped target so swap-time adoption coverage holds');
+    ok(SRC_FULL.includes("toastr.success(`Ledger rewound to turn ${targetTurn} — before the story's first reply"), 'a rewind below the first reply installs the true (empty) state instead of freezing the stale page');
 }
 
 section('notepad — one document, two views (panel + full-screen editor)');

@@ -18,7 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
-const SC_VERSION = '5.77.0';   // real version — keep in sync with manifest.json on every release
+const SC_VERSION = '5.78.0';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -1191,6 +1191,22 @@ async function repairIfBranched() {
 }
 
 // ─── Assistant Turn Utilities ────────────────────────────────────────
+
+// The last assistant turn at or below `upTo` — the highest turn any scribe pass
+// can ever read up to. A trailing USER message has been read by nothing: its
+// content enters the ledger only with the NEXT AI reply's passage. So "state as
+// of user turn T" IS "state as of the last assistant turn <= T", and any process
+// waiting to reach a user-indexed turn waits for a turn that will never come.
+function _lastAssistantAt(chat, upTo) {
+    if (!Array.isArray(chat)) return -1;
+    for (let i = Math.min(upTo, chat.length - 1); i >= 0; i--) {
+        const m = chat[i];
+        if (!m) continue;
+        const isOurGhost = m.extra?.sc_ghosted === true;
+        if (!m.is_user && (!m.is_system || isOurGhost) && m.mes && m.mes.trim().length > 0) return i;
+    }
+    return -1;
+}
 
 function getAssistantTurns(chat) {
     const turns = [];
@@ -3006,10 +3022,34 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
             if (synth) {
                 ckpt = synth;
             } else {
+            // Clamp the rebuild's finish line to a turn a scribe pass can actually
+            // reach. Deleting the last AI reply hands us targetTurn = the user
+            // message before it; every job's liveEnd is an ASSISTANT index, so a
+            // user-indexed target made `liveEnd >= target` unreachable — the rebuild
+            // ran, then the swap waited forever and the stale page kept serving.
+            const effTarget = _lastAssistantAt((SillyTavern.getContext() || {}).chat, targetTurn);
+            if (effTarget < 0) {
+                // The rewind lands before the first AI turn: the true ledger state
+                // there is EMPTY. Install it exactly — page, journal, and pointer —
+                // instead of leaving the stale serving page as the final state.
+                cur.ledger = {};
+                cur.ledgerNotes = [];
+                cur.ledgerNotesFrom = 0;
+                cur.ledgerLiveIdx = targetTurn;
+                cur.ledgerStaging = null;
+                cur.ledgerStagingNotes = null;
+                cur.ledgerRebuild = null;
+                _ledgerQueue = [];
+                _ledgerGen++;
+                await saveChatStore();
+                try { updateInjection(true); renderLedger(); } catch (_) {}
+                toastr.success(`Ledger rewound to turn ${targetTurn} — before the story's first reply, so it starts empty and refills as you play.`, 'Summaryception', { timeOut: 5000 });
+                return true;
+            }
             const _dropped = Object.keys(cur.ledger).length;
-            cur.ledger = _ledgerDroppingPast(cur.ledger, targetTurn);
+            cur.ledger = _ledgerDroppingPast(cur.ledger, effTarget);
             const _droppedN = _dropped - Object.keys(cur.ledger).length;
-            if (_droppedN > 0) log(`Rewind(${label}): dropped ${_droppedN} ledger entr${_droppedN === 1 ? 'y' : 'ies'} shaped past turn ${targetTurn} from the serving copy.`);
+            if (_droppedN > 0) log(`Rewind(${label}): dropped ${_droppedN} ledger entr${_droppedN === 1 ? 'y' : 'ies'} shaped past turn ${effTarget} from the serving copy.`);
             // STAGING rebuild: the existing ledger keeps serving injection EXACTLY as
             // it is (imperfect beats absent) while the clean rebuild accumulates in
             // ledgerStaging. The swap happens atomically at completion; a failure or
@@ -3030,8 +3070,8 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
             // work first; it belongs to the timeline the rebuild replaces.
             if (Array.isArray(cur.ledgerNotes)) {
                 try { adoptExternalLedgerEdits(cur); } catch (_) {}
-                cur.ledgerNotes = _baseNotesFromPage(cur.ledger, targetTurn);
-                cur.ledgerNotesFrom = targetTurn;
+                cur.ledgerNotes = _baseNotesFromPage(cur.ledger, effTarget);
+                cur.ledgerNotesFrom = effTarget;   // effTarget, not targetTurn: the swap's coverage check (notesCover(st, upTo)) compares against the pointer the jobs actually reach
             }
             // RESUME, don't restart: if a staged rebuild is already underway, its
             // completed chunks (through ledgerLiveIdx) are valid for a tail trim —
@@ -3041,7 +3081,7 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
             const _resumable = !!(cur.ledgerRebuild && cur.ledgerRebuild.staging
                 && cur.ledgerStaging && typeof cur.ledgerStaging === 'object'
                 && typeof cur.ledgerLiveIdx === 'number' && cur.ledgerLiveIdx >= 0
-                && cur.ledgerLiveIdx < targetTurn);
+                && cur.ledgerLiveIdx < effTarget);
             let jobs = 0;
             if (_resumable) {
                 // A rebuild that started before the staging journal existed has no
@@ -3049,15 +3089,15 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
                 // would masquerade as full coverage. Absent journal -> the swap's
                 // per-entry-base fallback; present journal keeps accumulating.
                 if (cur.ledgerStagingNotes !== undefined && !Array.isArray(cur.ledgerStagingNotes)) cur.ledgerStagingNotes = undefined;
-                jobs = queueLedgerReplay(cur.ledgerLiveIdx, targetTurn, { staging: true });
-                cur.ledgerRebuild = { target: targetTurn, staging: true, attempts: cur.ledgerRebuild.attempts | 0 };
+                jobs = queueLedgerReplay(cur.ledgerLiveIdx, effTarget, { staging: true });
+                cur.ledgerRebuild = { target: effTarget, staging: true, attempts: cur.ledgerRebuild.attempts | 0 };
             } else {
                 cur.ledgerStaging = {};
                 cur.ledgerStagingNotes = [];   // the rebuild journals its own reads — the swap installs page AND journal
                 cur.ledgerLiveIdx = -1;        // tracks STAGING progress until the swap
                 cur._ckptLast = -1;            // re-arm checkpointing (staging snapshots) from zero — per-chat cursor since v5.51
-                jobs = queueLedgerRebuild(targetTurn);
-                cur.ledgerRebuild = jobs > 0 ? { target: targetTurn, staging: true, attempts: 0 } : null;   // persisted: resumes at reopen
+                jobs = queueLedgerRebuild(effTarget);
+                cur.ledgerRebuild = jobs > 0 ? { target: effTarget, staging: true, attempts: 0 } : null;   // persisted: resumes at reopen
                 if (jobs === 0) cur.ledgerStaging = null;
             }
             await saveChatStore();
@@ -5088,15 +5128,23 @@ function onMessageDeleted(deletedIndex) {
 
         let _bulkTrim = false;
         let _genStale = true;
+        let _liPre = -1;   // pre-deletion live pointer — the timeline D belongs to
         if (delta === 1 && D >= 0 && D <= newLen) {
+            // D is a PRE-deletion index — every comparison against the pointer must
+            // use the pre-deletion pointer too. Reading it after reindexAfterDeletion
+            // (which decrements it) made the guard below false for exactly D == liveIdx:
+            // deleting the newest read turn — the most common deletion there is, the
+            // last AI reply — skipped the legacy rewind, and the stale ledger sat
+            // until the NEXT event (editing the message before it) tripped over the
+            // rewind this deletion owed. Same-frame capture, compared apples to apples.
+            _liPre = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : -1;
             reindexAfterDeletion(store, D);   // the common case: one message, known position — exact shift
             // Deleting a message the ledger never read (above the live pointer)
             // invalidates nothing in flight: passages below D are untouched and the
             // pointer did not shift. Bumping the generation here threw away COMPLETED
             // passes for no reason — the root of the 'it restarts after finishing'
             // loop when the user deleted during background reads.
-            const _li = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : -1;
-            if (D > _li) _genStale = false;
+            if (D > _liPre) _genStale = false;
         } else if (delta >= 1 || D >= 0) {
             clampStoreToLength(store, newLen);   // bulk / uncertain — safe overrun-only repair
             _bulkTrim = true;
@@ -5123,8 +5171,12 @@ function onMessageDeleted(deletedIndex) {
             // re-read everything. That is why deleting appeared to need a close and
             // reopen, and why returning to a chat re-read a ledger that was current.
             // Legacy chats (history predating the notes base) still need the fallback.
-            const _li = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : -1;
-            if (!notesCover(store, _li) && D >= 0 && D <= _li) {
+            // Two different pointers on purpose: whether the JOURNAL can vouch for the
+            // page is a question about NOW (post-deletion pointer); whether the deleted
+            // turn was within what the ledger had read is a question about THEN
+            // (pre-deletion pointer). Conflating them skipped the rewind for D == liveIdx.
+            const _liNow = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : -1;
+            if (!notesCover(store, _liNow) && D >= 0 && D <= _liPre) {
                 tryAutoRewindLedger(Math.max(0, D - 1), 'delete').catch(() => {});
             } else {
                 try { renderLedger(); } catch (_) { /* panel may be closed */ }
@@ -7740,7 +7792,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — the Manual Notepad gains a full-screen editor (⛶ in the panel; ⤡ Default / ✕ / Escape return to the panel — every keystroke is already saved, exiting never discards). Panel and editor are ONE document: keystrokes flow through the single #sc_notepad pipeline, every programmatic write (co-writer edits, undo, recall→notepad, panel reload) goes through one sync point, and a chat switch closes an open editor so text never crosses chats. Full history: git log.`);
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — deleting the last AI reply now rewinds the ledger AT the deletion (the guard compared the pre-deletion index against the post-deletion pointer — false for exactly that turn — so the rewind waited for the next event, e.g. editing the message before it); a staged rebuild's finish line is clamped to the last assistant turn (a user-indexed target waited for a scribe pass that can never come), and a rewind below the story's first reply installs the true empty state. Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

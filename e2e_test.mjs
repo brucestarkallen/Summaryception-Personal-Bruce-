@@ -373,6 +373,36 @@ try {
         ok(rec.some((r) => r && r.issue === 'legacy receipt (no range)'), 'receipts that cannot be judged are kept (they age out of the cap)');
     }
 
+    console.log('== 13. DELETE THE LAST AI REPLY (D == liveIdx): the rewind fires AT the deletion, not at the next edit ==');
+    {
+        // The reported shape: ...49 AI / 50 user / 51 AI on a legacy chat (journal
+        // does not cover), pointer on 51. Deleting 51 must rewind the ledger NOW.
+        // Before the fix, the guard compared the PRE-deletion index D against the
+        // POST-deletion pointer — false for exactly D == liveIdx — so nothing
+        // happened until editing message 50 tripped the edit-path rewind ("green
+        // checkpoint 49 banner"), one event too late, with turn-51 facts injected
+        // in between.
+        chat.push(mkMsg('Narrator', 'The verdict fell: Silas Kane was exiled from Marcroft.'));
+        const st = store();
+        const last = chat.length - 1;   // the "51"
+        st.ledger = { 'Silas Kane': { core: 'STALE: exiled from Marcroft', state: 'STALE: leaving the academy' } };   // no _t — synthesis must decline
+        st.ledgerNotes = [{ t: 99, name: 'Silas Kane', at: 1, base: true, core: 'STALE: exiled from Marcroft' }];
+        st.ledgerNotesFrom = 99;        // legacy region: the journal cannot vouch for anything
+        st.ledgerLiveIdx = last;        // the pointer sits ON the turn being deleted
+        st.ledgerEra = (st.ledgerEra | 0) + 1;   // no usable checkpoints either
+        st._ckptLast = -1;
+        await fire('GENERATION_STARTED');        // teach the router the pre-deletion length
+        const callsBefore3 = calls.length;
+        chat.splice(last, 1);
+        await fire('MESSAGE_DELETED', last);     // delta === 1, D === pre-deletion liveIdx
+        await sleep(4000);
+        ok(calls.length > callsBefore3, 'THE FIX: deleting the newest read turn triggers the rewind AT the deletion (scribe replay ran) — no edit needed');
+        const led4 = store().ledger || {};
+        const s4 = JSON.stringify(led4);
+        ok(!/exiled/i.test(s4), 'the deleted turn\'s facts are gone from the page without touching any other message');
+        ok(store().ledgerLiveIdx <= chat.length - 1, 'the live pointer lives inside the surviving chat');
+    }
+
     console.log('== 6. a REAL chat switch: new metadata AND new messages ==');
     const oldNames = Object.keys(store().ledger || {});
     ctx.chatMetadata = {};
