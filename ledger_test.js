@@ -30,7 +30,7 @@ const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
 const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', 'reindexAfterDeletion', '_computeLiveLedgerRange', '_NOTES_SOFT_CAP', '_NOTES_KEEP_TAIL', 'foldLedgerNotes', 'ledgerHistoryFor', '_histOpen', '_historyHtml', 'escapeHtml', 'notesCover', 'ensureLedgerNotes', 'appendLedgerNotes', 'rewindLedgerFromNotes', 'compactLedgerNotes', 'stripLeadingLabel', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_characterWeight', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
-    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive'];
+    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive', '_syncNotepadUi'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -45,18 +45,29 @@ function log(){}
 const document = { createElement(){ let _v = ''; return { set textContent(x){ _v = String(x); }, get innerHTML(){ return _v.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); } }; } };
 function toastr_noop(){}
 const SillyTavern = { getContext(){ return { chat: __chat }; } };
+let __dom = {};   // selector -> { val, text, present }
+function __resetDom(present){ __dom = {}; for (const k of (present||[])) __dom[k] = { val: '', text: '', present: true }; }
+function $(sel){
+    const d = __dom[sel] || (__dom[sel] = { val: '', text: '', present: false });
+    return {
+        length: d.present ? 1 : 0,
+        val(v){ if (v === undefined) return d.val; d.val = String(v); return this; },
+        text(v){ if (v === undefined) return d.text; d.text = String(v); return this; },
+    };
+}
 ${body}
 return {
   __setSettings: (v)=>{ __settings = v; },
   __setStore:    (v)=>{ __store = v; },
   __setChat:     (v)=>{ __chat = v; },
+  __resetDom, __dom: () => __dom,
   stripMetaBlocks, buildPassageFromRange, _ledgerDroppingPast, _editRewindDecision, _ledgerMissingCore, _missingCoreNotice, _synthesizeCheckpoint, computeLedgerCast, reindexAfterDeletion, _computeLiveLedgerRange, foldLedgerNotes, ledgerHistoryFor, _historyHtml, _histOpen, notesCover, ensureLedgerNotes, appendLedgerNotes, rewindLedgerFromNotes, compactLedgerNotes, _ledgerAuditTargets, _pickEvidenceIndices, buildLedgerAuditEvidence, _ambiguousTokens, _characterWeight,
   _escapeRegex, characterAliases, wordPresentInText, formatLedgerEntry,
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
   normalizeContinuityOutput, _continuitySig, mergeContinuityFlags, reconcileSnippetFlags, _findSnippetByTurnRange, _findSnippetsCovering,
   _baseNotesFromPage, adoptExternalLedgerEdits, _notesFromDeltas, _swapStagedLedgerIn,
-  _pinNeedle, _findPinSource, _pinAlive,
+  _pinNeedle, _findPinSource, _pinAlive, _syncNotepadUi,
 };
 `;
 const L = new Function(sandbox)();
@@ -1710,6 +1721,43 @@ section('resolved receipts — trimmed with the timeline they belong to');
     ok(/turnRange: Array\.isArray\(flag\.turnRange\) \? flag\.turnRange\.slice\(\) : undefined/.test(SRC_FULL), 'Apply stamps the receipt with the flag turn range');
     ok(SRC_FULL.includes('r && (!Array.isArray(r.turnRange) || r.turnRange[1] < chatLength));'), 'branch repair trims receipts about turns the branch abandoned');
     ok(SRC_FULL.includes('store.continuityResolved.filter(r => r && (!Array.isArray(r.turnRange) || r.turnRange[1] <= max));'), 'bulk-delete clamp trims receipts past the new end');
+}
+
+section('notepad — one document, two views (panel + full-screen editor)');
+{
+    // _syncNotepadUi being EXTRACTED is itself the guard: extraction only finds
+    // TOP-LEVEL declarations, and this function shipped its first draft nested
+    // inside getChatStore() — parse-green, ReferenceError at every call site.
+    ok(typeof L._syncNotepadUi === 'function', '_syncNotepadUi is top-level (a nested draft was parse-green and runtime-dead)');
+
+    // editor open: both views receive the write
+    L.__resetDom(['#sc_notepad', '#sc_notepad_fs_text', '#sc_notepad_fs_count']);
+    L._syncNotepadUi('Marcroft canon: the arch faces east');
+    let d = L.__dom();
+    ok(d['#sc_notepad'].val === 'Marcroft canon: the arch faces east', 'programmatic write lands in the panel textarea');
+    ok(d['#sc_notepad_fs_text'].val === 'Marcroft canon: the arch faces east', 'and in the open full-screen editor');
+    ok(d['#sc_notepad_fs_count'].text === '35 ch', 'and the editor char count follows');
+
+    // editor closed: panel only, no phantom writes
+    L.__resetDom(['#sc_notepad']);
+    L._syncNotepadUi('solo');
+    d = L.__dom();
+    ok(d['#sc_notepad'].val === 'solo' && (d['#sc_notepad_fs_text'].val === ''), 'with the editor closed only the panel is written');
+
+    ok(L._syncNotepadUi(null) === undefined && L.__dom()['#sc_notepad'].val === '', 'null clears rather than printing "null"');
+
+    // wiring contracts — every programmatic notepad writer goes through the one sync point
+    // Exactly two direct writes may exist: inside the sync point itself, and the
+    // full-screen editor's keystroke path — which deliberately writes THROUGH the
+    // panel via .trigger('input') so store/save/injection stay one pipeline.
+    {
+        const writes = (SRC_FULL.match(/\$\('#sc_notepad'\)\.val\([^)]+\)/g) || []);
+        ok(writes.length === 2 && SRC_FULL.includes("$('#sc_notepad').val(v).trigger('input')"), 'no stray direct #sc_notepad writes bypass the sync point (only the sync point + the editor keystroke pipeline)');
+    }
+    ok((SRC_FULL.match(/_syncNotepadUi\(/g) || []).length >= 5, 'all four programmatic writers + definition use the sync point');
+    ok(SRC_FULL.includes("$('#sc_notepad').val(v).trigger('input');"), 'the full-screen editor writes THROUGH the panel input pipeline — one store path');
+    ok(SRC_FULL.includes('window._closeNotepadFs === '.slice(0, 24)) && /onChatChanged\(\) \{\n    try \{ if \(typeof window/.test(SRC_FULL), 'a chat switch closes an open editor — its text belongs to the chat being left');
+    ok(SRC_FULL.includes("if (e.key === 'Escape' && $('#sc_notepad_fs').length) _closeNotepadFs();"), 'Escape closes the editor');
 }
 
 console.log('\n────────────────────────────────────────');

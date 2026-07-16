@@ -18,7 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
-const SC_VERSION = '5.76.0';   // real version — keep in sync with manifest.json on every release
+const SC_VERSION = '5.77.0';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -551,6 +551,19 @@ function patchLedgerPrompt() {
 
 function saveSettings() {
     SillyTavern.getContext().saveSettingsDebounced();
+}
+
+// Every PROGRAMMATIC write to the notepad UI goes through here so the panel
+// textarea and the full-screen editor (when open) can never disagree — the two
+// views are one document. User keystrokes flow the other way, through
+// #sc_notepad's input handler, which mirrors into the editor itself.
+function _syncNotepadUi(v) {
+    const val = String(v == null ? '' : v);
+    try {
+        $('#sc_notepad').val(val);
+        const $fs = $('#sc_notepad_fs_text');
+        if ($fs.length) { $fs.val(val); $('#sc_notepad_fs_count').text(val.length + ' ch'); }
+    } catch (_) {}
 }
 
 function getChatStore() {
@@ -5142,6 +5155,7 @@ function onMessageReceived(messageIndex) {
 }
 
 function onChatChanged() {
+    try { if (typeof window !== 'undefined' && typeof window._closeNotepadFs === 'function') window._closeNotepadFs(); } catch (_) {}
     log('Chat changed.');
     catchupDismissed = false;
     _clearLiveRetry();
@@ -5389,7 +5403,7 @@ function updateUI() {
         $('#sc_inject_ledger').prop('checked', s.injectLedger !== false);
         $('#sc_inject_summary').prop('checked', s.injectSummary !== false);
         $('#sc_inject_details').prop('checked', s.injectDetails !== false);
-        $('#sc_notepad').val(store.notepad || '');
+        _syncNotepadUi(store.notepad || '');
         $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
         $('#sc_sister_enabled').prop('checked', s.sisterEnabled !== false);
@@ -6095,7 +6109,7 @@ async function restoreMemorySnapshot() {
     await saveChatStore();
     updateInjection(true);
     updateUI();
-    $('#sc_notepad').val(store.notepad || '');
+    _syncNotepadUi(store.notepad || '');
     $('#sc_editor_undo').hide();
     $('#sc_editor_review_list').empty();
     _editorUndoSnapshot = null;
@@ -6199,7 +6213,7 @@ async function applyEditorOp(i) {
     const newVal = String(card.find('.sc-editor-new').val() ?? '').trim();
     if (pend.op === 'edit_notepad') {
         store.notepad = newVal;
-        $('#sc_notepad').val(newVal);
+        _syncNotepadUi(newVal);
     } else if (pend.ref) {
         const { obj, arr } = pend.ref;   // object reference — stable across splices
         if (pend.op === 'edit_snippet') { if (newVal) obj.text = newVal; }
@@ -6584,6 +6598,43 @@ function bindUIEvents() {
         getChatStore().notepad = $(this).val();
         saveChatStore();
         updateInjection(true);
+        const $fs = $('#sc_notepad_fs_text');
+        if ($fs.length && $fs.val() !== $(this).val()) { $fs.val($(this).val()); $('#sc_notepad_fs_count').text(String($(this).val()).length + ' ch'); }   // panel edits mirror into an open editor
+    });
+
+    // ── Notepad full-screen editor ──
+    // One store, one pipeline: the editor writes THROUGH #sc_notepad's input
+    // handler (val + trigger), so persistence, injection refresh, and any future
+    // notepad side effects live in exactly one place. Exiting never discards —
+    // every keystroke is already saved; ⤡ and ✕ both simply return to the panel.
+    $(document).on('click', '#sc_notepad_fullscreen', function () {
+        if ($('#sc_notepad_fs').length) return;   // already open
+        const cur = String(getChatStore().notepad || '');
+        const $ov = $(
+            '<div id="sc_notepad_fs" class="sc-notepad-fs-overlay">'
+            + '<div class="sc-notepad-fs-head">'
+            + '<span class="sc-notepad-fs-title">📝 Manual Notepad (this chat)</span>'
+            + '<span class="sc-notepad-fs-count" id="sc_notepad_fs_count"></span>'
+            + '<button id="sc_notepad_fs_min" class="menu_button" title="Back to the normal panel view — your text is already saved">⤡ Default</button>'
+            + '<button id="sc_notepad_fs_close" class="menu_button" title="Close — your text is already saved">✕</button>'
+            + '</div>'
+            + '<textarea id="sc_notepad_fs_text" class="sc-notepad-fs-text" placeholder="Lore this story must never forget — e.g. character names & canon, world rules, locations, ongoing plot facts."></textarea>'
+            + '</div>'
+        );
+        $('body').append($ov);
+        const $t = $('#sc_notepad_fs_text');
+        $t.val(cur);
+        $('#sc_notepad_fs_count').text(cur.length + ' ch');
+        $t.trigger('focus');
+    });
+    function _closeNotepadFs() { $('#sc_notepad_fs').remove(); }
+    window._closeNotepadFs = _closeNotepadFs;   // onChatChanged closes an open editor — its text belongs to the chat being left
+    $(document).on('click', '#sc_notepad_fs_min, #sc_notepad_fs_close', _closeNotepadFs);
+    $(document).on('keydown', function (e) { if (e.key === 'Escape' && $('#sc_notepad_fs').length) _closeNotepadFs(); });
+    $(document).on('input', '#sc_notepad_fs_text', function () {
+        const v = $(this).val();
+        $('#sc_notepad_fs_count').text(v.length + ' ch');
+        $('#sc_notepad').val(v).trigger('input');   // the one pipeline: store + save + injection + mirror-guard
     });
 
     // ── Detail Auditor (sister) ──
@@ -6814,7 +6865,7 @@ function bindUIEvents() {
     $(document).on('click', '#sc_recall_to_notepad', async () => {
         if(!_lastRecallText){ toastr.warning('Nothing recalled yet.','Summaryception'); return; }
         const st=getChatStore(); st.notepad=(st.notepad?st.notepad+'\n\n':'')+_lastRecallText;
-        await saveChatStore(); $('#sc_notepad').val(st.notepad); updateInjection(true);
+        await saveChatStore(); _syncNotepadUi(st.notepad); updateInjection(true);
         toastr.success('Recall appended to Notepad (permanent).','Summaryception');
     });
     $(document).on('input', '#sc_recall_k', function(){ getSettings().recallMaxSnippets=parseInt($(this).val())||4; saveSettings(); });
@@ -7689,7 +7740,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — pins now carry provenance — a pin injects only while its source text exists in the CURRENT chat, so a quote pinned on a branched-away timeline stops narrating this one (orphans stay visible in the panel and self-revive if a branch brings the text back; pins whose selection was never chat text inject unconditionally); the "Recently resolved" continuity receipts are stamped with their turn range and trimmed with the timeline they belonged to. Full history: git log.`);
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — the Manual Notepad gains a full-screen editor (⛶ in the panel; ⤡ Default / ✕ / Escape return to the panel — every keystroke is already saved, exiting never discards). Panel and editor are ONE document: keystrokes flow through the single #sc_notepad pipeline, every programmatic write (co-writer edits, undo, recall→notepad, panel reload) goes through one sync point, and a chat switch closes an open editor so text never crosses chats. Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

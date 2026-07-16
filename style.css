@@ -679,3 +679,56 @@ details.sc-collapse>:last-child{margin-bottom:14px}
 .sc-hist-list li { margin-bottom: 6px; }
 .sc-hist-turn { opacity: 0.7; font-size: 0.88em; }
 .sc-hist-body { margin-top: 2px; font-size: 0.94em; }
+
+/* ─── Notepad Full-Screen Editor ──────────────────────────────── */
+
+.sc-notepad-fs-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 100000;
+    background: #16171d;
+    color: #e8e8ec;
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+    padding: max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));
+}
+
+.sc-notepad-fs-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 2px 8px 2px;
+    flex: 0 0 auto;
+}
+
+.sc-notepad-fs-title {
+    font-weight: 600;
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.sc-notepad-fs-count {
+    opacity: 0.6;
+    font-size: 0.85em;
+    flex: 0 0 auto;
+}
+
+.sc-notepad-fs-text {
+    flex: 1 1 auto;
+    width: 100%;
+    min-height: 0;
+    resize: none;
+    box-sizing: border-box;
+    font-family: monospace;
+    font-size: 0.95em;
+    line-height: 1.5;
+    background: #0f1014;
+    color: #e8e8ec;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 8px;
+    padding: 10px;
+}
