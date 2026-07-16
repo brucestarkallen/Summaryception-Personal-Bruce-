@@ -30,7 +30,7 @@ const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
 const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', 'reindexAfterDeletion', '_computeLiveLedgerRange', '_NOTES_SOFT_CAP', '_NOTES_KEEP_TAIL', 'foldLedgerNotes', 'ledgerHistoryFor', '_histOpen', '_historyHtml', 'escapeHtml', 'notesCover', 'ensureLedgerNotes', 'appendLedgerNotes', 'rewindLedgerFromNotes', 'compactLedgerNotes', 'stripLeadingLabel', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_characterWeight', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
-    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn'];
+    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -56,6 +56,7 @@ return {
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
   normalizeContinuityOutput, _continuitySig, mergeContinuityFlags, reconcileSnippetFlags, _findSnippetByTurnRange, _findSnippetsCovering,
   _baseNotesFromPage, adoptExternalLedgerEdits, _notesFromDeltas, _swapStagedLedgerIn,
+  _pinNeedle, _findPinSource, _pinAlive,
 };
 `;
 const L = new Function(sandbox)();
@@ -1653,7 +1654,66 @@ section('adoption guards — divergence is only adopted when it means intent');
     ok(L.foldLedgerNotes(store.ledgerNotes, Infinity)['Claire'] !== undefined, 'the journal cast is untouched');
 }
 
+section('pin provenance — a pin injects only while its text exists in THIS branch');
+{
+    // needle: the truncation ellipsis is display, not content
+    eq(L._pinNeedle({ excerpt: 'She turned away\u2026' }), 'She turned away', 'needle strips the truncation ellipsis');
+    eq(L._pinNeedle({ excerpt: 'plain' }), 'plain', 'needle passes plain excerpts through');
+    eq(L._pinNeedle(null), '', 'needle: null pin is empty');
+
+    const chat = [
+        { mes: 'Claire waited by the arch.' },
+        { mes: 'Jovan stepped onto the platform. Claire did not move.' },
+        { mes: 'She said: "You came back." Claire did not move.' },
+    ];
+    // newest-first: a repeated quote resolves to its LATEST occurrence
+    eq(L._findPinSource({ excerpt: 'Claire did not move.' }, chat), 2, 'find: repeated quote resolves newest-first');
+    eq(L._findPinSource({ excerpt: 'by the arch' }, chat), 0, 'find: substring anywhere in the message');
+    eq(L._findPinSource({ excerpt: 'never written' }, chat), -1, 'find: absent text is -1');
+    eq(L._findPinSource({ excerpt: 'Jovan stepped onto the platform. Claire d\u2026' }, chat), 1, 'find: truncated pin matches its source as a prefix');
+
+    // alive: cached index still valid — no rescan, srcIdx untouched
+    const p1 = { excerpt: 'by the arch', srcIdx: 0 };
+    ok(L._pinAlive(p1, chat) === true && p1.srcIdx === 0, 'alive: valid cache hits without rescan');
+
+    // alive: a deletion shifted the source — rescan adopts the new index
+    const p2 = { excerpt: 'You came back.', srcIdx: 2 };
+    const shifted = [chat[0], chat[2]];   // message 1 deleted
+    ok(L._pinAlive(p2, shifted) === true && p2.srcIdx === 1, 'alive: shifted source is re-found and the cache updated');
+
+    // alive: BRANCHED AWAY — the reported bug: the pin must stop injecting
+    const p3 = { excerpt: 'You came back.', srcIdx: 2 };
+    const branched = [chat[0], chat[1]];   // branch below the pinned turn
+    ok(L._pinAlive(p3, branched) === false && p3.srcIdx === -1, 'THE BUG: a pin from a branched-away turn is orphaned, not injected');
+
+    // alive: the branch comes back (or another branch contains the text) — self-revives
+    ok(L._pinAlive(p3, chat) === true && p3.srcIdx === 2, 'orphan self-revives when the text exists again');
+
+    // alive: free pin (selection was never chat text) injects unconditionally
+    ok(L._pinAlive({ excerpt: 'anything', srcIdx: null }, []) === true, 'free pin (srcIdx null) is timeline-independent');
+
+    // alive: legacy pin (no srcIdx) resolves lazily — found adopts, missing orphans
+    const legacyFound = { excerpt: 'by the arch' };
+    ok(L._pinAlive(legacyFound, chat) === true && legacyFound.srcIdx === 0, 'legacy pin lazily adopts its source index');
+    const legacyGone = { excerpt: 'from a dead timeline' };
+    ok(L._pinAlive(legacyGone, chat) === false && legacyGone.srcIdx === -1, 'legacy pin whose text is gone is orphaned — the leak is closed for old data too');
+
+    // wiring: injection gates on liveness; creation stamps provenance; panel shows the same truth
+    ok(SRC_FULL.includes("if(!_pinAlive(p, chat)) continue;"), 'buildPinnedBlock: dead pins are excluded from injection');
+    ok(SRC_FULL.includes("srcIdx: (_src >= 0 ? _src : null)"), 'addPin: provenance stamped at creation — the only moment free-vs-quote is knowable');
+    ok(SRC_FULL.includes("const alive=_pinAlive(p, chat);"), 'renderPins: the panel judges liveness with the SAME function the injection uses');
+}
+
+section('resolved receipts — trimmed with the timeline they belong to');
+{
+    ok(/turnRange: Array\.isArray\(f\.turnRange\) \? f\.turnRange\.slice\(\) : undefined/.test(SRC_FULL), 'Resolve stamps the receipt with the flag turn range');
+    ok(/turnRange: Array\.isArray\(flag\.turnRange\) \? flag\.turnRange\.slice\(\) : undefined/.test(SRC_FULL), 'Apply stamps the receipt with the flag turn range');
+    ok(SRC_FULL.includes('r && (!Array.isArray(r.turnRange) || r.turnRange[1] < chatLength));'), 'branch repair trims receipts about turns the branch abandoned');
+    ok(SRC_FULL.includes('store.continuityResolved.filter(r => r && (!Array.isArray(r.turnRange) || r.turnRange[1] <= max));'), 'bulk-delete clamp trims receipts past the new end');
+}
+
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);
-if (fail > 0) { console.log('\nFAILURES:'); fails.forEach(f => console.log('  - ' + f)); process.exit(1); }
+if (fail > 0) { 
+console.log('\nFAILURES:'); fails.forEach(f => console.log('  - ' + f)); process.exit(1); }
 console.log('ALL CHARACTER-LEDGER ASSERTIONS PASS ✓');

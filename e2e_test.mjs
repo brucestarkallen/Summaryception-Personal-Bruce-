@@ -342,6 +342,37 @@ try {
         ok(led3['Claire Argent'] && !String(led3['Claire Argent'].core).includes('STALE'), 'KILL SHOT: the fold after the swap keeps the REBUILT truth — the rebuild no longer self-undoes');
     }
 
+    console.log('== 12. BRANCH HYGIENE: dead-timeline pins leave the injection; future receipts leave the log ==');
+    {
+        const st = store();
+        // Four pins, four provenance classes. The chat right now (post scene 11):
+        // 0 'I step off…' 1 'Claire Argent waited by the arch…' 2 'I meet her eyes.'
+        // 3 'Jovan Argent stepped onto the platform…' 4 'I speak first.'
+        st.pins = [
+            { id: 'p_live',   mesId: 1, srcIdx: 1,    excerpt: 'Claire Argent waited by the arch', label: '', createdAt: 1 },
+            { id: 'p_free',   mesId: 4, srcIdx: null, excerpt: 'STYLE NOTE: keep the prose terse', label: '', createdAt: 2 },
+            { id: 'p_dead',   mesId: 7, srcIdx: 7,    excerpt: 'the Council Hall verdict was read aloud', label: '', createdAt: 3 },
+            { id: 'p_legacy', mesId: 6,               excerpt: 'the masked fighter fell at the gate', label: '', createdAt: 4 },
+        ];
+        st.continuityResolved = [
+            { issue: 'future receipt', fix: 'x', kind: 'contradiction', turnRange: [90, 95], resolvedAt: 1 },
+            { issue: 'legacy receipt (no range)', fix: 'y', kind: 'drift', resolvedAt: 2 },
+        ];
+        // A real bulk trim — the branch shape — through the real router.
+        chat.push(mkMsg('Player', 'And then.', true), mkMsg('Narrator', 'Claire Argent smiled, briefly.'));
+        await fire('GENERATION_STARTED');
+        chat.length = 5;
+        await fire('MESSAGE_DELETED', 5);
+        await sleep(1500);
+        ok(/waited by the arch/.test(injected), 'a pin whose source text lives in THIS branch still injects');
+        ok(/keep the prose terse/.test(injected), 'a free pin (never chat text) injects unconditionally');
+        ok(!/Council Hall verdict/.test(injected), 'THE LEAK, CLOSED: a pin quoting a branched-away turn no longer narrates this timeline');
+        ok(!/masked fighter fell/.test(injected), 'legacy pins (no provenance) are held to the same rule');
+        const rec = store().continuityResolved || [];
+        ok(!rec.some((r) => r && r.issue === 'future receipt'), 'a resolved receipt about abandoned turns is trimmed at the branch');
+        ok(rec.some((r) => r && r.issue === 'legacy receipt (no range)'), 'receipts that cannot be judged are kept (they age out of the cap)');
+    }
+
     console.log('== 6. a REAL chat switch: new metadata AND new messages ==');
     const oldNames = Object.keys(store().ledger || {});
     ctx.chatMetadata = {};

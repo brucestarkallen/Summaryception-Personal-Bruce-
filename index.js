@@ -18,7 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
-const SC_VERSION = '5.75.1';   // real version — keep in sync with manifest.json on every release
+const SC_VERSION = '5.76.0';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -1150,6 +1150,11 @@ async function repairIfBranched() {
     // if the same issue still exists it'll be re-flagged when the branch re-summarizes.
     store.continuityFlags = (store.continuityFlags || []).filter(f =>
         f && (!Array.isArray(f.turnRange) || (f.turnRange[0] >= 0 && f.turnRange[1] <= store.summarizedUpTo)));
+    // The "Recently resolved" receipts are display-only, but receipts about turns
+    // this branch abandoned are noise — trim the ones whose turns no longer exist.
+    // Legacy entries without a turnRange can't be judged; they age out of the cap.
+    store.continuityResolved = (store.continuityResolved || []).filter(r =>
+        r && (!Array.isArray(r.turnRange) || r.turnRange[1] < chatLength));
 
     await saveChatStore();
     log(`Branch repair complete. summarizedUpTo: ${oldSummarizedUpTo} → ${store.summarizedUpTo}, un-ghosted ${unghosted} turn(s).`);
@@ -3627,7 +3632,7 @@ async function resolveContinuityFlag(id) {
     const f = list[i];
     list.splice(i, 1);
     if (!Array.isArray(store.continuityResolved)) store.continuityResolved = [];
-    store.continuityResolved.unshift({ issue: f.issue, fix: f.fix, kind: f.kind, resolvedAt: Date.now() });
+    store.continuityResolved.unshift({ issue: f.issue, fix: f.fix, kind: f.kind, turnRange: Array.isArray(f.turnRange) ? f.turnRange.slice() : undefined, resolvedAt: Date.now() });
     store.continuityResolved = store.continuityResolved.slice(0, 20);
     await saveChatStore(); updateInjection(); try { renderLedger(); } catch (_) {}
     log(`Continuity: flag ${id} resolved.`);
@@ -3700,7 +3705,7 @@ async function applyContinuityFix(id) {
     const i = list.findIndex(f => f && f.id === flag.id);
     if (i >= 0) list.splice(i, 1);
     if (!Array.isArray(store.continuityResolved)) store.continuityResolved = [];
-    store.continuityResolved.unshift({ issue: flag.issue, fix: flag.fix, kind: flag.kind, applied: changed, resolvedAt: Date.now() });
+    store.continuityResolved.unshift({ issue: flag.issue, fix: flag.fix, kind: flag.kind, turnRange: Array.isArray(flag.turnRange) ? flag.turnRange.slice() : undefined, applied: changed, resolvedAt: Date.now() });
     store.continuityResolved = store.continuityResolved.slice(0, 20);
     await saveChatStore(); updateInjection(); try { renderLedger(); } catch (_) {}
     log(`Continuity: flag ${flag.id} applied (snippet ${changed ? 'rewritten' : 'unchanged'}).`);
@@ -5053,6 +5058,9 @@ function clampStoreToLength(store, newLen) {
         }
     }
     if (Array.isArray(store.ghostedIndices)) store.ghostedIndices = store.ghostedIndices.filter(i => i <= max);
+    if (Array.isArray(store.continuityResolved)) {
+        store.continuityResolved = store.continuityResolved.filter(r => r && (!Array.isArray(r.turnRange) || r.turnRange[1] <= max));
+    }
 }
 
 function onMessageDeleted(deletedIndex) {
@@ -6286,6 +6294,42 @@ async function clearAuthorsNoteHard() {
 }
 
 // ─── Pinned Memories ──────────────────────────────────────────────────
+// ── Pin provenance ──────────────────────────────────────────────────
+// Pins are injected VERBATIM every turn, so a pin whose source turn was branched
+// away kept narrating a timeline that no longer exists — prose from the future
+// injected forever, with nothing trimming it. mesId cannot gate this: it records
+// when the pin was CREATED (last message index at pin time), not where the quoted
+// text LIVES. The honest rule is provenance: a pin injects only while its text
+// still exists in the current chat. srcIdx caches where; null declares a FREE pin
+// (the selection was never chat text — decidable only at creation) that injects
+// unconditionally; -1 marks an orphan (source text gone from this branch): shown
+// in the panel, excluded from injection, revived automatically if a later branch
+// brings the text back (every liveness miss rescans).
+function _pinNeedle(pin) {
+    let x = String((pin && pin.excerpt) || '');
+    if (x.endsWith('\u2026')) x = x.slice(0, -1);   // addPin appends … when a long selection is truncated — the stored excerpt is then a PREFIX of the source
+    return x;
+}
+function _findPinSource(pin, chat) {
+    const needle = _pinNeedle(pin);
+    if (!needle || !Array.isArray(chat)) return -1;
+    for (let i = chat.length - 1; i >= 0; i--) {   // newest-first: a repeated quote resolves to its latest occurrence
+        const m = chat[i];
+        if (m && typeof m.mes === 'string' && m.mes.includes(needle)) return i;
+    }
+    return -1;
+}
+function _pinAlive(pin, chat) {
+    if (!pin) return false;
+    if (pin.srcIdx === null) return true;   // free pin — timeline-independent by declaration at creation
+    const idx = (typeof pin.srcIdx === 'number' && pin.srcIdx >= 0) ? pin.srcIdx : -1;
+    if (idx >= 0 && Array.isArray(chat) && chat[idx] && typeof chat[idx].mes === 'string' && chat[idx].mes.includes(_pinNeedle(pin))) return true;
+    // Cache miss: source deleted, shifted by a deletion, edited, or a legacy pin
+    // (no srcIdx) resolving for the first time. One rescan settles all of them.
+    pin.srcIdx = _findPinSource(pin, chat);
+    return pin.srcIdx >= 0;
+}
+
 function getPins() { const st=getChatStore(); if(!Array.isArray(st.pins)) st.pins=[]; return st.pins; }
 
 async function addPin(label) {
@@ -6297,7 +6341,11 @@ async function addPin(label) {
     }
     if(!excerpt){ toastr.warning('Nothing to pin.','Summaryception'); return; }
     const cap=s.pinMaxChars??1500; if(excerpt.length>cap) excerpt=excerpt.slice(0,cap)+'…';
-    getPins().push({ id:'pin_'+Date.now(), mesId:(chat?.length||1)-1, excerpt, label:(label||'').trim(), createdAt:Date.now() });
+    const _src = _findPinSource({ excerpt }, chat);
+    // Found: quote text, gated on liveness. Not found: the selection was never chat
+    // text — a FREE pin (null), injected unconditionally. Only creation can tell
+    // these apart; later, "absent from chat" is indistinguishable from "branched away".
+    getPins().push({ id:'pin_'+Date.now(), mesId:(chat?.length||1)-1, srcIdx: (_src >= 0 ? _src : null), excerpt, label:(label||'').trim(), createdAt:Date.now() });
     await saveChatStore(); updateInjection(true); renderPins();
     toastr.success('Pinned ('+excerpt.length+' chars)','Summaryception',{timeOut:2000});
 }
@@ -6306,9 +6354,10 @@ function renderPins() {
     const el=$('#sc_pins_list'); if(!el.length) return;
     const pins=getPins();
     if(pins.length===0){ el.html('<div class="sc-hint">No pins yet. Select text (or nothing = last message) and pin it — pins are injected verbatim every turn, immune to summarization.</div>'); return; }
+    const { chat }=SillyTavern.getContext();
     let total=0, html='';
-    for(const p of pins){ total+=p.excerpt.length;
-        html+='<div class="sc-pin-item" data-id="'+p.id+'"><span class="sc-pin-label">📌 '+escapeHtml(p.label||('msg #'+p.mesId))+' <small>('+p.excerpt.length+' ch)</small></span><span class="sc-pin-text">'+escapeHtml(p.excerpt.slice(0,160))+(p.excerpt.length>160?'…':'')+'</span><button class="sc-pin-unpin menu_button fa-solid fa-xmark" title="Unpin"></button></div>';
+    for(const p of pins){ const alive=_pinAlive(p, chat); if(alive) total+=p.excerpt.length;
+        html+='<div class="sc-pin-item'+(alive?'':' sc-pin-orphan')+'" data-id="'+p.id+'"'+(alive?'':' style="opacity:.55" title="Source text no longer exists in this branch — not injected. Unpin it, or re-pin from live text; it revives by itself if a branch brings the text back."')+'><span class="sc-pin-label">'+(alive?'📌 ':'⚠️ ')+escapeHtml(p.label||('msg #'+p.mesId))+' <small>('+(alive?p.excerpt.length+' ch':'orphaned')+')</small></span><span class="sc-pin-text"'+(alive?'':' style="text-decoration:line-through"')+'>'+escapeHtml(p.excerpt.slice(0,160))+(p.excerpt.length>160?'…':'')+'</span><button class="sc-pin-unpin menu_button fa-solid fa-xmark" title="Unpin"></button></div>';
     }
     html+='<div class="sc-hint">Total: '+total+' chars (cap '+(getSettings().pinsMaxTotalChars??6000)+')</div>';
     el.html(html);
@@ -6316,8 +6365,10 @@ function renderPins() {
 
 function buildPinnedBlock() {
     const s=getSettings(); const pins=getPins(); if(pins.length===0) return '';
+    const { chat }=SillyTavern.getContext();
     const cap=s.pinsMaxTotalChars??6000; let used=0; const parts=[];
     for(let i=pins.length-1;i>=0;i--){ const p=pins[i];   // newest kept first under cap
+        if(!_pinAlive(p, chat)) continue;   // source text not in THIS branch — a quote from an abandoned timeline must not narrate this one
         if(used+p.excerpt.length>cap){ log('Pins over cap — oldest pins truncated from injection.'); break; }
         used+=p.excerpt.length; parts.unshift((p.label?('['+p.label+'] '):'')+p.excerpt);
     }
@@ -7638,7 +7689,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — the staged-rebuild swap now installs the page WITH its journal (the rebuild journals its own reads; one real swap function serves both completion paths), so a rebuild no longer self-undoes at the first fold or rewind after it; the old journal is re-based to the serving page at rebuild start so only genuine external edits are carried across (and when a resumed legacy rebuild reaches the swap with a journal that cannot vouch for the page, adoption is skipped rather than journaling the doomed page as "edits"); audit corrections land at each entry's own turn, so the roster's "last seen" and branch decontamination are never falsified by an audit. Full history: git log.`);
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — pins now carry provenance — a pin injects only while its source text exists in the CURRENT chat, so a quote pinned on a branched-away timeline stops narrating this one (orphans stay visible in the panel and self-revive if a branch brings the text back; pins whose selection was never chat text inject unconditionally); the "Recently resolved" continuity receipts are stamped with their turn range and trimmed with the timeline they belonged to. Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
