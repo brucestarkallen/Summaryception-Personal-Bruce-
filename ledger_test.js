@@ -30,7 +30,7 @@ const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
 const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', 'reindexAfterDeletion', '_computeLiveLedgerRange', '_NOTES_SOFT_CAP', '_NOTES_KEEP_TAIL', 'foldLedgerNotes', 'ledgerHistoryFor', '_histOpen', '_historyHtml', 'escapeHtml', 'notesCover', 'ensureLedgerNotes', 'appendLedgerNotes', 'rewindLedgerFromNotes', 'compactLedgerNotes', 'stripLeadingLabel', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_characterWeight', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
-    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering'];
+    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -55,6 +55,7 @@ return {
   buildCharacterBlock, serializeLedgerForScribe, resolveLedgerKey, mergeLedgerDeltas,
   subst, _storeHasContent, _computeLiveLedgerRange, _selectRoster, _composeRoster, _pickCheckpoint, _computeReplayChunks, _selectCheckpointKeeps, _contiguousRanges, _selectStorageEvictions,
   normalizeContinuityOutput, _continuitySig, mergeContinuityFlags, reconcileSnippetFlags, _findSnippetByTurnRange, _findSnippetsCovering,
+  _baseNotesFromPage, adoptExternalLedgerEdits,
 };
 `;
 const L = new Function(sandbox)();
@@ -1372,6 +1373,157 @@ section('page == fold(notes) — the rebuild swap must not clobber live work');
 ok(SRC_FULL.includes('st.ledger = foldLedgerNotes(st.ledgerNotes, Infinity);'), 'the swap folds instead of assigning');
 ok(!/if \(st\.ledgerRebuild\.staging && st\.ledgerStaging && Object\.keys\(st\.ledgerStaging\)\.length > 0\) st\.ledger = st\.ledgerStaging;/.test(SRC_FULL), 'the blind assignment that clobbered live work is gone');
 ok(!SRC_FULL.includes('a staged rebuild writes its own notes on swap'), 'the comment that claimed a thing the code never did is gone');
+
+
+// ─── EXTERNAL EDITS ARE JOURNAL TRUTH: page ↔ notes reconciliation ───
+section('tombstones — a deletion is journaled; folds cannot resurrect');
+{
+    const notes = [
+        { t: 5, name: 'Silas', at: 1, core: 'quiet observer', state: 'in the library' },
+        { t: 9, name: 'Silas', at: 2, gone: true },
+    ];
+    const page = L.foldLedgerNotes(notes, Infinity);
+    ok(!('Silas' in page), 'fold honors a tombstone: the deleted character stays deleted');
+    notes.push({ t: 14, name: 'Silas', at: 3, core: 'returned, changed', state: 'at the gates' });
+    const page2 = L.foldLedgerNotes(notes, Infinity);
+    ok(page2['Silas'] && page2['Silas'].core === 'returned, changed', 'a LATER note lawfully re-introduces the character');
+    ok(page2['Silas'].state === 'at the gates', 'and the re-introduction carries only post-tombstone facts');
+    const rewound = L.foldLedgerNotes(notes, 7);
+    ok(rewound['Silas'] && rewound['Silas'].state === 'in the library', 'rewinding BELOW the tombstone brings them back — deletion is an event in time, not an erasure of history');
+}
+ok(SRC_FULL.includes("store.ledgerNotes.push({ t: _t, name, at: Date.now(), gone: true });"), 'panel delete writes the tombstone (page-only deletes resurrected on the next fold)');
+
+section('adoptExternalLedgerEdits — copilot page edits survive every fold');
+{
+    // The reported class: the Chat Assistant fixes a wrong ledger state by writing
+    // the PAGE. Nothing journals it. One message deletion later, the refold
+    // silently reverts the fix. The reconciler adopts the diff as a note first.
+    const store = {
+        ledgerLiveIdx: 20, ledgerNotesFrom: 0,
+        ledgerNotes: [
+            { t: 10, name: 'Stella', at: 1, core: 'ambitious duelist', state: 'at the dorms' },
+            { t: 18, name: 'Honami', at: 2, core: 'student council', state: 'in the courtyard' },
+        ],
+        ledger: null,
+    };
+    store.ledger = L.foldLedgerNotes(store.ledgerNotes, Infinity);
+    // External (copilot) edit: correct Stella's state on the page only.
+    store.ledger['Stella'].state = 'confined to the infirmary';
+    const n1 = L.adoptExternalLedgerEdits(store);
+    ok(n1 === 1, 'exactly the one divergent field is adopted (got ' + n1 + ')');
+    const refold = L.foldLedgerNotes(store.ledgerNotes, Infinity);
+    ok(refold['Stella'].state === 'confined to the infirmary', 'THE FIX: the copilot edit is journal truth — a refold keeps it');
+    ok(refold['Stella'].core === 'ambitious duelist', 'untouched fields are untouched');
+    ok(refold['Honami'].state === 'in the courtyard', 'other characters are untouched');
+    ok(L.adoptExternalLedgerEdits(store) === 0, 'idempotent: page == fold(notes) adopts nothing');
+
+    // Survives the real rewind path (which folds).
+    L.__setStore(store);
+    store.ledger = L.foldLedgerNotes(store.ledgerNotes, Infinity);
+    store.ledger['Honami'].arc = 'suspects the masked fighter';
+    ok(L.rewindLedgerFromNotes(20) === true, 'rewind path runs (notes cover the target)');
+    ok(store.ledger['Honami'].arc === 'suspects the masked fighter', 'an external edit made just before a rewind survives it');
+
+    // External NEW character (copilot structural replace can create one).
+    store.ledger['Claire'] = { core: 'transfer student', state: 'unassigned dorm', threads: ['find the fight ring'] };
+    const n2 = L.adoptExternalLedgerEdits(store);
+    ok(n2 === 1, 'a page-only character is adopted whole');
+    const refold2 = L.foldLedgerNotes(store.ledgerNotes, Infinity);
+    ok(refold2['Claire'] && refold2['Claire'].core === 'transfer student' && refold2['Claire'].threads.length === 1, 'and folds back complete');
+
+    // External deletion → tombstone.
+    delete store.ledger['Stella'];
+    const n3 = L.adoptExternalLedgerEdits(store);
+    ok(n3 === 1, 'a page-side deletion is adopted as a tombstone');
+    const refold3 = L.foldLedgerNotes(store.ledgerNotes, Infinity);
+    ok(!('Stella' in refold3), 'and the fold keeps them deleted');
+
+    // Audit stamps ride adoption too.
+    store.ledger = L.foldLedgerNotes(store.ledgerNotes, Infinity);
+    store.ledger['Honami']._a = 19;
+    L.adoptExternalLedgerEdits(store);
+    ok(L.foldLedgerNotes(store.ledgerNotes, Infinity)['Honami']._a === 19, 'an _a stamp diff is adopted (folds no longer force re-audits)');
+}
+{
+    // Staged rebuild: _ledgerDroppingPast trims the SERVING page on purpose.
+    // Those trims are temporary hygiene — they must NOT be adopted as deletions.
+    const store = {
+        ledgerLiveIdx: 3, ledgerNotesFrom: 0,
+        ledgerRebuild: { target: 30, staging: true },
+        ledgerNotes: [
+            { t: 10, name: 'Alaric', at: 1, core: 'proctor', state: 'observing' },
+            { t: 12, name: 'Emilia', at: 2, core: 'heiress', state: 'front row' },
+        ],
+        ledger: { 'Alaric': { core: 'proctor', state: 'observing', _t: 10 } },  // Emilia trimmed from the serving copy
+    };
+    const n = L.adoptExternalLedgerEdits(store);
+    ok(n === 0, 'no tombstone is adopted for a rebuild-trimmed character');
+    ok(L.foldLedgerNotes(store.ledgerNotes, Infinity)['Emilia'] !== undefined, 'Emilia survives in the journal for the rebuild to reconcile');
+    store.ledger['Alaric'].state = 'called the match';
+    ok(L.adoptExternalLedgerEdits(store) === 1, 'field edits are still adopted mid-rebuild');
+}
+{
+    // Same-turn tie: an adopted note must beat the scribe note it corrects.
+    const store = {
+        ledgerLiveIdx: 7, ledgerNotesFrom: 0,
+        ledgerNotes: [ { t: 7, name: 'Jovan', at: 100, state: 'in the training yard' } ],
+        ledger: { 'Jovan': { state: 'slipping out the east gate' } },
+    };
+    L.adoptExternalLedgerEdits(store);
+    ok(L.foldLedgerNotes(store.ledgerNotes, Infinity)['Jovan'].state === 'slipping out the east gate', 'the adoption outranks a same-turn scribe note (later timestamp wins the tie)');
+}
+
+section('_baseNotesFromPage — restarting the journal from a page is exact');
+{
+    const page = {
+        'Alexia': { core: 'sharp-tongued', state: 'training', arc: 'rivalry', threads: ['beat Stella'], _a: 4, updatedAt: 111 },
+        'Silas': { state: 'missing' },
+    };
+    const base = L._baseNotesFromPage(page, 9);
+    ok(base.length === 2 && base.every(n => n.base === true && n.t === 9), 'one base note per entry, all at the restore turn');
+    const fold = L.foldLedgerNotes(base, Infinity);
+    ok(JSON.stringify(Object.keys(fold).sort()) === JSON.stringify(['Alexia', 'Silas']), 'fold(base) has exactly the page cast');
+    ok(fold['Alexia'].core === 'sharp-tongued' && fold['Alexia'].threads[0] === 'beat Stella' && fold['Alexia']._a === 4, 'every field round-trips: the invariant page == fold(notes) is re-established');
+}
+
+section('journal hygiene — fallback rewinds cannot leave ghost notes');
+ok(SRC_FULL.includes('_st0.ledgerNotes = [];'), 'turn-0 clear: the journal clears WITH the page (ghosts re-materialized the abandoned ledger)');
+ok(SRC_FULL.includes('store.ledgerNotes = _baseNotesFromPage(store.ledger, ckpt.atTurn);'), 'checkpoint restore: the journal is rebased on the restored page');
+ok(SRC_FULL.includes('if (Array.isArray(cur.ledgerNotes)) cur.ledgerNotes = cur.ledgerNotes.filter(n => n && typeof n.t === \'number\' && n.t <= targetTurn);'), 'staged rebuild entry: ghost notes past the target are trimmed before any mid-rebuild fold can paint them back');
+ok(SRC_FULL.includes('adoptExternalLedgerEdits(st, _at);'), 'rebuild swap: external page edits are adopted before the final fold');
+ok(SRC_FULL.includes('try { adoptExternalLedgerEdits(store); } catch (e)'), 'scribe merge: durable early adoption before new deltas land');
+ok((SRC_FULL.match(/adoptExternalLedgerEdits\(store\);/g) || []).length >= 3, 'rewind, message-deletion refold, and merge all reconcile first');
+ok(SRC_FULL.includes("store.ledgerNotes.push({ t: _t, name: key, at: Date.now(), a: stampAt });"), 'the audit stamp rides the journal (page-only stamps forced endless re-audits)');
+
+section('adoption guards — divergence is only adopted when it means intent');
+{
+    // Persisted pre-v5.73 clobber: the page saved STALER than its own journal
+    // (_t proves it). Adoption must skip it so the fold repairs the bug instead
+    // of freezing it as truth.
+    const store = {
+        ledgerLiveIdx: 134, ledgerNotesFrom: 0,
+        ledgerNotes: [
+            { t: 120, name: 'Alaric', at: 1, state: "at the official's mark" },
+            { t: 134, name: 'Alaric', at: 2, state: "at the dais, Emilia's right shoulder" },
+        ],
+        ledger: { 'Alaric': { state: "at the official's mark", _t: 120 } },
+    };
+    ok(L.adoptExternalLedgerEdits(store) === 0, 'a provably-stale page entry (_t behind the journal) is NOT adopted');
+    ok(L.foldLedgerNotes(store.ledgerNotes, Infinity)['Alaric'].state === "at the dais, Emilia's right shoulder", 'so the fold repairs the persisted clobber instead of freezing it');
+    // A copilot edit never rewrites _t — equal stamps mean the divergence is intent.
+    store.ledger = L.foldLedgerNotes(store.ledgerNotes, Infinity);
+    store.ledger['Alaric'].state = 'escorted out by proctors';
+    ok(L.adoptExternalLedgerEdits(store) === 1, 'equal _t + different text = a genuine external edit, adopted');
+}
+{
+    // An empty page is a page that was never materialized, not a mass deletion.
+    const store = {
+        ledgerLiveIdx: 9, ledgerNotesFrom: 0, ledger: {},
+        ledgerNotes: [{ t: 3, name: 'Claire', at: 1, core: 'guarded' }],
+    };
+    ok(L.adoptExternalLedgerEdits(store) === 0, 'an empty page adopts no tombstones');
+    ok(L.foldLedgerNotes(store.ledgerNotes, Infinity)['Claire'] !== undefined, 'the journal cast is untouched');
+}
 
 console.log('\n────────────────────────────────────────');
 console.log(`RESULT: ${pass} passed, ${fail} failed`);

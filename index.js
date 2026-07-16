@@ -18,6 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
+const SC_VERSION = '5.74.0';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -2087,7 +2088,17 @@ async function auditLedgerEntries(opts = {}) {
         // Stamp every audited entry (changed or not) so the round-robin advances and
         // the same characters are not re-checked forever.
         const stampAt = (typeof liveIdx === 'number') ? liveIdx : 0;
-        for (const n of targets) { const key = resolveLedgerKey(ledger, n); if (ledger[key]) ledger[key]._a = stampAt; }
+        for (const n of targets) {
+            const key = resolveLedgerKey(ledger, n);
+            if (!ledger[key]) continue;
+            ledger[key]._a = stampAt;
+            // The stamp must ride the journal too: page-only stamps were erased by
+            // every fold, so the auditor re-checked the same characters forever.
+            if (Array.isArray(store.ledgerNotes)) {
+                const _t = (typeof ledger[key]._t === 'number') ? ledger[key]._t : stampAt;
+                store.ledgerNotes.push({ t: _t, name: key, at: Date.now(), a: stampAt });
+            }
+        }
 
         await saveChatStore();
         if (changed > 0) { updateInjection(true); try { renderLedger(); } catch (_) {} }
@@ -2204,6 +2215,7 @@ function foldLedgerNotes(notes, maxTurn) {
         .sort((a, b) => (a.t - b.t) || ((a.at || 0) - (b.at || 0)));
     for (const n of rows) {
         const key = resolveLedgerKey(out, n.name.trim());
+        if (n.gone === true) { delete out[key]; continue; }   // tombstone: deleted here; a LATER note lawfully re-introduces them
         const e = out[key] || {};
         if (typeof n.core === 'string') e.core = n.core;
         if (typeof n.state === 'string') e.state = n.state;
@@ -2315,10 +2327,92 @@ function appendLedgerNotes(deltas, atTurn) {
     return n;
 }
 
+// One shape for "the journal restarts as a snapshot of this page": base notes at
+// atTurn carrying every field an entry has. Used wherever the page's provenance is
+// NOT the journal (a checkpoint restore) so the invariant page == fold(notes) is
+// re-established instead of silently violated.
+function _baseNotesFromPage(page, atTurn) {
+    const out = [];
+    if (!page || typeof page !== 'object') return out;
+    const at = (typeof atTurn === 'number' && isFinite(atTurn)) ? Math.max(0, Math.floor(atTurn)) : 0;
+    for (const [nm, e] of Object.entries(page)) {
+        if (!e || typeof e !== 'object') continue;
+        const note = { t: at, name: nm, at: e.updatedAt || Date.now(), base: true };
+        if (typeof e.core === 'string') note.core = e.core;
+        if (typeof e.state === 'string') note.state = e.state;
+        if (typeof e.arc === 'string') note.arc = e.arc;
+        if (Array.isArray(e.threads)) note.threads = e.threads.slice();
+        if (typeof e._a === 'number') note.a = e._a;
+        out.push(note);
+    }
+    return out;
+}
+
+// External writers — the Chat Assistant's memory edits, its Undo restores, a
+// console tweak — touch the PAGE; they cannot know the notes journal exists.
+// Every fold then resolved page↔journal divergence as fold-wins: the copilot's
+// correction survived until the next message deletion or rewind and silently
+// reverted, and a page-side deletion resurrected. This reconciler makes the
+// journal the complete record: any page-side difference is adopted as a note
+// BEFORE folding, so external work survives folds exactly like the scribe's own.
+// Deletion adoption is suppressed while a staged rebuild serves a deliberately
+// trimmed page (_ledgerDroppingPast is temporary hygiene, not a user deletion).
+function adoptExternalLedgerEdits(store, tFloor) {
+    if (!store || !store.ledger || typeof store.ledger !== 'object') return 0;
+    if (!Array.isArray(store.ledgerNotes)) return 0;   // pre-notes chat: nothing to reconcile against
+    const page = store.ledger;
+    const fold = foldLedgerNotes(store.ledgerNotes, Infinity);
+    const rebuildActive = !!(store.ledgerRebuild && store.ledgerRebuild.staging);
+    let tNow = (typeof tFloor === 'number' && isFinite(tFloor)) ? Math.max(0, Math.floor(tFloor)) : 0;
+    if (!rebuildActive && typeof store.ledgerLiveIdx === 'number' && store.ledgerLiveIdx > tNow) tNow = store.ledgerLiveIdx;
+    for (const n of store.ledgerNotes) if (n && typeof n.t === 'number' && n.t > tNow) tNow = n.t;
+    let adopted = 0;
+    for (const [name, e] of Object.entries(page)) {
+        if (!e || typeof e !== 'object') continue;
+        const fk = Object.prototype.hasOwnProperty.call(fold, name) ? name : resolveLedgerKey(fold, name);
+        const f = Object.prototype.hasOwnProperty.call(fold, fk) ? fold[fk] : null;
+        // A page entry whose last shaping turn is PROVABLY behind the journal's is
+        // not an external edit — it is the persisted pre-v5.73 clobber (the page
+        // saved 14 turns staler than its own history). Adopting it would freeze the
+        // bug as truth; skipping lets the fold repair it. External editors never
+        // touch _t, so a genuine copilot edit always compares equal here.
+        if (f && typeof e._t === 'number' && typeof f._t === 'number' && e._t < f._t) continue;
+        const note = { t: tNow, name, at: Date.now(), ext: true };
+        let has = false;
+        for (const fld of ['core', 'state', 'arc']) {
+            const pv = (typeof e[fld] === 'string') ? e[fld] : undefined;
+            const fv = (f && typeof f[fld] === 'string') ? f[fld] : undefined;
+            if (pv !== undefined && pv !== fv) { note[fld] = pv; has = true; }
+        }
+        const pt = Array.isArray(e.threads) ? e.threads : undefined;
+        const ft = (f && Array.isArray(f.threads)) ? f.threads : undefined;
+        if (pt !== undefined && JSON.stringify(pt) !== JSON.stringify(ft)) { note.threads = pt.slice(); has = true; }
+        if (typeof e._a === 'number' && (!f || f._a !== e._a)) { note.a = e._a; has = true; }
+        if (has) { store.ledgerNotes.push(note); adopted++; }
+    }
+    // An EMPTY page is indistinguishable from a not-yet-materialized page (a fresh
+    // store initializes ledger: {} while notes may already exist) — absence there
+    // is never a deletion statement. Only a page with entries can testify that a
+    // journal character was removed.
+    if (!rebuildActive && Object.keys(page).length > 0) {
+        for (const name of Object.keys(fold)) {
+            const pk = Object.prototype.hasOwnProperty.call(page, name) ? name : resolveLedgerKey(page, name);
+            if (Object.prototype.hasOwnProperty.call(page, pk)) continue;
+            store.ledgerNotes.push({ t: tNow, name, at: Date.now(), gone: true, ext: true });
+            adopted++;
+        }
+    }
+    if (adopted) { try { log(`Adopted ${adopted} external ledger edit(s) into the journal (page \u2194 notes reconciled).`); } catch (e) { /* logging must never break a fold */ } }
+    return adopted;
+}
+
 // Rewind by READING FEWER NOTES. No snapshot, no model call, no pruning, exact.
 function rewindLedgerFromNotes(targetTurn) {
     const store = getChatStore();
     ensureLedgerNotes(store);
+    // Journal any external page edits FIRST: an edit made after the last pass would
+    // otherwise be silently reverted by the fold below.
+    adoptExternalLedgerEdits(store);
     if (!notesCover(store, targetTurn)) return false;
     const before = store.ledgerNotes.length;
     store.ledgerNotes = store.ledgerNotes.filter(n => n && typeof n.t === 'number' && n.t <= targetTurn);
@@ -2337,6 +2431,9 @@ function mergeLedgerDeltas(deltas, target, atTurn) {
         const store = getChatStore();
         if (!store.ledger || typeof store.ledger !== 'object') store.ledger = {};
         ledger = store.ledger;
+        // Durable early adoption: a copilot edit made since the last pass is
+        // journaled BEFORE new deltas land on top of it.
+        try { adoptExternalLedgerEdits(store); } catch (e) { log('adoptExternalLedgerEdits failed (non-fatal):', e); }
     }
     let changed = 0;
     for (const d of deltas) {
@@ -2755,6 +2852,10 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
             _ledgerQueue = [];
             _ledgerGen++;
             _st0.ledger = {};
+            // The journal must clear WITH the page: ghost notes left behind here
+            // re-materialized the entire abandoned ledger at the next fold.
+            _st0.ledgerNotes = [];
+            _st0.ledgerNotesFrom = 0;
             _st0.ledgerLiveIdx = -1;
             _st0.ledgerRebuild = null;
             await saveChatStore();
@@ -2810,6 +2911,10 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
             // chunk. Nothing is deleted before its replacement exists.
             _ledgerQueue = [];
             _ledgerGen++;                  // invalidate any in-flight job — it saw the pre-trim timeline
+            // Notes past the target describe turns that no longer exist — trim them
+            // now, or a mid-rebuild fold (one message deletion) paints the abandoned
+            // timeline onto the live serving page while the rebuild runs.
+            if (Array.isArray(cur.ledgerNotes)) cur.ledgerNotes = cur.ledgerNotes.filter(n => n && typeof n.t === 'number' && n.t <= targetTurn);
             // RESUME, don't restart: if a staged rebuild is already underway, its
             // completed chunks (through ledgerLiveIdx) are valid for a tail trim —
             // deleting messages ABOVE the pointer changes nothing below it. Blowing
@@ -2847,6 +2952,13 @@ async function tryAutoRewindLedger(targetTurn, label, maxCkptTurn) {
         _ledgerQueue = [];   // drop pending background jobs — we're rewriting the ledger
         _ledgerGen++;        // and invalidate any job already IN FLIGHT: its deltas were computed against the pre-rewind ledger/timeline
         store.ledger = JSON.parse(JSON.stringify(ckpt.ledger || {}));
+        // Every surviving note describes turns past this restore point (notesCover
+        // said no, so ledgerNotesFrom > ckpt.atTurn) — ghosts of the abandoned
+        // timeline. Left in place, the next fold (a message deletion, a rewind)
+        // painted them back over the restored page. Rebase: the journal restarts
+        // as base notes of the checkpoint itself; the replay journals forward.
+        store.ledgerNotes = _baseNotesFromPage(store.ledger, ckpt.atTurn);
+        store.ledgerNotesFrom = ckpt.atTurn;
         store.ledgerLiveIdx = ckpt.atTurn;
         store._ckptLast = ckpt.atTurn;   // re-arm checkpointing from the restore point — per-chat cursor
         // The restore itself is instant. The delta re-derivation is NOT a foreground
@@ -4743,6 +4855,9 @@ function reindexAfterDeletion(store, D) {
     // (Base notes are carried-over snapshots of everything up to their turn, not a
     // record of that turn, so they shift rather than vanish.)
     if (Array.isArray(store.ledgerNotes)) {
+        // Journal external page edits BEFORE the shift+refold — a copilot fix made
+        // since the last pass died to something as routine as deleting one message.
+        adoptExternalLedgerEdits(store);
         store.ledgerNotes = store.ledgerNotes
             .filter(n => !(n && typeof n.t === 'number' && n.t === D && !n.base))
             .map(n => (n && typeof n.t === 'number' && n.t >= D) ? Object.assign({}, n, { t: n.t - 1 }) : n);
@@ -4996,6 +5111,10 @@ function onChatChanged() {
                             }
                             st.ledgerNotes = _base.concat(_newer);
                             st.ledgerNotesFrom = Math.max(0, _at);
+                            // The live page may also hold EXTERNAL edits (copilot memedits)
+                            // that no note records — adopt them off the pre-fold page now,
+                            // floored at the rebuild edge so they survive the fold below.
+                            adoptExternalLedgerEdits(st, _at);
                             st.ledger = foldLedgerNotes(st.ledgerNotes, Infinity);
                         }
                         st.ledgerStaging = null;
@@ -6372,7 +6491,15 @@ function bindUIEvents() {
         if (name === undefined || name === null) return;
         const store = getChatStore();
         if (store.ledger && Object.prototype.hasOwnProperty.call(store.ledger, name)) {
+            const _e = store.ledger[name];
             delete store.ledger[name];
+            // Journal the deletion. Without a tombstone the very next fold (one
+            // message deletion was enough) resurrected the character in full.
+            if (Array.isArray(store.ledgerNotes)) {
+                let _t = (typeof store.ledgerLiveIdx === 'number' && store.ledgerLiveIdx >= 0) ? store.ledgerLiveIdx : 0;
+                if (_e && typeof _e._t === 'number' && _e._t > _t) _t = _e._t;
+                store.ledgerNotes.push({ t: _t, name, at: Date.now(), gone: true });
+            }
             // dropping a character also drops any pin on them, so no orphan pins linger
             const pins = getLedgerPins();
             const pi = pins.findIndex(p => String(p).toLowerCase() === String(name).toLowerCase());
@@ -7413,7 +7540,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, 'Summaryception v5.47.0 loaded — REBUILDS RESUME, NEVER RESTART: deleting messages during a staged rebuild now keeps every completed chunk and continues from the pointer (a tail trim invalidates nothing below it) instead of resetting to turn 0 on every deletion; and the startup storage GC now protects the newest 4 snapshots of EVERY chat from eviction — global oldest-first pruning was stripping any chat you hadn\'t touched today completely bare, which is what kept forcing from-scratch rebuilds on return. Prior (5.46): STAGED LEDGER REBUILDS: when a branch/trim needs a rebuild, the existing ledger now keeps serving injection UNTOUCHED while the clean rebuild accumulates in a separate staging area, and the swap happens atomically only at completion — nothing is deleted before its replacement exists, a failure or app-kill keeps the old ledger, and resume continues from the last finished chunk. A failed chunk now halts the pipeline instead of letting later chunks advance the pointer past the hole (that silent turn-skipping is where drifting Now entries came from), failed rounds are counted on the persisted marker, and after 5 the auto-resume STOPS with a clear warning instead of retry-looping forever. Staging chunks read/write only the staging ledger (checkpoints included), so a contaminated old ledger can never bleed into the rebuilt one. Prior (5.45): DATA-LOSS FIX: the auto-rewind no longer wipes the ledger on chats without summarized history (that pre-live-ledger shortcut destroyed live-built ledgers on reopen whenever a repair fired — e.g. the mobile save race that leaves ledgerLiveIdx one past a shorter chat); the clear now applies ONLY when rewinding to the literal start of a chat, and everything else goes through checkpoint restore / background rebuild like any other chat. Also: rebuilds and replays persist a catch-up marker in chat metadata, so killing the app mid-catch-up RESUMES at reopen from the last finished chunk instead of stranding a half-empty ledger; and a live pass facing a huge pointer gap now routes through bounded chunks instead of one monster prompt. Prior (5.44): no more foreground full-rebuilds: when a trim/branch lands below the oldest surviving checkpoint, the ledger now rebuilds through the SAME invisible, resumable background queue as a normal rewind (assistant-turn batches, snapshots saved along the way so the situation cannot recur for that region) instead of the busy-locked whole-history backfill; and checkpoint lookups now union across the chat\'s recent content signatures (remembered in chat metadata, which survives greeting edits / head deletions and is copied into branches) — editing message 0 no longer orphans every snapshot the chat ever saved. Prior (5.43): hardening release: a ledger GENERATION guard now discards any scribe job still in flight when the ledger is rewound, trimmed, or a message is deleted (the epoch only covered chat switches, so a stale job could merge deltas from deleted turns into a freshly-restored ledger and push the live pointer past the chat end); branch/repair toasts and logs now name exactly WHICH condition triggered them ([summaryOverruns/snippetOverruns/verbatimGhosted/ledgerAhead]) so misfires are diagnosable from a screenshot; a startup storage GC keeps the total checkpoint+backup footprint bounded (quota exhaustion silently broke checkpoint saves — the exact thing that makes branch rewinds cheap); and the profile connection path no longer dumps the full model response to console on every call unless debugMode is on. Prior (5.42): deep-audit release: per-call abort controllers (Abort now stops the RIGHT call even with background passes in flight), the 120s watchdog no longer leaks zombie timers/unhandled rejections, batch summaries skip the redundant ledger scribe when the live pass already covered those turns (one full LLM call saved per batch), live-off installs now checkpoint from batch jobs (branch rewind no longer full-rebuilds for them), ALL unhide paths (Clear Memory, branch repair, orphan heal) use contiguous range calls — one chat save per run instead of one per message, pending edit-rechecks and continuity jobs are cleared on chat switch (no more cross-chat snippet contamination), the backlog dialog can no longer stack copies of itself, passages keep each speaker\'s NAME (group scenes stop being anonymous "Assistant:" lines), and snippet boundaries survive into the gist/injection/promotion prompts instead of collapsing into a run-on. Prior (5.41): branch/trim ledger rewinds are instant: the checkpoint restores immediately and the delta re-derives as bounded background passes (resumable if interrupted) instead of one blocking scribe call with a sticky toast; old checkpoints are thinned geometrically rather than dropped, so deep branches rewind from a nearby snapshot instead of triggering a full rebuild. — memory now records causal chains and involuntary manner instead of flat facts, pins load-bearing verbatim quotes, and the character ledger carries each person\'s current whereabouts plus a compressed relationship-arc history with the reason behind every shift. Improved default prompts auto-migrate to installs that were on the stock prompt; customized prompts are untouched. Memory is now also mirrored to a local backup and auto-recovers if a chat rename or reload ever drops it. The character ledger now updates live every turn (not only on summarization) and injects a full-cast roster (compact, capped, and rotating) so off-screen characters are never forgotten. Important characters can be pinned to stay in context permanently, and off-screen characters are invited back into the story when it fits. Bulk passes (catch-up and build-from-history) write to disk far less per batch, and branching/deleting correctly rewinds snippets and their audit notes, and the character ledger is brought back in line automatically on branch/trim — a cheap checkpoint rewind when a snapshot exists, otherwise an automatic clean rebuild, with no manual step. NEW: an opt-in Continuity Auditor checks each snippet against its source and the established record, filing concise flags (drift / contradiction) into a work-queue your copilot can list/resolve/dismiss, with an optional nudge-the-story toggle; re-checking now reconciles (clears flags whose issue is fixed); flags can be one-click Applied, Applied-all oldest->newest, or auto-fixed (snippet layer) via a toggle, with message-level fixes routed to the copilot. Flags now record where the error lives (snippet vs source); auto-fix only rewrites snippet-level ones (aligning the snippet to its source, so no drift loop), leaving source-level errors for the copilot to fix at the message. Editing an already-summarized message now auto-re-checks just that snippet (debounced), so a fixed message realigns its snippet on its own. NEW: an in-app Continuity panel (flag list with per-flag Apply/Dismiss, Re-check All / Apply All buttons, enable/auto-fix/nudge toggles, and prompt editors).');
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — external ledger edits (copilot memedits, undo restores) are now journal truth: adopted as notes before every fold, so they survive message deletions, rewinds, and rebuild swaps; character deletion is a tombstone note (folds can no longer resurrect); fallback rewinds sweep ghost notes; audit stamps ride the journal. Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
