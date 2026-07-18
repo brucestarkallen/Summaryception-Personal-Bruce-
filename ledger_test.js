@@ -30,7 +30,7 @@ const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
 const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', 'reindexAfterDeletion', '_computeLiveLedgerRange', '_NOTES_SOFT_CAP', '_NOTES_KEEP_TAIL', 'foldLedgerNotes', 'ledgerHistoryFor', '_histOpen', '_historyHtml', 'escapeHtml', 'notesCover', 'ensureLedgerNotes', 'appendLedgerNotes', 'rewindLedgerFromNotes', 'compactLedgerNotes', 'stripLeadingLabel', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_characterWeight', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
-    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive', '_syncNotepadUi', '_lastAssistantAt', '_tpMark', 'buildTransplantExport', 'parseTransplant', 'storeFieldsFromTransplant'];
+    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive', '_syncNotepadUi', '_lastAssistantAt', '_tpMark', 'buildTransplantExport', 'parseTransplant', 'storeFieldsFromTransplant', '_exportTailBatches'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -68,7 +68,7 @@ return {
   normalizeContinuityOutput, _continuitySig, mergeContinuityFlags, reconcileSnippetFlags, _findSnippetByTurnRange, _findSnippetsCovering,
   _baseNotesFromPage, adoptExternalLedgerEdits, _notesFromDeltas, _swapStagedLedgerIn,
   _pinNeedle, _findPinSource, _pinAlive, _syncNotepadUi, _lastAssistantAt,
-  _tpMark, buildTransplantExport, parseTransplant, storeFieldsFromTransplant,
+  _tpMark, buildTransplantExport, parseTransplant, storeFieldsFromTransplant, _exportTailBatches,
 };
 `;
 const L = new Function(sandbox)();
@@ -1828,6 +1828,40 @@ section('memory transplant — export, survive an external editor, import into a
         ok(brief.includes('zero loss wins'), 'brief: on conflict, zero loss beats smaller');
         ok(brief.includes('marker lines are untouchable'), 'brief: compression can never eat the import markers');
     }
+}
+
+section('export tail — the transplant covers the verbatim window, the session stays untouched');
+{
+    const U = (m) => ({ is_user: true, mes: m });
+    const A = (m) => ({ is_user: false, mes: m });
+    const chat = [U('u0'), A('a1'), U('u2'), A('a3'), U('u4'), A('a5'), U('u6'), A('a7'), U('u8')];
+
+    // nothing summarized yet: passages tile the WHOLE chat with no gaps
+    let b = L._exportTailBatches(chat, -1, 2);
+    eq(JSON.stringify(b), JSON.stringify([{ passageStart: 0, endIdx: 3 }, { passageStart: 4, endIdx: 7 }]), 'from scratch: batches of 2 assistant turns, passages contiguous (user turns never skipped)');
+
+    // partially summarized (the reported shape: verbatim window unexported before the fix)
+    b = L._exportTailBatches(chat, 3, 2);
+    eq(JSON.stringify(b), JSON.stringify([{ passageStart: 4, endIdx: 7 }]), 'tail only: starts right after summarizedUpTo');
+
+    // trailing user message: covered by the last batch's passage end? No — passage
+    // ends at the last ASSISTANT turn, same as live summarization; a trailing user
+    // message is unread by design (it enters with the next reply).
+    b = L._exportTailBatches(chat, 5, 5);
+    eq(JSON.stringify(b), JSON.stringify([{ passageStart: 6, endIdx: 7 }]), 'trailing user turn stays outside the passage — identical to live behavior');
+
+    eq(L._exportTailBatches(chat, 7, 3).length, 0, 'fully covered: no ephemeral pass, export is instant');
+    eq(L._exportTailBatches([], -1, 3).length, 0, 'empty chat');
+    b = L._exportTailBatches(chat, -1, 0);
+    ok(b.length === 1 && b[0].passageStart === 0 && b[0].endIdx === 7, 'nonsense batch size falls back to the default (5), never an infinite loop');
+
+    // wiring: the export pass is EPHEMERAL by construction
+    const h = SRC_FULL.split("#sc_tp_export")[1].split("#sc_tp_brief")[0];
+    ok(h.includes('_exportTailBatches(chat, store.summarizedUpTo,'), 'export: tail computed from the real cursor');
+    ok(!/store\.layers\[0\]\.push|store\.summarizedUpTo\s*=|ghostMessagesUpTo|saveChatStore/.test(h), 'export: NO store mutation — no push, no cursor advance, no ghosting, no save (a 9-turn verbatim window is still 9 after)');
+    ok(h.includes('Object.assign({}, store, { layers:'), 'export: fresh snippets ride a COPIED view, never the store');
+    ok(h.includes('export aborted so you never get a file missing its newest chapter'), 'export: a failed batch aborts loudly — no half-true file that LOOKS complete');
+    ok(h.includes('isSummarizing || _llmChannelBusy()') && h.includes('isSummarizing = true;') && h.includes('finally { isSummarizing = false;'), 'export: takes and releases the summarizer channel like every other pass');
 }
 
 section('notepad — one document, two views (panel + full-screen editor)');

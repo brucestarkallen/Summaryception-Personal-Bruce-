@@ -18,7 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
-const SC_VERSION = '5.79.1';   // real version — keep in sync with manifest.json on every release
+const SC_VERSION = '5.80.0';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -6236,6 +6236,32 @@ function parseTransplant(text) {
 // treats that as first-class. Pins are FREE pins (srcIdx null): the one class
 // v5.76 injects unconditionally, which is exactly right for quotes whose
 // source text lives in another chat.
+// Pure: batch the UNSUMMARIZED tail (turns past summarizedUpTo) exactly the way
+// live summarization would — same batch size, same passage continuity (each
+// passage starts where the previous ended, so user turns between assistant
+// turns are never skipped). Used by the export's ephemeral pass.
+function _exportTailBatches(chat, upTo, per) {
+    const from = (typeof upTo === 'number') ? upTo : -1;
+    const p = (per | 0) > 0 ? (per | 0) : 5;
+    const turns = [];
+    if (Array.isArray(chat)) {
+        for (let i = 0; i < chat.length; i++) {
+            const m = chat[i];
+            if (!m || i <= from) continue;
+            const isOurGhost = m.extra?.sc_ghosted === true;
+            if (!m.is_user && (!m.is_system || isOurGhost) && m.mes && m.mes.trim().length > 0) turns.push(i);
+        }
+    }
+    const out = [];
+    let cursor = from;
+    for (let i = 0; i < turns.length; i += p) {
+        const endIdx = turns[Math.min(i + p, turns.length) - 1];
+        out.push({ passageStart: cursor < 0 ? 0 : cursor + 1, endIdx });
+        cursor = endIdx;
+    }
+    return out;
+}
+
 function storeFieldsFromTransplant(parsed, baseTurn) {
     const b = (typeof baseTurn === 'number' && baseTurn >= 0) ? baseTurn : 0;
     const ledger = {};
@@ -7322,13 +7348,46 @@ function bindUIEvents() {
         a.href = url; a.download = name; a.click();
         URL.revokeObjectURL(url);
     }
-    $(document).on('click', '#sc_tp_export', function () {
+    $(document).on('click', '#sc_tp_export', async function () {
+        const $btn = $(this);
+        if ($btn.prop('disabled')) return;
         const store = getChatStore();
         const { chat } = SillyTavern.getContext();
         const meta = { exportedAt: new Date().toISOString(), turns: Array.isArray(chat) ? chat.length : 0, scVersion: SC_VERSION };
-        const md = buildTransplantExport(store, meta);
+        // The transplant must carry the WHOLE story — including the verbatim
+        // window your settings deliberately keep unsummarized in the session.
+        // So the export runs an EPHEMERAL pass over that tail: same batching,
+        // same prompts, same context as live summarization — but the snippets
+        // go into the FILE ONLY. The session is untouched by construction:
+        // no layers.push, no summarizedUpTo advance, no ghosting — if your
+        // verbatim window is 9, it is still 9 after the export.
+        const tailBatches = _exportTailBatches(chat, store.summarizedUpTo, getSettings().turnsPerSummary);
+        let tail = [];
+        if (tailBatches.length) {
+            if (isSummarizing || _llmChannelBusy()) { toastr.info('A background pass is running — try the export again in a few seconds.', 'Summaryception', { timeOut: 3500 }); return; }
+            $btn.prop('disabled', true);
+            isSummarizing = true;
+            toastr.info('Summarizing the last ' + tailBatches.length + ' batch' + (tailBatches.length === 1 ? '' : 'es') + ' of recent turns for the export (your session stays exactly as it is)…', 'Summaryception', { timeOut: 5000, progressBar: true });
+            try {
+                for (const b of tailBatches) {
+                    const storyTxt = buildPassageFromRange(chat, b.passageStart, b.endIdx);
+                    if (!storyTxt.trim()) continue;
+                    const summary = await callSummarizer(storyTxt, buildFullContext(0));
+                    if (!summary) {
+                        // A half-true export that LOOKS complete is worse than no export.
+                        toastr.error('Summarizer failed on turns ' + b.passageStart + '\u2013' + b.endIdx + ' \u2014 export aborted so you never get a file missing its newest chapter. Try again.', 'Summaryception', { timeOut: 7000 });
+                        return;
+                    }
+                    tail.push({ text: summary, turnRange: [b.passageStart, b.endIdx] });
+                }
+            } finally { isSummarizing = false; $btn.prop('disabled', false); }
+        }
+        const view = tail.length
+            ? Object.assign({}, store, { layers: [((store.layers && store.layers[0]) || []).concat(tail)].concat(Array.isArray(store.layers) ? store.layers.slice(1) : []) })
+            : store;
+        const md = buildTransplantExport(view, meta);
         _downloadText('memory_transplant_' + new Date().toISOString().slice(0, 10) + '.md', md);
-        toastr.success('Memory transplant exported — pair it with the Auditor Brief for an external review.', 'Summaryception', { timeOut: 5000 });
+        toastr.success('Memory transplant exported' + (tail.length ? ' \u2014 including ' + tail.length + ' fresh snippet(s) for the verbatim window (session untouched)' : '') + '. Pair it with the Auditor Brief for an external review.', 'Summaryception', { timeOut: 6000 });
     });
     $(document).on('click', '#sc_tp_brief', async function () {
         try {
@@ -8024,7 +8083,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — Memory Transplant: export the whole memory (notepad, ledger, snippets + details, pins) as one portable Markdown file; pair it with the shipped Auditor Brief (MEMORY_AUDITOR.md — *audit, *fix, *optimize, and the showrunner *cleanup with a Director's Read) on any strong AI; then Import Transplant into a FRESH chat — snippets arrive range-less as permanent memory, quotes as always-injected free pins, the ledger re-bases to state-as-of-now with its journal invariant intact, and the replaced chat's checkpoints are era-retired. Full history: git log.`);
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — the transplant export now covers the verbatim window: an EPHEMERAL summarization pass over the unsummarized tail (same batching, prompts, and context as live) puts the newest turns in the FILE while the session stays byte-identical — no cursor advance, no ghosting, no layer push; a verbatim window of 9 is still 9 after the export, and a failed batch aborts the export loudly instead of delivering a file missing its newest chapter. Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
