@@ -18,7 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
-const SC_VERSION = '5.78.0';   // real version — keep in sync with manifest.json on every release
+const SC_VERSION = '5.79.0';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -6100,6 +6100,171 @@ let _editorPending = [];
 let _editorUndoSnapshot = null;
 let _editorCancelled = false;
 
+// ── Memory Transplant (portable .md) ───────────────────────────────
+// A TRANSPLANT is the story's memory as a portable Markdown file: notepad,
+// character ledger, snippets (+details), pins. Human-readable, but every item
+// sits between HTML-comment markers carrying a JSON payload, so an external
+// auditor AI can edit the CONTENT while the importer re-parses the STRUCTURE
+// losslessly. Distinct from the raw JSON export: that one restores the SAME
+// chat (turn indexes, ghosting); the transplant targets a FRESH chat, where
+// the old chat's turn indexes are meaningless by definition — so snippets
+// import range-less ("unrecallable": their source turns lived in another
+// chat), pins import as free pins (their source text does not exist here),
+// and the ledger re-bases to "state as of import".
+function _tpMark(kind, payload) {
+    return '<!-- SC-' + kind + (payload ? ' ' + JSON.stringify(payload) : '') + ' -->';
+}
+function buildTransplantExport(store, meta) {
+    const L = [];
+    const m = Object.assign({ v: 1 }, meta || {});
+    L.push('# SUMMARYCEPTION MEMORY TRANSPLANT');
+    L.push(_tpMark('TRANSPLANT', m));
+    L.push('');
+    L.push('## NOTEPAD (author canon — highest authority)');
+    L.push(_tpMark('NOTEPAD'));
+    L.push(String(store.notepad || '').trim());
+    L.push('<!-- /SC-NOTEPAD -->');
+    L.push('');
+    L.push('## CHARACTER LEDGER');
+    const led = (store.ledger && typeof store.ledger === 'object') ? store.ledger : {};
+    for (const name of Object.keys(led)) {
+        const e = led[name] || {};
+        const pay = { name };
+        if (typeof e._t === 'number') pay.t = e._t;
+        L.push(_tpMark('LEDGER', pay));
+        L.push('CORE: ' + String(e.core || '').trim());
+        L.push('STATE: ' + String(e.state || '').trim());
+        L.push('ARC: ' + String(e.arc || '').trim());
+        L.push('THREADS: ' + String(e.threads || '').trim());
+        L.push('<!-- /SC-LEDGER -->');
+        L.push('');
+    }
+    L.push('## MEMORY SNIPPETS (story order)');
+    const layers = Array.isArray(store.layers) ? store.layers : [];
+    for (let li = 0; li < layers.length; li++) {
+        const layer = layers[li];
+        if (!Array.isArray(layer)) continue;
+        for (const sn of layer) {
+            if (!sn) continue;
+            const pay = {};
+            if (Array.isArray(sn.turnRange)) pay.turns = sn.turnRange[0] + '-' + sn.turnRange[1];
+            if (li > 0) pay.layer = li;
+            L.push(_tpMark('SNIPPET', pay));
+            L.push(String(sn.text || '').trim());
+            if (sn.detail) {
+                L.push('<!-- SC-DETAIL -->');
+                L.push(String(sn.detail).trim());
+            }
+            L.push('<!-- /SC-SNIPPET -->');
+            L.push('');
+        }
+    }
+    L.push('## PINNED QUOTES (verbatim — never reworded)');
+    const pins = Array.isArray(store.pins) ? store.pins : [];
+    for (const p of pins) {
+        if (!p) continue;
+        L.push(_tpMark('PIN', p.label ? { label: p.label } : {}));
+        L.push(String(p.excerpt || '').trim());
+        L.push('<!-- /SC-PIN -->');
+        L.push('');
+    }
+    const flags = Array.isArray(store.continuityFlags) ? store.continuityFlags.filter(f => f && f.issue) : [];
+    if (flags.length) {
+        L.push('## OPEN CONTINUITY FLAGS (informational — not re-imported)');
+        for (const f of flags) L.push('- [' + (f.kind || 'issue') + '] ' + f.issue + (f.fix ? ' → ' + f.fix : ''));
+        L.push('');
+    }
+    return L.join('\n');
+}
+// Tolerant marker parser: keys ONLY on SC- markers; headings/prose between
+// blocks are ignored; CRLF normalized; a block missing its closer runs to the
+// next opener (an auditor AI's most likely mutilation) rather than being lost.
+function parseTransplant(text) {
+    const t = String(text || '').replace(/\r\n?/g, '\n');
+    const open = /<!--\s*SC-(TRANSPLANT|NOTEPAD|LEDGER|SNIPPET|PIN)\s*(\{[\s\S]*?\})?\s*-->/g;
+    const out = { meta: null, notepad: '', ledger: {}, snippets: [], pins: [] };
+    const marks = [];
+    let m;
+    while ((m = open.exec(t)) !== null) {
+        let pay = null;
+        if (m[2]) { try { pay = JSON.parse(m[2]); } catch (_) { pay = null; } }
+        marks.push({ kind: m[1], pay, start: m.index, bodyAt: m.index + m[0].length });
+    }
+    for (let i = 0; i < marks.length; i++) {
+        const mk = marks[i];
+        if (mk.kind === 'TRANSPLANT') { out.meta = mk.pay || {}; continue; }
+        const hardEnd = (i + 1 < marks.length) ? marks[i + 1].start : t.length;
+        const closer = new RegExp('<!--\\s*/SC-' + mk.kind + '\\s*-->');
+        const seg = t.slice(mk.bodyAt, hardEnd);
+        const cm = closer.exec(seg);
+        let body = (cm ? seg.slice(0, cm.index) : seg).trim();
+        if (mk.kind === 'NOTEPAD') {
+            out.notepad = body;
+        } else if (mk.kind === 'LEDGER') {
+            const name = mk.pay && typeof mk.pay.name === 'string' ? mk.pay.name.trim() : '';
+            if (!name) continue;
+            const entry = {};
+            const fm = /^(CORE|STATE|ARC|THREADS):[ \t]*/;
+            let cur = null;
+            for (const line of body.split('\n')) {
+                const f = fm.exec(line);
+                if (f) { cur = f[1].toLowerCase(); entry[cur] = line.slice(f[0].length); }
+                else if (cur) entry[cur] += '\n' + line;
+            }
+            for (const k of Object.keys(entry)) { entry[k] = entry[k].trim(); if (!entry[k]) delete entry[k]; }
+            if (Object.keys(entry).length) out.ledger[name] = entry;
+        } else if (mk.kind === 'SNIPPET') {
+            const dm = /<!--\s*SC-DETAIL\s*-->/.exec(body);
+            let text2 = body, detail;
+            if (dm) { text2 = body.slice(0, dm.index).trim(); detail = body.slice(dm.index + dm[0].length).trim(); }
+            if (text2) {
+                const sn = { text: text2 };
+                if (detail) sn.detail = detail;
+                if (mk.pay && typeof mk.pay.turns === 'string') sn.turns = mk.pay.turns;
+                out.snippets.push(sn);
+            }
+        } else if (mk.kind === 'PIN') {
+            if (body) out.pins.push({ label: (mk.pay && mk.pay.label) ? String(mk.pay.label) : '', excerpt: body });
+        }
+    }
+    return out;
+}
+// Fresh-chat store fields from a parsed transplant. baseTurn = "state as of
+// NOW" for the ledger (page + base journal at one turn: page == fold(notes)
+// holds from the first instant). Snippets are layer-0 and RANGE-LESS — every
+// null-turnRange code path (recall "unrecallable", recompute, reindex) already
+// treats that as first-class. Pins are FREE pins (srcIdx null): the one class
+// v5.76 injects unconditionally, which is exactly right for quotes whose
+// source text lives in another chat.
+function storeFieldsFromTransplant(parsed, baseTurn) {
+    const b = (typeof baseTurn === 'number' && baseTurn >= 0) ? baseTurn : 0;
+    const ledger = {};
+    const notes = [];
+    for (const name of Object.keys(parsed.ledger || {})) {
+        const e = parsed.ledger[name];
+        const entry = { updatedAt: Date.now(), _t: b };
+        for (const k of ['core', 'state', 'arc', 'threads']) if (e[k]) entry[k] = e[k];
+        ledger[name] = entry;
+        const bn = { t: b, name, at: Date.now(), base: true };
+        for (const k of ['core', 'state', 'arc', 'threads']) if (e[k]) bn[k] = e[k];
+        notes.push(bn);
+    }
+    const snippets = (parsed.snippets || []).map(sn => {
+        const o = { text: sn.text, turnRange: null, imported: true };
+        if (sn.detail) o.detail = sn.detail;
+        return o;
+    });
+    const pins = (parsed.pins || []).map((p, i) => ({
+        id: 'pin_tp_' + Date.now() + '_' + i, mesId: b, srcIdx: null,
+        excerpt: p.excerpt, label: p.label || '', createdAt: Date.now(),
+    }));
+    return {
+        notepad: parsed.notepad || '',
+        ledger, ledgerNotes: notes, ledgerNotesFrom: b, ledgerLiveIdx: b,
+        layers: [snippets], pins,
+    };
+}
+
 function buildMemoryDump() {
     const store = getChatStore();
     const snippets = [];
@@ -7150,6 +7315,73 @@ function bindUIEvents() {
         toastr.success('Memory exported', 'Summaryception');
     });
 
+    function _downloadText(name, text, mime) {
+        const blob = new Blob([text], { type: mime || 'text/markdown' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = name; a.click();
+        URL.revokeObjectURL(url);
+    }
+    $(document).on('click', '#sc_tp_export', function () {
+        const store = getChatStore();
+        const { chat } = SillyTavern.getContext();
+        const meta = { exportedAt: new Date().toISOString(), turns: Array.isArray(chat) ? chat.length : 0, scVersion: SC_VERSION };
+        const md = buildTransplantExport(store, meta);
+        _downloadText('memory_transplant_' + new Date().toISOString().slice(0, 10) + '.md', md);
+        toastr.success('Memory transplant exported — pair it with the Auditor Brief for an external review.', 'Summaryception', { timeOut: 5000 });
+    });
+    $(document).on('click', '#sc_tp_brief', async function () {
+        try {
+            const res = await fetch(new URL('MEMORY_AUDITOR.md', import.meta.url));
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            _downloadText('MEMORY_AUDITOR.md', await res.text());
+        } catch (e) {
+            log('auditor brief fetch failed:', e);
+            toastr.error('Could not load MEMORY_AUDITOR.md from the extension folder.', 'Summaryception');
+        }
+    });
+    $(document).on('click', '#sc_tp_import', function () {
+        const input = document.createElement('input');
+        input.type = 'file'; input.accept = '.md,.txt,text/markdown,text/plain';
+        input.onchange = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            try {
+                const parsed = parseTransplant(await file.text());
+                const nSnip = parsed.snippets.length, nLed = Object.keys(parsed.ledger).length, nPin = parsed.pins.length;
+                if (!nSnip && !nLed && !parsed.notepad) { toastr.error('No transplant markers found in that file.', 'Summaryception'); return; }
+                if (!confirm('Import memory transplant into THIS chat?\n\nREPLACES: notepad, character ledger, all snippets, all pins, continuity flags.\nKEEPS: your chat messages (nothing is ghosted).\n\nIncoming: ' + nSnip + ' snippet(s), ' + nLed + ' ledger character(s), ' + nPin + ' pin(s)' + (parsed.notepad ? ', notepad' : '') + '.')) return;
+                try { await unghostAllMessages(); } catch (_) {}
+                const { chat } = SillyTavern.getContext();
+                const base = Math.max(0, (Array.isArray(chat) ? chat.length : 1) - 1);
+                const store = getChatStore();
+                const f = storeFieldsFromTransplant(parsed, base);
+                store.notepad = f.notepad;
+                store.ledger = f.ledger;
+                store.ledgerNotes = f.ledgerNotes;
+                store.ledgerNotesFrom = f.ledgerNotesFrom;
+                store.ledgerLiveIdx = f.ledgerLiveIdx;
+                store.layers = f.layers;
+                store.pins = f.pins;
+                store.ghostedIndices = [];
+                store.continuityFlags = []; store.continuityResolved = []; store.continuityDismissed = [];
+                store.ledgerStaging = null; store.ledgerStagingNotes = null; store.ledgerRebuild = null;
+                store._ckptLast = -1;
+                store.ledgerEra = (store.ledgerEra | 0) + 1;   // checkpoints of the replaced ledger must never restore over the transplant
+                recomputeSummarizedUpTo();                     // imported snippets are range-less: this chat's own summarization starts clean
+                await saveChatStore();
+                try { const ctx = SillyTavern.getContext(); if (ctx.saveChat) await ctx.saveChat(); } catch (_) {}
+                updateInjection(true); updateUI();
+                try { renderLedger(); renderPins(); _syncNotepadUi(store.notepad); } catch (_) {}
+                toastr.success('Transplant imported: ' + nSnip + ' snippet(s), ' + nLed + ' character(s), ' + nPin + ' pin(s). The story continues from here with its memory.', 'Summaryception', { timeOut: 6000 });
+            } catch (err) {
+                log('transplant import failed:', err);
+                toastr.error('Transplant import failed: ' + (err && err.message || err), 'Summaryception');
+            }
+        };
+        input.click();
+    });
+
     $(document).on('click', '#sc_import', function () {
         const input = document.createElement('input');
         input.type = 'file';
@@ -7792,7 +8024,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — deleting the last AI reply now rewinds the ledger AT the deletion (the guard compared the pre-deletion index against the post-deletion pointer — false for exactly that turn — so the rewind waited for the next event, e.g. editing the message before it); a staged rebuild's finish line is clamped to the last assistant turn (a user-indexed target waited for a scribe pass that can never come), and a rewind below the story's first reply installs the true empty state. Full history: git log.`);
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — Memory Transplant: export the whole memory (notepad, ledger, snippets + details, pins) as one portable Markdown file; pair it with the shipped Auditor Brief (MEMORY_AUDITOR.md — *audit, *fix, *optimize, and the showrunner *cleanup with a Director's Read) on any strong AI; then Import Transplant into a FRESH chat — snippets arrive range-less as permanent memory, quotes as always-injected free pins, the ledger re-bases to state-as-of-now with its journal invariant intact, and the replaced chat's checkpoints are era-retired. Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

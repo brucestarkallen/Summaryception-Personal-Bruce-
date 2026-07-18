@@ -30,7 +30,7 @@ const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
 const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', 'reindexAfterDeletion', '_computeLiveLedgerRange', '_NOTES_SOFT_CAP', '_NOTES_KEEP_TAIL', 'foldLedgerNotes', 'ledgerHistoryFor', '_histOpen', '_historyHtml', 'escapeHtml', 'notesCover', 'ensureLedgerNotes', 'appendLedgerNotes', 'rewindLedgerFromNotes', 'compactLedgerNotes', 'stripLeadingLabel', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_characterWeight', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
-    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive', '_syncNotepadUi', '_lastAssistantAt'];
+    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive', '_syncNotepadUi', '_lastAssistantAt', '_tpMark', 'buildTransplantExport', 'parseTransplant', 'storeFieldsFromTransplant'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -68,6 +68,7 @@ return {
   normalizeContinuityOutput, _continuitySig, mergeContinuityFlags, reconcileSnippetFlags, _findSnippetByTurnRange, _findSnippetsCovering,
   _baseNotesFromPage, adoptExternalLedgerEdits, _notesFromDeltas, _swapStagedLedgerIn,
   _pinNeedle, _findPinSource, _pinAlive, _syncNotepadUi, _lastAssistantAt,
+  _tpMark, buildTransplantExport, parseTransplant, storeFieldsFromTransplant,
 };
 `;
 const L = new Function(sandbox)();
@@ -1754,6 +1755,67 @@ section('deleting the newest read turn — the guard compares D to the timeline 
     ok(SRC_FULL.includes('jobs = queueLedgerRebuild(effTarget);') && SRC_FULL.includes('jobs = queueLedgerReplay(cur.ledgerLiveIdx, effTarget, { staging: true });'), 'both queue paths aim at the clamped target');
     ok(SRC_FULL.includes('cur.ledgerNotesFrom = effTarget;'), 'the rebase anchors at the clamped target so swap-time adoption coverage holds');
     ok(SRC_FULL.includes("toastr.success(`Ledger rewound to turn ${targetTurn} — before the story's first reply"), 'a rewind below the first reply installs the true (empty) state instead of freezing the stale page');
+}
+
+section('memory transplant — export, survive an external editor, import into a fresh chat');
+{
+    const store = {
+        notepad: 'Marcroft canon:\nthe arch faces east.',
+        ledger: {
+            'Stella Voss': { core: 'Duelist.\nSecond seat.', state: 'At the arch', arc: 'Softening', threads: 'Owes Jovan', _t: 134 },
+            'Honami "Quote" Rei': { core: 'Archivist', state: 'Library', _t: 90 },
+        },
+        layers: [
+            [ { text: 'Jovan arrived at Marcroft.', turnRange: [0, 4], detail: 'Rain. Claire waited.' },
+              { text: 'The duel with Stella ended in a draw.', turnRange: [5, 9] } ],
+            [ { text: 'Season one: arrival and first rivalries.', turnRange: [0, 9] } ],
+        ],
+        pins: [ { id: 'p1', mesId: 7, srcIdx: 7, excerpt: 'You came back.', label: 'the promise' } ],
+        continuityFlags: [ { issue: 'Silas in two places', fix: 'pick one', kind: 'continuity', turnRange: [40, 44] } ],
+    };
+    const md = L.buildTransplantExport(store, { exportedAt: 'T', turns: 52, scVersion: 'test' });
+    ok(md.includes('<!-- SC-TRANSPLANT {"v":1,"exportedAt":"T","turns":52,"scVersion":"test"} -->'), 'export: header marker carries meta');
+    ok(md.includes('{"name":"Honami \"Quote\" Rei","t":90}'.replace('\"Quote\"', '\\"Quote\\"')), 'export: names with quotes survive via JSON payload');
+    ok(md.includes('Silas in two places'), 'export: open flags ride along informationally');
+
+    // round-trip: parse the untouched export
+    const p1 = L.parseTransplant(md);
+    eq(p1.notepad, 'Marcroft canon:\nthe arch faces east.', 'round-trip: notepad exact, newline kept');
+    eq(Object.keys(p1.ledger).length, 2, 'round-trip: both characters');
+    eq(p1.ledger['Stella Voss'].core, 'Duelist.\nSecond seat.', 'round-trip: multi-line CORE survives');
+    eq(p1.ledger['Honami "Quote" Rei'].state, 'Library', 'round-trip: quoted name resolves');
+    eq(p1.snippets.length, 3, 'round-trip: snippets across layers, story order');
+    eq(p1.snippets[0].detail, 'Rain. Claire waited.', 'round-trip: detail sub-block');
+    eq(p1.pins.length, 1, 'round-trip: pin');
+    ok(!md.includes('undefined'), 'export never prints undefined');
+
+    // survive the auditor: CRLF, edited text, a deleted block, an ADDED block,
+    // and a block whose closer the AI ate — the likeliest mutilations.
+    let edited = md.replace(/\n/g, '\r\n')
+        .replace('The duel with Stella ended in a draw.', 'The duel with Stella ended in her narrow win.')
+        .replace(/<!-- SC-PIN[\s\S]*?\/SC-PIN -->\r\n/, '')
+        .replace('## PINNED QUOTES', '<!-- SC-SNIPPET {"turns":"?"} -->\r\nA quiet week passed at the academy.\r\n<!-- /SC-SNIPPET -->\r\n\r\n## PINNED QUOTES');
+    edited = edited.replace('<!-- /SC-NOTEPAD -->\r\n', '');   // eaten closer
+    const p2 = L.parseTransplant(edited);
+    ok(p2.notepad.startsWith('Marcroft canon:') && !p2.notepad.includes('SC-LEDGER'), 'tolerance: a missing closer ends at the next opener, not at EOF');
+    ok(p2.snippets.some(s => s.text.includes('her narrow win')), 'tolerance: edited snippet text comes through');
+    eq(p2.snippets.length, 4, 'tolerance: the added snippet is picked up');
+    eq(p2.pins.length, 0, 'tolerance: a deleted block is a deleted item');
+
+    // fresh-chat semantics
+    const f = L.storeFieldsFromTransplant(p2, 0);
+    ok(Object.values(f.ledger).every(e => e._t === 0), 'import: ledger re-bases to state-as-of-now');
+    eq(f.ledgerNotes.length, 2, 'import: one base note per character — page == fold(notes) from the first instant');
+    ok(f.ledgerNotes.every(n => n.base === true && n.t === 0) && f.ledgerNotesFrom === 0 && f.ledgerLiveIdx === 0, 'import: journal invariant holds at the base turn');
+    ok(f.layers.length === 1 && f.layers[0].every(s => s.turnRange === null), 'import: snippets are layer-0 and RANGE-LESS — their turns lived in another chat');
+    ok(f.layers[0].every(s => s.imported === true), 'import: snippets carry the imported stamp');
+    ok(f.pins.every(pn => pn.srcIdx === null), 'import: pins are FREE pins — always injected, source text is in another chat by definition');
+
+    // wiring: the import handler resets the machinery of the replaced memory
+    ok(SRC_FULL.includes('store.ledgerEra = (store.ledgerEra | 0) + 1;   // checkpoints of the replaced ledger must never restore over the transplant'), 'import: era bump retires old checkpoints');
+    ok(/sc_tp_import[\s\S]*?continuityFlags = \[\]/.test(SRC_FULL), 'import: stale continuity state cleared');
+    ok(/sc_tp_import[\s\S]*?recomputeSummarizedUpTo\(\);/.test(SRC_FULL), 'import: summarization cursor derives from range-less snippets (fresh)');
+    ok(SRC_FULL.includes("fetch(new URL('MEMORY_AUDITOR.md', import.meta.url))"), 'the auditor brief ships with the extension and downloads from its own folder');
 }
 
 section('notepad — one document, two views (panel + full-screen editor)');
