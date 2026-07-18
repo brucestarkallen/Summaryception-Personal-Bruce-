@@ -1827,6 +1827,15 @@ section('memory transplant — export, survive an external editor, import into a
         ok(brief.includes('ZERO-LOSS VERIFICATION') && brief.includes('"same entry count"\nis the WRONG test'.replace('\n', String.fromCharCode(10))), 'brief: verification tests substance, not counts');
         ok(brief.includes('zero loss wins'), 'brief: on conflict, zero loss beats smaller');
         ok(brief.includes('marker lines are untouchable'), 'brief: compression can never eat the import markers');
+        // Token-discipline contract (the user runs this on paid models):
+        ok(brief.includes('memory_transplant_edited.md'), 'brief: delivery is a downloadable FILE, named, importable as-is');
+        ok(brief.includes('printing it into chat as well is pure token waste'), 'brief: file delivery excludes the chat copy');
+        ok(brief.includes('CONTINUED'), 'brief: forced code-block splits have a zero-commentary continuation protocol');
+        ok(/a partial file\s+silently deletes whatever it omits/.test(brief), 'brief: COMPLETE is explained by consequence, not just asserted');
+        ok(brief.includes('One change, one file.'), 'brief: no re-delivery of unchanged files');
+        ok(brief.includes('ON RECEIPT'), 'brief: a bare transplant gets a five-line receipt, not an unrequested audit');
+        ok(brief.includes('REPORT ONLY: no file changes, NO file delivery'), 'brief: *audit never ships a file');
+        ok(brief.includes('never echo the received file back'), 'brief: the input is never mirrored');
     }
 }
 
