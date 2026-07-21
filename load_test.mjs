@@ -20,7 +20,7 @@
  *
  * Exit code 0 = safe to ship. Non-zero = DO NOT PUSH.
  */
-import { mkdtempSync, copyFileSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, copyFileSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -139,6 +139,16 @@ try {
 } finally {
     console.error = realError;
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* temp dir */ }
+}
+
+console.log('== v5.82.0: notepad starting-canon doctrine ==');
+{
+    const SRCW = readFileSync(new URL('./index.js', import.meta.url), 'utf8');
+    const n = (SRCW.match(/STARTING canon/g) || []).length;
+    ok(n === 6, `all six notepad consumers (auditor, editor sys+template, continuity record, transplant, brief dump) carry the starting-canon doctrine (found ${n}, need 6)`);
+    ok(SRCW.includes('never a CONTINUITY finding'), 'the continuity auditor is told outgrown opening-state is progression, not a finding');
+    const MDW = readFileSync(new URL('./MEMORY_AUDITOR.md', import.meta.url), 'utf8');
+    ok(MDW.includes('STARTING canon') && MDW.includes('never a finding'), 'the auditor brief documents the deliberately-static notepad');
 }
 
 console.log(`\nRESULT: ${pass} passed, ${fail} failed`);

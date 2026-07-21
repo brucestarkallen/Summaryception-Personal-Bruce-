@@ -149,3 +149,5 @@ Alexia Valois — Nature: Analytical, proud, guarded; calls Jovan "Ardent" until
 - **Original Summaryception:** [Lodactio / Extension‑Summaryception](https://github.com/Lodactio/Extension-Summaryception).
 - **This enhanced fork:** adds the Character Ledger, Detail Auditor, Backfill/Maintenance, injection controls, and robustness work.
 - **License:** GNU AGPL‑3.0 (inherited from the original — see `LICENSE`).
+
+**Notepad = starting canon.** The notepad is the story's *starting* state — written at the beginning and deliberately never updated as the story progresses. Foundational facts (world rules, identities, backstory) stay highest-authority; situational details describe the opening and are *expected* to be outgrown by the snippets. Every LLM consumer (continuity auditor, Continuity Editor, continuity record, Memory Transplant, auditor brief) is told this explicitly, so "the notepad wasn't updated" is never flagged, never "fixed", and never treated as staleness.
