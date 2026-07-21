@@ -18,7 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
-const SC_VERSION = '5.80.1';   // real version — keep in sync with manifest.json on every release
+const SC_VERSION = '5.81.0';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -8174,7 +8174,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — the transplant export now covers the verbatim window: an EPHEMERAL summarization pass over the unsummarized tail (same batching, prompts, and context as live) puts the newest turns in the FILE while the session stays byte-identical — no cursor advance, no ghosting, no layer push; a verbatim window of 9 is still 9 after the export, and a failed batch aborts the export loudly instead of delivering a file missing its newest chapter. Full history: git log.`);
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — full-extension audit release. The Continuity Editor is rebuilt on content identity: Apply re-locates each reviewed snippet by CONTENT (background promotions and mid-batch deletes can move or kill objects and shift ids), refuses honestly when the reviewed memory no longer exists, and records exact inverses — Undo now replays those inverses instead of restoring a wholesale snapshot that deleted post-review summaries and left their turns permanently ghosted. Blank snippet edits refuse instead of silently no-opping; Apply-All keeps refused cards visible with counts. Continuity Apply gains the same mid-flight guard as the queues. Audited clean this pass: continuity queue, detail sister, flag dedup, injection assembly. Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches

@@ -31,7 +31,7 @@ A memory system for long‑form roleplay in [SillyTavern](https://github.com/Sil
   npx eslint@9 --config eslint.config.mjs index.js connectionutil.js   # 4. STATIC: no-undef / no-redeclare
                          #    across every code path, including ones no test executes.
   ```
-  All three must exit 0. `require-atomic-updates` findings are false positives on this codebase — every
+  All three must exit 0. `require-atomic-updates` findings (8 as of v5.81.0; one left with the deleted snapshot-undo code) are false positives on this codebase — every
   guard→set path is synchronous (an async body runs synchronously to its first `await`), and
   `_catchupDialogOpen` covers the one genuine await-window; verify before dismissing any new one.
 - **One exclusive LLM channel.** Every background pass (summarizer, ledger scribe, detail auditor, ledger auditor, continuity checker, edit re-check) must gate on **`_llmChannelBusy()`**. `callSummarizer` snapshots SillyTavern's prompt toggles, disables them, and restores on finish — two concurrent calls interleave those snapshots and leave the user's toggles **permanently wrong**. Adding a new pass? Add its flag to that one predicate; never hand-roll a subset check (that pattern is O(n²) and has already failed twice).
