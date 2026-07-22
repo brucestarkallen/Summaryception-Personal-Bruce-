@@ -30,7 +30,7 @@ const SRC_FULL = require('fs').readFileSync(__dirname + '/index.js', 'utf8');
 const names = ['stripMetaBlocks', 'buildPassageFromRange', '_ledgerDroppingPast', '_editRewindDecision', '_ledgerMissingCore', '_missingCoreNotice', '_synthesizeCheckpoint', 'computeLedgerCast', 'reindexAfterDeletion', '_computeLiveLedgerRange', '_NOTES_SOFT_CAP', '_NOTES_KEEP_TAIL', 'foldLedgerNotes', 'ledgerHistoryFor', '_histOpen', '_historyHtml', 'escapeHtml', 'notesCover', 'ensureLedgerNotes', 'appendLedgerNotes', 'rewindLedgerFromNotes', 'compactLedgerNotes', 'stripLeadingLabel', '_ledgerAuditTargets', '_pickEvidenceIndices', 'buildLedgerAuditEvidence', '_ambiguousTokens', '_characterWeight', '_ESC_RE', '_escapeRegex', 'characterAliases', 'wordPresentInText',
     'formatLedgerEntry', 'buildCharacterBlock', 'serializeLedgerForScribe',
     'resolveLedgerKey', '_LEDGER_LABEL_RE', 'stripLeadingLabel', 'mergeLedgerDeltas', 'subst', '_storeHasContent', '_computeLiveLedgerRange', '_selectRoster', '_composeRoster', 'getLedgerPins', '_pickCheckpoint', '_computeReplayChunks', '_selectCheckpointKeeps', '_contiguousRanges', '_selectStorageEvictions',
-    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive', '_syncNotepadUi', '_lastAssistantAt', '_tpMark', 'buildTransplantExport', 'parseTransplant', 'storeFieldsFromTransplant', '_exportTailBatches', '_locateSnippetForOp', '_applyInverseOp'];
+    'normalizeContinuityOutput', '_continuitySig', 'mergeContinuityFlags', 'reconcileSnippetFlags', '_findSnippetByTurnRange', '_findSnippetsCovering', '_baseNotesFromPage', 'adoptExternalLedgerEdits', '_notesFromDeltas', '_swapStagedLedgerIn', '_pinNeedle', '_findPinSource', '_pinAlive', '_syncNotepadUi', '_lastAssistantAt', '_tpMark', 'buildTransplantExport', 'parseTransplant', 'storeFieldsFromTransplant', '_exportTailBatches', '_locateSnippetForOp', '_applyInverseOp', '_lev', '_normName'];
 
 const body = names.map(extractTopLevel).join('\n\n');
 
@@ -69,7 +69,7 @@ return {
   _baseNotesFromPage, adoptExternalLedgerEdits, _notesFromDeltas, _swapStagedLedgerIn,
   _pinNeedle, _findPinSource, _pinAlive, _syncNotepadUi, _lastAssistantAt,
   _tpMark, buildTransplantExport, parseTransplant, storeFieldsFromTransplant, _exportTailBatches,
-  _locateSnippetForOp, _applyInverseOp,
+  _locateSnippetForOp, _applyInverseOp, _lev, _normName,
 };
 `;
 const L = new Function(sandbox)();
@@ -1869,9 +1869,17 @@ section('export tail — the transplant covers the verbatim window, the session 
     const h = SRC_FULL.split("#sc_tp_export")[1].split("#sc_tp_brief")[0];
     ok(h.includes('_exportTailBatches(chat, store.summarizedUpTo,'), 'export: tail computed from the real cursor');
     ok(!/store\.layers\[0\]\.push|store\.summarizedUpTo\s*=|ghostMessagesUpTo|saveChatStore/.test(h), 'export: NO store mutation — no push, no cursor advance, no ghosting, no save (a 9-turn verbatim window is still 9 after)');
-    ok(h.includes('Object.assign({}, store, { layers:'), 'export: fresh snippets ride a COPIED view, never the store');
+    ok(/Object\.assign\(\{\}, store,\s*\{ layers:/.test(h), 'export: fresh snippets ride a COPIED view, never the store');
     ok(h.includes('export aborted so you never get a file missing its newest chapter'), 'export: a failed batch aborts loudly — no half-true file that LOOKS complete');
     ok(h.includes('isSummarizing || _llmChannelBusy()') && h.includes('isSummarizing = true;') && h.includes('finally { isSummarizing = false;'), 'export: takes and releases the summarizer channel like every other pass');
+
+    // v5.83.0: the ledger gets the same guarantee — ephemerally, into a clone
+    ok(h.includes('_exportTailBatches(chat, lp,'), 'export: ledger catch-up batches from the LIVE POINTER (the stale-wave root: pointer legally behind the chat)');
+    ok(h.includes('structuredClone(store.ledger || {})'), 'export: the scribe writes a CLONE, never the store');
+    ok(h.includes('serializeLedgerForScribe(clone,'), 'export: successive batches compound on the clone (batch N sees batch N-1)');
+    ok(h.includes('mergeLedgerDeltas(deltas, clone, b.endIdx)'), 'export: clone-targeted merge — journaling skipped by design, session untouched');
+    ok(h.includes('ledgerView ? { ledger: ledgerView } : {}'), 'export: the caught-up ledger rides the view');
+    ok(h.includes('export aborted so you never audit dossiers missing their newest chapter'), 'export: a failed scribe batch aborts loudly — no half-current ledger that LOOKS complete');
 }
 
 section('continuity editor — content is the identity: Apply and Undo never write blind');
@@ -1934,6 +1942,65 @@ section('continuity editor — content is the identity: Apply and Undo never wri
     // Continuity Apply carries the same mid-flight discipline as the queues:
     // identity AND content verified after the fixer's await, or the rewrite dies.
     ok(/callContinuityFixer[\s\S]{0,900}still\.snippet !== sn \|\| sn\.text !== before/.test(SRC_FULL), 'continuity Apply: a snippet edited or moved during the fixer call is never overwritten with a stale rewrite');
+
+    // v5.83.0 prompt patches: anchor+tag pairs must both exist so the surgical
+    // patch lands on stock prompts and then no-ops (idempotence by tag absence).
+    ok(SRC_FULL.includes("their state and choices follow from their own perspective, not the reader's.") && SRC_FULL.includes('This applies to threads doubly'), 'ledger prompt patch: the epistemic law reaches THREADS by name');
+    ok(SRC_FULL.includes('Omit if no temporal marker appears.') && SRC_FULL.includes('The marker must fit THIS passage'), 'summarizer prompt patch: temporal prefixes span the passage, end day stated');
+    ok(SRC_FULL.includes('patchSummarizerPrompt(); } catch (_) {}'), 'summarizer patch runs at load next to the ledger patch');
+}
+
+section('ledger key resolution — the fragmentation audit, replayed against the resolver');
+{
+    // The external audit found 9 blocks for 3 characters. Every variant it listed,
+    // as a resolver case — plus the safety cases that must NOT merge.
+    const led = {
+        'Rose Ōtoribashi': {}, 'Kiyone Kotetsu': {}, 'Sentarō Kotsubaki': {},
+        'Madarame': {}, 'Jovan': {},
+    };
+    eq(L.resolveLedgerKey(led, 'Rose Ōtoribash'), 'Rose Ōtoribashi', 'truncated surname resolves (distance 1)');
+    eq(L.resolveLedgerKey(led, 'Rose Otoribashi'), 'Rose Ōtoribashi', 'diacritic drift resolves (normalized exact)');
+    eq(L.resolveLedgerKey(led, 'Rose'), 'Rose Ōtoribashi', 'short form resolves (existing stage 3)');
+    eq(L.resolveLedgerKey(led, 'Kiyone Kotetsi'), 'Kiyone Kotetsu', 'surname typo resolves (distance 1)');
+    eq(L.resolveLedgerKey(led, 'Kiyone Kotsubaki'), 'Kiyone Kotetsu', "CROSSED surname (another character's) resolves to the unique given-name match");
+    eq(L.resolveLedgerKey(led, 'Madarome'), 'Madarame', 'single-token typo resolves (distance 1)');
+    // safety: never merge two real people
+    eq(L.resolveLedgerKey(led, 'Sentarō Kotsubaki'), 'Sentarō Kotsubaki', 'the REAL owner of the crossed surname resolves to himself');
+    eq(L.resolveLedgerKey(led, 'Kiyone Aoyama'), 'Kiyone Aoyama', 'a surname unknown to the ledger stays a NEW entry — could be a different Kiyone');
+    eq(L.resolveLedgerKey(led, 'Jovana'), 'Jovan', 'near single-token still within distance for short names');
+    eq(L.resolveLedgerKey({ 'Kiyone Kotetsu': {}, 'Kiyone Aoyama': {} }, 'Kiyone Kotsubaki'), 'Kiyone Kotsubaki', 'TWO Kiyones → given-name no longer unique → new entry, never a guess');
+    eq(L.resolveLedgerKey({ 'Mara': {}, 'Marta': {} }, 'Marra'), 'Marra', 'two near candidates at equal distance → ambiguous → new entry');
+    ok(typeof L._lev === 'function' && L._lev('Kotetsu', 'Kotetsi', 2) === 1 && L._lev('abc', 'xyz', 2) === 3, '_lev: distance + cap overflow');
+    eq(L._normName('  Ōtori—bashi!  '), 'otoribashi', '_normName strips diacritics, punctuation, spacing');
+    eq(L.resolveLedgerKey({ 'A': {} }, 'B'), 'B', 'REGRESSION (caught by the guard test crashing): names under 4 chars never distance-merge');
+    eq(L.resolveLedgerKey({ 'Ana': {} }, 'Anna'), 'Anna', '3-char existing key: still no distance merge below the floor');
+}
+
+section('ledger contamination guard — a dossier can no longer wear another character\'s skin');
+{
+    const led = {
+        'Shunsui': { core: 'S'.repeat(30) + ' aristocratic ease as governance, the lazy man drawn over iron', arc: 'A'.repeat(50), threads: ['what Mayuri offered Jovan — Nanao ordered to find out', 'the dais debt'] },
+    };
+    // the audited failure: Mayuri arrives wearing Shunsui's CORE/ARC/THREADS verbatim, own STATE
+    const deltas = [{ name: 'Mayuri', core: led['Shunsui'].core, arc: led['Shunsui'].arc, threads: led['Shunsui'].threads.slice(), state: 'examination chamber, crush-before-burn' }];
+    const n = L.mergeLedgerDeltas(deltas, led, 100);
+    ok(n === 1 && led['Mayuri'], 'the delta still merges (state is legitimate)');
+    ok(led['Mayuri'].state === 'examination chamber, crush-before-burn', 'his own STATE lands');
+    ok(!led['Mayuri'].core && !led['Mayuri'].arc && !led['Mayuri'].threads, "THE AUDIT'S C1: copied CORE, ARC, and THREADS are dropped at the door");
+    ok(led['Shunsui'].core.includes('aristocratic ease'), 'the true owner is untouched');
+
+    // same-batch contamination: two names, one text, no pre-existing entry
+    const led2 = {};
+    L.mergeLedgerDeltas([
+        { name: 'Aoi', core: 'C'.repeat(60) },
+        { name: 'Ren', core: 'C'.repeat(60), state: 'at the gate' },
+    ], led2, 5);
+    ok(led2['Aoi'].core && !led2['Ren'].core && led2['Ren'].state === 'at the gate', 'same-batch verbatim copy: first writer keeps it, second is dropped, rest of the delta lives');
+
+    // guards must NOT fire on short or legitimately-shared text
+    const led3 = { 'A': { state: 'at the courtyard' } };
+    L.mergeLedgerDeltas([{ name: 'B', state: 'at the courtyard', core: 'a genuinely distinct person with their own long identity text here' }], led3, 5);
+    ok(led3['B'].state === 'at the courtyard' && led3['B'].core, 'short shared STATE is fine; distinct core merges; no false positive');
 }
 
 section('notepad — one document, two views (panel + full-screen editor)');

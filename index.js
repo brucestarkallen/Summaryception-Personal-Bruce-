@@ -18,7 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
-const SC_VERSION = '5.82.0';   // real version — keep in sync with manifest.json on every release
+const SC_VERSION = '5.83.0';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -513,6 +513,24 @@ function migratePrompts() {
     return migrated;
 }
 
+// Surgical, idempotent: snippet date headers must span THIS passage. An external
+// audit found two headers wearing the wrong day — one restating the PREVIOUS
+// scene's date for a passage that begins after it, one omitting the end day of a
+// multi-day span. Same anchor+tag pattern as patchLedgerPrompt: lands once, on
+// stock or lightly customized prompts, then no-ops forever.
+function patchSummarizerPrompt() {
+    let s; try { s = getSettings(); } catch (_) { return; }
+    let cur = (typeof s.summarizerUserPrompt === 'string') ? s.summarizerUserPrompt : '';
+    if (!cur) return;
+    const T_ANCHOR = 'Omit if no temporal marker appears.';
+    const T_TAG = 'The marker must fit THIS passage';
+    if (cur.indexOf(T_ANCHOR) !== -1 && cur.indexOf(T_TAG) === -1) {
+        s.summarizerUserPrompt = cur.replace(T_ANCHOR, T_ANCHOR + ' The marker must fit THIS passage: continue from the latest time already established in <prior_context> — never reuse an earlier scene\u2019s date for events that begin after it — and when the passage crosses into a new day, include the end day in the prefix (e.g., "[3rd\u20134th Frost, 18:41\u219208:00]").');
+        try { saveSettings(); } catch (_) {}
+        log('Summarizer prompt patched: temporal prefixes now span the passage (continue from prior context; state the end day).');
+    }
+}
+
 // Surgical, idempotent fix for the #1 cause of slow ledger passes: the default ledger
 // prompt tells the scribe to "restate the FULL stable picture" for core, so it re-emits
 // each character's entire (growing) entry every pass — huge, slow responses. This rewrites
@@ -541,6 +559,14 @@ function patchLedgerPrompt() {
     const ARC_ANCHOR = 'Update only when the passage actually moves it;';
     const ARC_TAG = 'OMIT arc entirely';
     if (cur.indexOf(ARC_ANCHOR) !== -1 && cur.indexOf(ARC_TAG) === -1) { cur = cur.replace(ARC_ANCHOR, ARC_ANCHOR + ' if it did NOT move this passage, OMIT arc entirely (never re-output an unchanged arc);'); changed = true; }
+
+    // An external audit caught the epistemic law being applied to state/choices but
+    // NOT to threads: a dossier carried another character's private instruction
+    // (an order given off-screen, about him, with no pathway to him). Make the law
+    // reach threads by name.
+    const EPI_ANCHOR = "their state and choices follow from their own perspective, not the reader's.";
+    const EPI_TAG = 'This applies to threads doubly';
+    if (cur.indexOf(EPI_ANCHOR) !== -1 && cur.indexOf(EPI_TAG) === -1) { cur = cur.replace(EPI_ANCHOR, EPI_ANCHOR + " This applies to threads doubly: a thread in a character's entry must be something that character KNOWS exists — another character's private orders, secret plans, or off-screen instructions ABOUT them belong in the entry of whoever made them, never in the subject's own threads."); changed = true; }
 
     if (changed) {
         s.ledgerSystemPrompt = cur;
@@ -2194,6 +2220,28 @@ function maybeAuditLedger() {
 
 // Case-insensitive key resolution so "mara" and "Mara" don't split into two
 // entries. Distinct characters keep distinct names (no fuzzy merging).
+// Bounded Levenshtein for name-variant detection. Names are short; cap keeps it O(1).
+function _lev(a, b, cap) {
+    a = String(a); b = String(b);
+    if (Math.abs(a.length - b.length) > cap) return cap + 1;
+    const prev = new Array(b.length + 1);
+    for (let j = 0; j <= b.length; j++) prev[j] = j;
+    for (let i = 1; i <= a.length; i++) {
+        let diag = prev[0]; prev[0] = i; let rowMin = prev[0];
+        for (let j = 1; j <= b.length; j++) {
+            const tmp = prev[j];
+            prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diag + (a[i - 1] === b[j - 1] ? 0 : 1));
+            diag = tmp;
+            if (prev[j] < rowMin) rowMin = prev[j];
+        }
+        if (rowMin > cap) return cap + 1;
+    }
+    return prev[b.length];
+}
+function _normName(s) {
+    return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^\p{L}\p{N}\s]/gu, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
 function resolveLedgerKey(ledger, name) {
     const keys = Object.keys(ledger);
     // 1. exact match
@@ -2217,6 +2265,51 @@ function resolveLedgerKey(ledger, name) {
         return kTok[0] === inTok[0] || kTok[kTok.length - 1] === inTok[inTok.length - 1];
     });
     if (candidates.length === 1) return candidates[0];   // unambiguous → same character
+    // 4. Variant repair — the fragmentation class an external audit exposed: a
+    //    ledger holding four Roses ("Rose Ōtoribash" truncated, "Rose" short,
+    //    diacritic drift), "Kiyone Kotetsi" (typo), "Kiyone Kotsubaki" (her name
+    //    crossed with ANOTHER character's surname), "Madarome" (typo). Each
+    //    variant minted a fresh dossier with its own conflicting STATE. Every
+    //    rule below resolves ONLY on a unique winner; any ambiguity falls
+    //    through to creating a new entry — fragmentation is recoverable,
+    //    merging two real characters is not.
+    const nIn = _normName(name);
+    if (nIn) {
+        // 4a. diacritic/punctuation-insensitive exact
+        const norm = keys.filter(k => _normName(k) === nIn);
+        if (norm.length === 1) return norm[0];
+        // 4b. whole-name typo/truncation: distance ≤ 1 (4–7 chars) or ≤ 2 (≥ 8).
+        //     Names under 4 chars NEVER distance-merge — at that length one edit
+        //     is a different name, not a typo ('B' is not a variant of 'A').
+        const capFor = (s) => (s.length >= 8 ? 2 : (s.length >= 4 ? 1 : 0));
+        const near = keys.filter(k => {
+            const nk = _normName(k);
+            const cap = Math.min(capFor(nIn), capFor(nk));
+            return nk && cap > 0 && _lev(nIn, nk, cap) <= cap;
+        });
+        if (near.length === 1) return near[0];
+        // 4c. crossed / drifted surname on a unique given name: input is multi-token,
+        //     exactly ONE key shares its first token, and the input's surname is
+        //     either a near-miss of that key's surname OR verbatim ANOTHER key's
+        //     surname (the token-crossover signature). A surname unknown to the
+        //     ledger stays ambiguous — it may be a genuinely new character.
+        const tIn = nIn.split(' ');
+        if (tIn.length >= 2) {
+            const first = tIn[0], last = tIn[tIn.length - 1];
+            const sameFirst = keys.filter(k => _normName(k).split(' ')[0] === first);
+            if (sameFirst.length === 1) {
+                const kTok = _normName(sameFirst[0]).split(' ');
+                const kLast = kTok[kTok.length - 1];
+                const lastNear = kTok.length >= 2 && _lev(last, kLast, 2) <= 2;
+                const crossed = keys.some(k => {
+                    if (k === sameFirst[0]) return false;
+                    const t = _normName(k).split(' ');
+                    return t.length >= 2 && t[t.length - 1] === last;
+                });
+                if (lastNear || crossed) return sameFirst[0];
+            }
+        }
+    }
     return name;                                          // ambiguous or none → keep separate
 }
 
@@ -2556,6 +2649,27 @@ function mergeLedgerDeltas(deltas, target, atTurn) {
         try { adoptExternalLedgerEdits(store); } catch (e) { log('adoptExternalLedgerEdits failed (non-fatal):', e); }
     }
     let changed = 0;
+    // Cross-dossier copy guard. An external audit caught a dossier wearing another
+    // character's skin: CORE, ARC, and THREADS copied character-for-character from
+    // a different entry (only STATE was his own) — which is simultaneously an
+    // epistemic breach, since the copied text asserts knowledge the character does
+    // not have. A ≥40-char identity field arriving VERBATIM identical to another
+    // character's same field (in the ledger, or earlier in this same batch) is
+    // copy contamination, not coincidence: that field is dropped, the rest of the
+    // delta (typically the legitimate state) still merges.
+    const _seenBatch = { core: new Map(), arc: new Map(), threads: new Map() };
+    const _dupOf = (field, value, selfKey) => {
+        if (String(value).length < 40) return null;
+        for (const k of Object.keys(ledger)) {
+            if (k === selfKey) continue;
+            const e = ledger[k];
+            const ev = field === 'threads' ? (Array.isArray(e && e.threads) ? e.threads.join('\n') : '') : String((e && e[field]) || '');
+            if (ev && ev === value) return k;
+        }
+        const b = _seenBatch[field].get(value);
+        return (b && b !== selfKey) ? b : null;
+    };
+    let _contam = 0;
     for (const d of deltas) {
         if (!d || typeof d !== 'object') continue;
         const rawName = typeof d.name === 'string' ? d.name.trim() : '';
@@ -2563,15 +2677,18 @@ function mergeLedgerDeltas(deltas, target, atTurn) {
         const key = resolveLedgerKey(ledger, rawName);
         const entry = ledger[key] || {};
         let touched = false;
-        if (typeof d.core === 'string')  { const v = stripLeadingLabel(d.core);  if (v) { entry.core  = v; touched = true; } }
+        if (typeof d.core === 'string')  { const v = stripLeadingLabel(d.core);  if (v) { const dup = _dupOf('core', v, key); if (dup) { _contam++; log(`Ledger contamination guard: '${key}' core arrived verbatim-identical to '${dup}' — dropped.`); } else { entry.core = v; _seenBatch.core.set(v, key); touched = true; } } }
         if (typeof d.state === 'string') { const v = stripLeadingLabel(d.state); if (v) { entry.state = v; touched = true; } }
-        if (typeof d.arc === 'string')   { const v = stripLeadingLabel(d.arc);   if (v) { entry.arc   = v; touched = true; } }
+        if (typeof d.arc === 'string')   { const v = stripLeadingLabel(d.arc);   if (v) { const dup = _dupOf('arc', v, key); if (dup) { _contam++; log(`Ledger contamination guard: '${key}' arc arrived verbatim-identical to '${dup}' — dropped.`); } else { entry.arc = v; _seenBatch.arc.set(v, key); touched = true; } } }
         if (Array.isArray(d.threads)) {
-            entry.threads = d.threads
+            const tv = d.threads
                 .filter(t => typeof t === 'string' && t.trim())
                 .map(t => stripLeadingLabel(t))
                 .filter(Boolean);
-            touched = true;
+            const joined = tv.join('\n');
+            const dup = joined ? _dupOf('threads', joined, key) : null;
+            if (dup) { _contam++; log(`Ledger contamination guard: '${key}' threads arrived verbatim-identical to '${dup}' — dropped.`); }
+            else { entry.threads = tv; if (joined) _seenBatch.threads.set(joined, key); touched = true; }
         }
         if (touched) {
             entry.updatedAt = Date.now();
@@ -7473,8 +7590,47 @@ function bindUIEvents() {
                 }
             } finally { isSummarizing = false; $btn.prop('disabled', false); }
         }
-        const view = tail.length
-            ? Object.assign({}, store, { layers: [((store.layers && store.layers[0]) || []).concat(tail)].concat(Array.isArray(store.layers) ? store.layers.slice(1) : []) })
+        // The ledger gets the SAME guarantee the snippets got in v5.80.0. An
+        // external audit found a broad stale-STATE wave: every dossier lagged the
+        // last two snippet batches — because the live ledger pointer legally sits
+        // behind the chat (channel busy, background pass pending) and the export
+        // shipped the ledger AS-IS while shipping snippets to the latest turn.
+        // Fix: an ephemeral catch-up — run the REAL scribe over (pointer, last
+        // assistant turn] into a CLONE, compounding batch over batch; the clone
+        // rides the export view. Session untouched: no pointer advance, no
+        // journal notes (mergeLedgerDeltas with a target skips journaling by
+        // design), no store write.
+        let ledgerView = null;
+        {
+            const lp = (typeof store.ledgerLiveIdx === 'number') ? store.ledgerLiveIdx : -1;
+            const lBatches = _exportTailBatches(chat, lp, getSettings().turnsPerSummary);
+            if (lBatches.length) {
+                if (isSummarizing || _llmChannelBusy()) { toastr.info('A background pass is running — try the export again in a few seconds.', 'Summaryception', { timeOut: 3500 }); return; }
+                $btn.prop('disabled', true);
+                isSummarizing = true;
+                toastr.info('Bringing the character ledger current for the export (' + lBatches.length + ' batch' + (lBatches.length === 1 ? '' : 'es') + ' — your session stays exactly as it is)…', 'Summaryception', { timeOut: 5000, progressBar: true });
+                try {
+                    const clone = structuredClone(store.ledger || {});
+                    const s2 = getSettings();
+                    for (const b of lBatches) {
+                        const storyTxt = buildPassageFromRange(chat, b.passageStart, b.endIdx);
+                        if (!storyTxt.trim()) continue;
+                        const ledgerStr = serializeLedgerForScribe(clone, s2.ledgerContextMaxChars);
+                        const deltas = await callLedgerScribe(storyTxt, buildFullContext(0), ledgerStr);
+                        if (deltas === null) {
+                            toastr.error('Ledger scribe failed on turns ' + b.passageStart + '\u2013' + b.endIdx + ' \u2014 export aborted so you never audit dossiers missing their newest chapter. Try again.', 'Summaryception', { timeOut: 7000 });
+                            return;
+                        }
+                        if (Array.isArray(deltas) && deltas.length) mergeLedgerDeltas(deltas, clone, b.endIdx);
+                    }
+                    ledgerView = clone;
+                } finally { isSummarizing = false; $btn.prop('disabled', false); }
+            }
+        }
+        const view = (tail.length || ledgerView)
+            ? Object.assign({}, store,
+                { layers: [((store.layers && store.layers[0]) || []).concat(tail)].concat(Array.isArray(store.layers) ? store.layers.slice(1) : []) },
+                ledgerView ? { ledger: ledgerView } : {})
             : store;
         const md = buildTransplantExport(view, meta);
         _downloadText('memory_transplant_' + new Date().toISOString().slice(0, 10) + '.md', md);
@@ -8171,10 +8327,11 @@ async function fetchProfilesFallback(selectElement, currentValue) {
         eventSource.on(event_types.APP_READY, () => {
             migratePrompts();
             try { patchLedgerPrompt(); } catch (_) {}
+            try { patchSummarizerPrompt(); } catch (_) {}
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — full-extension audit release. The Continuity Editor is rebuilt on content identity: Apply re-locates each reviewed snippet by CONTENT (background promotions and mid-batch deletes can move or kill objects and shift ids), refuses honestly when the reviewed memory no longer exists, and records exact inverses — Undo now replays those inverses instead of restoring a wholesale snapshot that deleted post-review summaries and left their turns permanently ghosted. Blank snippet edits refuse instead of silently no-opping; Apply-All keeps refused cards visible with counts. Continuity Apply gains the same mid-flight guard as the queues. Audited clean this pass: continuity queue, detail sister, flag dedup, injection assembly. Full history: git log.`);
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — external-audit hardening: ledger name variants (typos, truncations, diacritic drift, crossed surnames) now resolve to the existing dossier instead of minting duplicates — unique-winner-or-create, names under 4 chars never distance-merge; a verbatim-identical CORE/ARC/THREADS arriving under a different name is dropped at the door (cross-dossier copy contamination); the transplant export brings the ledger current ephemerally (real scribe over the pointer gap into a CLONE — the session's pointer, journal, and store untouched); the epistemic law now reaches THREADS by name and snippet date headers must span their own passage (both patched into saved prompts surgically). Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
