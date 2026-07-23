@@ -70,10 +70,21 @@ $('#sc_notepad_fullscreen').trigger('click');
 ok($('#sc_notepad_fs').length === 1, 'click opens the overlay');
 ok($('#sc_notepad_fs_text').val() === store.notepad, 'editor seeds from the store');
 ok($('#sc_notepad_fs_count').text() === store.notepad.length + ' ch', 'char count seeds');
-const ovStyle = $('#sc_notepad_fs').attr('style') || '';
-ok(/position:\s*fixed/.test(ovStyle) && /z-index:\s*100000/.test(ovStyle) && /inset:\s*0|top:\s*0/.test(ovStyle), 'SELF-CONTAINED: full-screen geometry is INLINE — a stale cached style.css cannot break it');
-ok(/flex-direction:\s*column/.test(ovStyle), 'column layout inline');
-ok(($('#sc_notepad_fs_text').attr('style') || '').includes('flex:1 1 auto'), 'textarea fills the screen without the stylesheet');
+const ovEl = $('#sc_notepad_fs')[0];
+ok(ovEl.style.position === 'fixed' && ovEl.style.zIndex === '2147483000', 'SELF-CONTAINED: geometry set by direct JS assignment — no stylesheet, no string parsing to disagree about');
+ok(/^\d+px$/.test(ovEl.style.width) && /^\d+px$/.test(ovEl.style.height) && parseInt(ovEl.style.height, 10) === window.innerHeight, 'MEASURED PIXELS: height taken from the live viewport, not from percentage units');
+ok(ovEl.style.flexDirection === 'column', 'column layout assigned');
+ok($('#sc_notepad_fs_text')[0].style.flex === '1 1 auto', 'textarea fills the measured screen');
+ok(typeof window._scNotepadFsFit === 'function', 'a live re-fit is registered for viewport/keyboard changes');
+{
+    // the keyboard scenario: viewport shrinks → the overlay must follow
+    const h0 = parseInt(ovEl.style.height, 10);
+    Object.defineProperty(window, 'innerHeight', { value: h0 - 300, configurable: true });
+    window._scNotepadFsFit();
+    ok(parseInt(ovEl.style.height, 10) === h0 - 300, 'KEYBOARD-PROOF: viewport change re-fits the overlay to measured pixels');
+    Object.defineProperty(window, 'innerHeight', { value: h0, configurable: true });
+    window._scNotepadFsFit();
+}
 
 // second click: no duplicate
 $('#sc_notepad_fullscreen').trigger('click');
@@ -100,6 +111,7 @@ ok($('#sc_notepad_fs').length === 0, '⤡ Default closes');
 $('#sc_notepad_fullscreen').trigger('click');
 $(window.document).trigger($.Event('keydown', { key: 'Escape' }));
 ok($('#sc_notepad_fs').length === 0, 'Escape closes');
+ok(window._scNotepadFsFit === undefined, 'close unbinds the viewport listeners — no leak, no ghost re-fits');
 ok(store.notepad === 'replaced by import', 'closing never discards — the store holds the last text');
 
 console.log('\n────────────────────────────────────────');

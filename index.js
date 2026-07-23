@@ -18,7 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
-const SC_VERSION = '5.84.0';   // real version — keep in sync with manifest.json on every release
+const SC_VERSION = '5.84.1';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -7055,32 +7055,69 @@ function bindUIEvents() {
     $(document).on('click', '#sc_notepad_fullscreen', function () {
         if ($('#sc_notepad_fs').length) return;   // already open
         const cur = String(getChatStore().notepad || '');
-        // SELF-CONTAINED overlay: every layout-critical style is INLINE. The class
-        // versions in style.css are theming sugar only. Reason: extension CSS is
-        // browser-cached aggressively; on a device holding a pre-v5.77 style.css
-        // the classed overlay had NO styles at all and rendered as a bare div
-        // dumped at the bottom of the page — one-line textarea, wrapped buttons:
-        // "broken". A full-screen editor must not depend on a stylesheet fetch
-        // to BE a full-screen editor.
-        const _fsBg = 'background:#16171d;color:#e8e8ec;';
+        // SELF-CONTAINED overlay, geometry by DIRECT JS ASSIGNMENT with a
+        // MEASURED pixel height. History of this element on mobile: (1) styles
+        // in style.css → a stale browser cache shipped none of them (bare div);
+        // (2) styles as an inline string with 100%/inset geometry → a real
+        // Android device still rendered a collapsed strip below the app's top
+        // bar with the page showing through: percentage heights, fixed-position
+        // containing blocks, and keyboard viewports are exactly the territory
+        // where mobile engines disagree. So: set every critical property via
+        // el.style.x = (no string parsing to disagree about), pin with
+        // top/left only, and size WIDTH and HEIGHT in measured PIXELS from the
+        // visual viewport, re-fitted on every viewport change while open. A
+        // pixel is a pixel on every engine.
         const $ov = $(
-            '<div id="sc_notepad_fs" class="sc-notepad-fs-overlay" style="position:fixed;inset:0;top:0;left:0;right:0;bottom:0;width:100%;height:100%;z-index:100000;display:flex;flex-direction:column;box-sizing:border-box;padding:max(8px, env(safe-area-inset-top)) max(8px, env(safe-area-inset-right)) max(8px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-left));' + _fsBg + '">'
-            + '<div class="sc-notepad-fs-head" style="display:flex;align-items:center;gap:8px;padding:4px 2px 8px 2px;flex:0 0 auto;">'
-            + '<span class="sc-notepad-fs-title" style="font-weight:600;flex:1 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">📝 Manual Notepad (this chat)</span>'
-            + '<span class="sc-notepad-fs-count" id="sc_notepad_fs_count" style="opacity:.6;font-size:.85em;flex:0 0 auto;"></span>'
+            '<div id="sc_notepad_fs" class="sc-notepad-fs-overlay">'
+            + '<div class="sc-notepad-fs-head">'
+            + '<span class="sc-notepad-fs-title">📝 Manual Notepad (this chat)</span>'
+            + '<span class="sc-notepad-fs-count" id="sc_notepad_fs_count"></span>'
             + '<button type="button" id="sc_notepad_fs_min" class="menu_button" title="Back to the normal panel view — your text is already saved">⤡ Default</button>'
             + '<button type="button" id="sc_notepad_fs_close" class="menu_button" title="Close — your text is already saved">✕</button>'
             + '</div>'
-            + '<textarea id="sc_notepad_fs_text" class="sc-notepad-fs-text" style="flex:1 1 auto;width:100%;min-height:0;resize:none;box-sizing:border-box;font-family:monospace;font-size:.95em;line-height:1.5;background:#0f1014;color:#e8e8ec;border:1px solid rgba(255,255,255,.18);border-radius:8px;padding:10px;" placeholder="Lore this story must never forget — e.g. character names & canon, world rules, locations, ongoing plot facts."></textarea>'
+            + '<textarea id="sc_notepad_fs_text" class="sc-notepad-fs-text" placeholder="Lore this story must never forget — e.g. character names & canon, world rules, locations, ongoing plot facts."></textarea>'
             + '</div>'
         );
         $('body').append($ov);
+        {
+            const ov = $ov[0], head = $ov.children()[0], ta = $('#sc_notepad_fs_text')[0];
+            const S = (el, o) => { for (const k in o) el.style[k] = o[k]; };
+            S(ov, { position: 'fixed', top: '0px', left: '0px', zIndex: '2147483000', display: 'flex', flexDirection: 'column', boxSizing: 'border-box', padding: '8px', background: '#16171d', color: '#e8e8ec', margin: '0' });
+            S(head, { display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 2px 8px 2px', flex: '0 0 auto' });
+            const kids = head.children;
+            S(kids[0], { fontWeight: '600', flex: '1 1 auto', minWidth: '0', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' });
+            S(kids[1], { opacity: '.6', fontSize: '.85em', flex: '0 0 auto' });
+            S(ta, { flex: '1 1 auto', width: '100%', minHeight: '0', resize: 'none', boxSizing: 'border-box', fontFamily: 'monospace', fontSize: '.95em', lineHeight: '1.5', background: '#0f1014', color: '#e8e8ec', border: '1px solid rgba(255,255,255,.18)', borderRadius: '8px', padding: '10px' });
+            const fit = () => {
+                const vv = window.visualViewport;
+                const w = Math.round((vv && vv.width) || window.innerWidth || document.documentElement.clientWidth);
+                const h = Math.round((vv && vv.height) || window.innerHeight || document.documentElement.clientHeight);
+                ov.style.width = w + 'px';
+                ov.style.height = h + 'px';
+                // pin to the VISUAL viewport origin: when the keyboard opens or the
+                // page is pinch-scrolled, the layout viewport shifts under it.
+                ov.style.top = Math.round((vv && vv.offsetTop) || 0) + 'px';
+                ov.style.left = Math.round((vv && vv.offsetLeft) || 0) + 'px';
+            };
+            fit();
+            window._scNotepadFsFit = fit;
+            window.addEventListener('resize', fit);
+            if (window.visualViewport) { window.visualViewport.addEventListener('resize', fit); window.visualViewport.addEventListener('scroll', fit); }
+        }
         const $t = $('#sc_notepad_fs_text');
         $t.val(cur);
         $('#sc_notepad_fs_count').text(cur.length + ' ch');
         $t.trigger('focus');
     });
-    function _closeNotepadFs() { $('#sc_notepad_fs').remove(); }
+    function _closeNotepadFs() {
+        const fit = window._scNotepadFsFit;
+        if (fit) {
+            window.removeEventListener('resize', fit);
+            if (window.visualViewport) { window.visualViewport.removeEventListener('resize', fit); window.visualViewport.removeEventListener('scroll', fit); }
+            delete window._scNotepadFsFit;
+        }
+        $('#sc_notepad_fs').remove();
+    }
     window._closeNotepadFs = _closeNotepadFs;   // onChatChanged closes an open editor — its text belongs to the chat being left
     $(document).on('click', '#sc_notepad_fs_min, #sc_notepad_fs_close', _closeNotepadFs);
     $(document).on('keydown', function (e) { if (e.key === 'Escape' && $('#sc_notepad_fs').length) _closeNotepadFs(); });
@@ -8339,7 +8376,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — the full-screen notepad is SELF-CONTAINED: every layout-critical style rides inline on the overlay, so a browser holding a stale cached style.css (the reported breakage: the editor rendered as a bare unstyled div at the page bottom) still gets a true full-screen editor — the stylesheet classes remain as theming only. New permanent gate: dom_test.mjs runs the SHIPPED notepad wiring verbatim under jsdom + real jQuery (open, seed, type-through-the-one-pipeline, sync, all three close paths). Full history: git log.`);
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — the full-screen notepad now sizes itself in MEASURED PIXELS from the live visual viewport, set by direct JS property assignment — after a real Android device rendered the inline-string geometry as a collapsed strip (percentage heights, fixed containing blocks, and keyboard viewports are where mobile engines disagree; a pixel is a pixel everywhere). It pins to the visual-viewport origin and re-fits on every viewport/keyboard change while open; close unbinds the listeners. The dom_test gate asserts the measured-pixel geometry, the keyboard re-fit, and the cleanup. Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
