@@ -504,6 +504,28 @@ try {
         ok(!Object.values(led).some(e => e && typeof e._t === 'number' && e._t > 8), 'no entry stamp beyond the chat survives');
     }
 
+    console.log('== 16. MC NAME: the story\'s protagonist, not the persona, keys every pass ==');
+    {
+        // scenes 14/15 swap ctx.chat wholesale — operate on the LIVE array
+        ctx.chatMetadata = { summaryception: { mcName: 'Jovan', summarizedUpTo: -1, layers: [[]] } };
+        ctx.chatId = 'mcname.jsonl';
+        ctx.chat = [
+            mkMsg('Player', 'You step onto the sand and face the captain.', true),
+            mkMsg('Narrator', 'Zaraki grinned wide.'),
+        ];
+        await fire('CHAT_CHANGED');
+        await sleep(600);
+        ctx.chat.push(mkMsg('Player', 'You draw and hold his stare.', true), mkMsg('Narrator', 'Zaraki grinned down at Jovan, delighted.'));
+        const callsBefore4 = calls.length;
+        await fire('MESSAGE_RECEIVED', ctx.chat.length - 1);
+        await sleep(2500);
+        const newCalls = calls.slice(callsBefore4).map(c => JSON.stringify(c));
+        ok(newCalls.length > 0, 'precondition: passes ran');
+        ok(newCalls.some(c => c.includes('<player_name>Jovan</player_name>')), 'every pass is told the MC is Jovan');
+        ok(!newCalls.some(c => c.includes('<player_name>Player</player_name>')), 'the persona/neutral label no longer masquerades as the protagonist');
+        ok(newCalls.some(c => c.includes('Jovan: You draw and hold his stare')), 'user turns in the passage carry the MC name — attribution is direct');
+    }
+
     console.log('== 6. a REAL chat switch: new metadata AND new messages ==');
     const oldNames = Object.keys(store().ledger || {});
     ctx.chatMetadata = {};

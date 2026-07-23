@@ -18,7 +18,7 @@ import {
 } from './connectionutil.js';
 
 const MODULE_NAME = 'summaryception';
-const SC_VERSION = '5.85.1';   // real version — keep in sync with manifest.json on every release
+const SC_VERSION = '5.86.0';   // real version — keep in sync with manifest.json on every release
 const LOG_PREFIX = '[Summaryception]';
 // const TRACE_MODE = true;  // ultra-verbose logging
 
@@ -835,8 +835,21 @@ function maybeRecoverStore() {
 }
 
 function getPlayerName() {
-    const ctx = SillyTavern.getContext();
-    return ctx.name1 || 'User';
+    // The MC's name and the PERSONA's name are different concepts. In
+    // director-style play the persona ("LO") issues instructions ABOUT the
+    // protagonist (Jovan) — but every pass was told <player_name>LO</player_name>,
+    // so the psychologist keyed arcs and threads to the director ("With LO: ...")
+    // instead of the character who actually lives in the story. A per-chat
+    // override names the MC; empty falls back to the persona as before.
+    try {
+        const mc = getChatStore().mcName;
+        if (typeof mc === 'string' && mc.trim()) return mc.trim();
+    } catch (_) {}
+    try {
+        const { name1 } = SillyTavern.getContext();
+        if (name1 && String(name1).trim()) return String(name1).trim();
+    } catch (_) {}
+    return 'Player';
 }
 
 // ─── Message Hiding (Ghosting via native /hide /unhide) ──────────────
@@ -1326,7 +1339,9 @@ function buildPassageFromRange(chat, startIdx, endIdx) {
         // Keep the character's NAME on non-user lines: the ledger is keyed by name and
         // group scenes have multiple speakers — a flat 'Assistant:' label forces every
         // downstream pass (summarizer/scribe/auditor) to guess who is talking.
-        const speaker = m.is_user ? 'Player' : ((m.name && String(m.name).trim()) ? String(m.name).trim() : 'Assistant');
+        const speaker = m.is_user
+            ? (() => { try { const mc = getChatStore().mcName; if (typeof mc === 'string' && mc.trim()) return mc.trim(); } catch (_) {} return 'Player'; })()
+            : ((m.name && String(m.name).trim()) ? String(m.name).trim() : 'Assistant');
         const body = stripMetaBlocks(m.mes.trim());
         if (!body) continue; // message was pure machine-meta — nothing narrated
         lines.push(`${speaker}: ${body}`);
@@ -5598,6 +5613,7 @@ function updateUI() {
         $('#sc_inject_summary').prop('checked', s.injectSummary !== false);
         $('#sc_inject_details').prop('checked', s.injectDetails !== false);
         _syncNotepadUi(store.notepad || '');
+        $('#sc_mc_name').val(store.mcName || '');
         $('#sc_summarizer_system_prompt').val(s.summarizerSystemPrompt);
         $('#sc_summarizer_user_prompt').val(s.summarizerUserPrompt);
         $('#sc_sister_enabled').prop('checked', s.sisterEnabled !== false);
@@ -7053,6 +7069,11 @@ function bindUIEvents() {
     }
 
     // ── Manual notepad (per-chat, live) ──
+    $(document).on('input', '#sc_mc_name', function () {
+        getChatStore().mcName = String($(this).val() || '').trim();
+        saveChatStore();
+        updateInjection(true);
+    });
     $(document).on('input', '#sc_notepad', function () {
         getChatStore().notepad = $(this).val();
         saveChatStore();
@@ -8390,7 +8411,7 @@ async function fetchProfilesFallback(selectElement, currentValue) {
             try { gcLocalStorageBudget(); } catch (_) {}   // bounded checkpoint/backup footprint — quota death silently breaks checkpointing
             updateInjection();
             updateUI();
-            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — chats damaged BEFORE the v5.85 fossil fix now self-heal on open: branch repair judges the timeline by the JOURNAL, not the pointer — a chat whose pointer looks sane (the fossil nuked it, live passes rebuilt it inside the branch) while notes or entry stamps still sit beyond the chat end is a timeline breach and rewinds on CHAT_CHANGED. The reported residue (chat at #8, journal at turn 21, dossiers narrating the abandoned future) is scene 15 in the pipeline: heals to the last truth the chat actually contains, journal trimmed, no stamp beyond the chat. Full history: git log.`);
+            console.log(LOG_PREFIX, `Summaryception v${SC_VERSION} loaded — the protagonist finally has a name of their own: a per-chat 🎭 Protagonist name (above the notepad) separates the story's MC from the SillyTavern persona — in director-style play the persona (e.g. "LO") issues instructions ABOUT the MC (e.g. "Jovan"), but every pass was told the player IS the persona, so dossiers keyed arcs to the director ("With LO: ..."). With the name set, the summarizer, ledger scribe, auditors, and editor all treat it as the player character, and user turns in passages carry it; empty keeps the old persona behavior. Existing "With LO" text converges as audits and new reads re-derive against the true name. Full history: git log.`);
         });
 
         // Settings panel — isolated. renderExtensionTemplateAsync() fetches
